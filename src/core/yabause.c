@@ -44,6 +44,26 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 
 #include <sys/types.h>
+#include "../vita/c68k_runtime.h"
+#ifdef VITA
+#include <psp2/kernel/processmgr.h>
+static unsigned long long vita_cpu_us, vita_vdp_in_us, vita_vdp_out_us, vita_sound_wait_us;
+extern void YuiMsg(const char *, ...);
+extern void VitaReportDrawStages(void);
+extern void VitaReportLayerStages(void);
+void VitaReportStages(void) {
+  VitaReportDrawStages();
+  VitaReportLayerStages();
+#ifdef VITA_NO_SH2_STAGE_CLOCKS
+  YuiMsg("stages cpu_us=unmeasured vdp_in_us=%llu vdp_out_us=%llu sound_wait_us=%llu",
+    vita_vdp_in_us, vita_vdp_out_us, vita_sound_wait_us);
+#else
+  YuiMsg("stages cpu_us=%llu vdp_in_us=%llu vdp_out_us=%llu sound_wait_us=%llu",
+    vita_cpu_us, vita_vdp_in_us, vita_vdp_out_us, vita_sound_wait_us);
+#endif
+  vita_cpu_us = vita_vdp_in_us = vita_vdp_out_us = vita_sound_wait_us = 0;
+}
+#endif
 #ifdef WIN32
 #include <windows.h>
 #endif
@@ -189,11 +209,6 @@ int YabauseInit(yabauseinit_struct *init)
   q_scsp_finish = YabThreadCreateQueue(1);
   setM68kCounter(0);
 
-#if !(defined(__LIBRETRO__))
-  if( init->playRecordPath && strlen(init->playRecordPath) != 0) {
-    PlayRecorder_setPlayMode(init->playRecordPath,init);
-  }
-#endif
 
    yabsys.frame_count = 0;
    yabsys.sync_shift = init->sync_shift;
@@ -647,9 +662,6 @@ int YabauseEmulate(void) {
    int oneframeexec = 0;
    yabsys.frame_count++;
 
-#if !defined(__LIBRETRO__)
-   PlayRecorder_proc(yabsys.frame_count);
-#endif
 
    const u32 cyclesinc =
       yabsys.DecilineMode ? yabsys.DecilineStop : yabsys.DecilineStop * 10;
@@ -732,7 +744,7 @@ int YabauseEmulate(void) {
       sh2cycles = (yabsys.SH2CycleFrac >> (YABSYS_TIMING_BITS + 1)) << 1;
       yabsys.SH2CycleFrac &= ((YABSYS_TIMING_MASK << 1) | 1);
 
-#ifdef YAB_STATICS
+#if defined(YAB_STATICS) || (defined(VITA) && !defined(VITA_NO_SH2_STAGE_CLOCKS))
       u64 current_cpu_clock = YabauseGetTicks();
 #endif
       if( sync_shift != 0 ){
@@ -757,6 +769,11 @@ int YabauseEmulate(void) {
           SH2Exec(SSH2, sh2cycles);
       }
 
+#ifdef VITA
+#ifndef VITA_NO_SH2_STAGE_CLOCKS
+      vita_cpu_us += YabauseGetTicks() - current_cpu_clock;
+#endif
+#endif
 #ifdef YAB_STATICS
       cpu_emutime += (YabauseGetTicks() - current_cpu_clock) * 1000000 / yabsys.tickfreq;
 #endif
@@ -786,7 +803,13 @@ int YabauseEmulate(void) {
             PROFILE_START("vblankin");
             // VBlankIN
             SmpcINTBACKEnd();
+#ifdef VITA
+            u64 vdp_in_start = YabauseGetTicks();
+#endif
             Vdp2VBlankIN();
+#ifdef VITA
+            vita_vdp_in_us += YabauseGetTicks() - vdp_in_start;
+#endif
 #if defined(ASYNC_SCSP)
             SyncCPUtoSCSP();
 #endif
@@ -797,7 +820,13 @@ int YabauseEmulate(void) {
          {
             // VBlankOUT
             PROFILE_START("VDP1/VDP2");
+#ifdef VITA
+            u64 vdp_out_start = YabauseGetTicks();
+#endif
             Vdp2VBlankOUT();
+#ifdef VITA
+            vita_vdp_out_us += YabauseGetTicks() - vdp_out_start;
+#endif
             yabsys.LineCount = 0;
             oneframeexec = 1;
             PROFILE_STOP("VDP1/VDP2");
@@ -852,7 +881,13 @@ int YabauseEmulate(void) {
 #else
       {
         saved_m68k_cycles  += m68k_cycles_per_deciline;
-        setM68kCounter(saved_m68k_cycles);
+        // Legacy main-CPU-paced SCSP advances at the VBlank handoff above,
+        // not at decilines: its increment is zero. SyncCPUtoSCSP publishes
+        // the reset before waking the next sound frame. Re-publishing that
+        // unchanged budget here only bounces a 64-bit atomic between cores.
+        // Keep incremental budgets and the alternate pacing mode unchanged.
+        if (m68k_cycles_per_deciline != 0 || g_scsp_main_mode != 0)
+          setM68kCounter(saved_m68k_cycles);
 #endif
       }
       PROFILE_STOP("Total Emulation");
@@ -903,7 +938,14 @@ int YabauseEmulate(void) {
 void SyncCPUtoSCSP() {
   //LOG("[SH2] WAIT SCSP");
   if (g_scsp_main_mode == 0) {
+#ifdef VITA
+    u64 sound_wait_start = YabauseGetTicks();
+#endif
     YabWaitEventQueue(q_scsp_finish);
+    VitaM68kNativePublish();
+#ifdef VITA
+    vita_sound_wait_us += YabauseGetTicks() - sound_wait_start;
+#endif
     saved_m68k_cycles = 0;
     setM68kCounter(saved_m68k_cycles);
     YabAddEventQueue(q_scsp_frame_start, 0);
@@ -971,7 +1013,9 @@ void YabauseStopSlave(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 u64 YabauseGetTicks(void) {
-#ifdef WIN32
+#ifdef VITA
+   return sceKernelGetProcessTimeWide();
+#elif defined(WIN32)
    u64 ticks;
    QueryPerformanceCounter((LARGE_INTEGER *)&ticks);
    return ticks;
@@ -999,7 +1043,9 @@ u64 YabauseGetTicks(void) {
 void YabauseSetVideoFormat(int type) {
    yabsys.IsPal = type;
    yabsys.MaxLineCount = type ? 313 : 263;
-#ifdef WIN32
+#ifdef VITA
+   yabsys.tickfreq = 1000000;
+#elif defined(WIN32)
    QueryPerformanceFrequency((LARGE_INTEGER *)&yabsys.tickfreq);
 #elif defined(_arch_dreamcast)
    yabsys.tickfreq = 1000;

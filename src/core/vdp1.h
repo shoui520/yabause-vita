@@ -116,6 +116,9 @@ typedef struct
    void(*Sync)();
    void (*GetNativeResolution)(int *width, int *height, int * interlace);
    void(*Vdp2DispOff)(void);
+   /* Optional notification for renderers that cache palette data. Software
+    * rendering reads color RAM directly and leaves this callback null. */
+   void (*ColorRamWriteWord)(u32 address);
 } VideoInterface_struct;
 
 extern VideoInterface_struct *VIDCore;

@@ -32,6 +32,11 @@ extern int vdp2_interlace;
 
 int vidsoft_num_priority_threads = 0;
 
+#ifdef YABAUSE_GXM_COMPOSITOR
+#include "../../vita/gxm/composite.h"
+extern int YuiUseGxmCompositor(void);
+#define PixelData VitaGxmPixel
+#else
 struct PixelData
 {
    u32 pixel;
@@ -40,6 +45,7 @@ struct PixelData
    u8 shadow_type;
    u8 shadow_enabled;
 };
+#endif
 
 static struct TitanContext {
    int inited;
@@ -625,6 +631,9 @@ void TitanRenderThreads(pixel_t * dispbuffer, int can_use_simplified)
 
 void TitanRender(pixel_t * dispbuffer)
 {
+#ifdef YABAUSE_GXM_COMPOSITOR
+   if (YuiUseGxmCompositor()) return;
+#endif
    int can_use_simplified_rendering = 1;
 
    if (!tt_context.inited || (!tt_context.trans))
@@ -663,6 +672,29 @@ void TitanRender(pixel_t * dispbuffer)
       TitanRenderSimplifiedCheck(dispbuffer, 0, tt_context.vdp2height, can_use_simplified_rendering);
    }
 }
+
+#ifdef YABAUSE_GXM_COMPOSITOR
+/* Borrowed only until the next rasterization. GXM copies these CPU-owned
+ * layers before submission; future native layers can supply GPU textures. */
+int TitanGxmFrame(VitaGxmCompositeFrame *frame)
+{
+   if (!tt_context.inited || !tt_context.trans || !frame) return -1;
+   int field, increment;
+   Vdp2GetInterlaceInfo(&field, &increment);
+   *frame = (VitaGxmCompositeFrame){0};
+   frame->width = tt_context.vdp2width;
+   frame->height = tt_context.vdp2height;
+   frame->field = field;
+   frame->line_increment = increment;
+   frame->blend_mode = tt_context.blend == TitanBlendPixelsAdd ? 2 :
+                       tt_context.blend == TitanBlendPixelsBottom ? 1 : 0;
+   frame->sprite_window = !!(Vdp2Regs->SPCTL & 0x10);
+   for (unsigned i = 0; i < 6; ++i) frame->layers[i] = tt_context.vdp2framebuffer[i];
+   frame->back = tt_context.backscreen;
+   for (unsigned i = 0; i < 3; ++i) frame->line[i] = tt_context.linescreen[i + 1];
+   return 0;
+}
+#endif
 
 #ifdef WORDS_BIGENDIAN
 void TitanWriteColor(pixel_t * dispbuffer, s32 bufwidth, s32 x, s32 y, u32 color)

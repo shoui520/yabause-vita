@@ -110,7 +110,14 @@ extern u32 tweak_backup_file_addr;
  * e.g. for implementing autosave of backup RAM. */
 u8 BupRamWritten;
 
-#if defined(NX)
+#if defined(VITA)
+
+/* Extended backups require file-backed mapping. The Vita frontend uses the
+ * existing explicit LoadBackupRam/SaveBackupRam path instead. */
+void *YabMemMap(char *filename, u32 size) { (void)filename; (void)size; return NULL; }
+void YabFreeMap(void *p) { (void)p; }
+
+#elif defined(NX)
 
 void * YabMemMap(char * filename, u32 size ) {
    return malloc(size);

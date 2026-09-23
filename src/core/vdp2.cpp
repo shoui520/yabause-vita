@@ -60,7 +60,34 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "vidsoft.h"
 #include <atomic>
 
+#ifdef VITA
+extern "C" void YuiMsg(const char *, ...);
+static u64 vita_draw_setup_us, vita_draw_vdp1_us, vita_draw_vdp2_us, vita_draw_tail_us;
+extern "C" void VitaReportDrawStages(void) {
+  YuiMsg("draw_stages setup_us=%llu vdp1_us=%llu vdp2_us=%llu tail_us=%llu",
+    vita_draw_setup_us, vita_draw_vdp1_us, vita_draw_vdp2_us, vita_draw_tail_us);
+  vita_draw_setup_us = vita_draw_vdp1_us = vita_draw_vdp2_us = vita_draw_tail_us = 0;
+}
+#endif
+
+static void NotifyColorRamWriteWord(u32 address) {
+  if (VIDCore && VIDCore->ColorRamWriteWord)
+    VIDCore->ColorRamWriteWord(address);
+}
+
 u8 * Vdp2Ram;
+#if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
+u32 Vdp2RamGeneration;
+#ifdef VITA_ROTATION_OUTPUT_GENERATION
+#include "vdp2_generation.h"
+u32 Vdp2RamGenerationEpoch;
+static inline void Vdp2AdvanceRamGeneration(void) {
+   Vdp2GenerationAdvance(&Vdp2RamGeneration,&Vdp2RamGenerationEpoch);
+}
+#else
+static inline void Vdp2AdvanceRamGeneration(void) { ++Vdp2RamGeneration; }
+#endif
+#endif
 u8 * Vdp2ColorRam;
 Vdp2 * Vdp2Regs;
 Vdp2Internal_struct Vdp2Internal;
@@ -168,7 +195,16 @@ void FASTCALL Vdp2RamWriteByte(u32 addr, u8 val) {
      B1_Updated = 1;
    }
 
+#if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
+   /* Identical stores leave VRAM unchanged; only real changes advance the
+    * generation that rotation texture reuse compares. */
+   if (T1ReadByte(Vdp2Ram, addr) != val) {
+      T1WriteByte(Vdp2Ram, addr, val);
+      Vdp2AdvanceRamGeneration();
+   }
+#else
    T1WriteByte(Vdp2Ram, addr, val);
+#endif
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -197,7 +233,16 @@ void FASTCALL Vdp2RamWriteWord(u32 addr, u16 val) {
      B1_Updated = 1;
    }
 
+#if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
+   /* Identical stores leave VRAM unchanged; only real changes advance the
+    * generation that rotation texture reuse compares. */
+   if (T1ReadWord(Vdp2Ram, addr) != val) {
+      T1WriteWord(Vdp2Ram, addr, val);
+      Vdp2AdvanceRamGeneration();
+   }
+#else
    T1WriteWord(Vdp2Ram, addr, val);
+#endif
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -226,7 +271,16 @@ void FASTCALL Vdp2RamWriteLong(u32 addr, u32 val) {
      B1_Updated = 1;
    }
 
+#if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
+   /* Identical stores leave VRAM unchanged; only real changes advance the
+    * generation that rotation texture reuse compares. */
+   if (T1ReadLong(Vdp2Ram, addr) != val) {
+      T1WriteLong(Vdp2Ram, addr, val);
+      Vdp2AdvanceRamGeneration();
+   }
+#else
    T1WriteLong(Vdp2Ram, addr, val);
+#endif
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -266,20 +320,20 @@ void FASTCALL Vdp2ColorRamWriteWord(u32 addr, u16 val) {
    if (Vdp2Internal.ColorMode == 0 ) {
      if (val != T2ReadWord(Vdp2ColorRam, addr)) {
        T2WriteWord(Vdp2ColorRam, addr, val);
-       YglOnUpdateColorRamWord(addr);
+       NotifyColorRamWriteWord(addr);
      }
 
      if (addr < 0x800) {
        if (val != T2ReadWord(Vdp2ColorRam, addr + 0x800)) {
          T2WriteWord(Vdp2ColorRam, addr + 0x800, val);
-         YglOnUpdateColorRamWord(addr + 0x800);
+         NotifyColorRamWriteWord(addr + 0x800);
        }
      }
    }
    else {
      if (val != T2ReadWord(Vdp2ColorRam, addr)) {
        T2WriteWord(Vdp2ColorRam, addr, val);
-       YglOnUpdateColorRamWord(addr);
+       NotifyColorRamWriteWord(addr);
      }
    }
 }
@@ -294,24 +348,24 @@ void FASTCALL Vdp2ColorRamWriteLong(u32 addr, u32 val) {
 
      const u32 base_addr = addr;
      T2WriteLong(Vdp2ColorRam, base_addr, val);
-     YglOnUpdateColorRamWord(base_addr + 2);
-     YglOnUpdateColorRamWord(base_addr);
+     NotifyColorRamWriteWord(base_addr + 2);
+     NotifyColorRamWriteWord(base_addr);
 
      if (addr < 0x800) {
        const u32 mirror_addr = base_addr + 0x800;
        T2WriteLong(Vdp2ColorRam, mirror_addr, val);
-       YglOnUpdateColorRamWord(mirror_addr + 2);
-       YglOnUpdateColorRamWord(mirror_addr);
+       NotifyColorRamWriteWord(mirror_addr + 2);
+       NotifyColorRamWriteWord(mirror_addr);
      }
    }
    else {
      T2WriteLong(Vdp2ColorRam, addr, val);
      if (Vdp2Internal.ColorMode == 2) {
-       YglOnUpdateColorRamWord(addr);
+       NotifyColorRamWriteWord(addr);
      }
      else {
-       YglOnUpdateColorRamWord(addr + 2);
-       YglOnUpdateColorRamWord(addr);
+       NotifyColorRamWriteWord(addr + 2);
+       NotifyColorRamWriteWord(addr);
      }
    }
 
@@ -325,6 +379,9 @@ int Vdp2Init(void) {
 
    if ((Vdp2Ram = T1MemoryInit(0x80000)) == NULL)
       return -1;
+#if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
+   Vdp2AdvanceRamGeneration();
+#endif
 
    if ((Vdp2ColorRam = T2MemoryInit(0x1000)) == NULL)
       return -1;
@@ -347,7 +404,7 @@ int Vdp2Init(void) {
 
    memset(Vdp2ColorRam, 0xFF, 0x1000);
    for (int i = 0; i < 0x1000; i += 2) {
-     YglOnUpdateColorRamWord(i);
+     NotifyColorRamWriteWord(i);
    }
 
    return 0;
@@ -713,7 +770,9 @@ void vdp2VBlankIN(void) {
 }
 
 //////////////////////////////////////////////////////////////////////////////
+#include "../vita/telemetry.h"
 void Vdp2VBlankIN(void) {
+   VT_SCOPE(VT_VBLANK);
   FRAMELOG("***** VIN *****");
 
 #if defined(YAB_ASYNC_RENDERING)
@@ -762,6 +821,7 @@ void Vdp2VBlankIN(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 void Vdp2HBlankIN(void) {
+   VT_SCOPE(VT_HBLANK);
 
   if (yabsys.LineCount < yabsys.VBlankLineCount) {
     Vdp2Regs->TVSTAT |= 0x0004;
@@ -776,6 +836,7 @@ extern atomic<int> vdp1_clock;
 
 
 void Vdp2HBlankOUT(void) {
+   VT_SCOPE(VT_HBLANK);
   int i;
   if (yabsys.LineCount < yabsys.VBlankLineCount)
   {
@@ -1049,6 +1110,9 @@ void restorevram() {
   FILE * fp = fopen("vdp2vram.bin", "rb");
   fread(Vdp2Regs, sizeof(Vdp2), 1, fp);
   fread(Vdp2Ram, 0x80000, 1, fp);
+#if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
+  Vdp2AdvanceRamGeneration();
+#endif
   fread(Vdp2ColorRam, 0x1000, 1, fp);
   fread(&Vdp2Internal, sizeof(Vdp2Internal_struct), 1, fp);
   fread((void *)Vdp1Regs, sizeof(Vdp1), 1, fp);
@@ -1057,7 +1121,7 @@ void restorevram() {
   fclose(fp);
 
   for (int i = 0; i < 0x1000; i += 2) {
-    YglOnUpdateColorRamWord(i);
+    NotifyColorRamWriteWord(i);
   }
 }
 
@@ -1083,6 +1147,9 @@ void vdp2VBlankOUT(void) {
   static u32 framecount = 0;
   static u64 onesecondticks = 0;
   static VideoInterface_struct * saved = NULL;
+  static void (*saved_draw_start)(void);
+  static void (*saved_draw_end)(void);
+  static void (*saved_draw_screens)(void);
   int isrender = 0;
 #if PROFILE_RENDERING
   u64 starttime = YabauseGetTicks();
@@ -1122,6 +1189,9 @@ void vdp2VBlankOUT(void) {
   {
     skipped_frame++;
     saved = VIDCore;
+    saved_draw_start = VIDCore->Vdp2DrawStart;
+    saved_draw_end = VIDCore->Vdp2DrawEnd;
+    saved_draw_screens = VIDCore->Vdp2DrawScreens;
     
     previous_skipped = 1;
     VIDCore->Vdp2DrawStart = VIDDummy.Vdp2DrawStart;
@@ -1136,20 +1206,16 @@ void vdp2VBlankOUT(void) {
     //VIDCore = saved;
     if( saved != NULL ){
 
-      if (VIDCore->id == VIDCORE_OGL) {
-        VIDCore->Vdp2DrawStart = VIDOGLVdp2DrawStart;
-        VIDCore->Vdp2DrawEnd = VIDOGLVdp2DrawEnd;
-        VIDCore->Vdp2DrawScreens = VIDOGLVdp2DrawScreens;
-      }
-      else if (VIDCore->id == VIDCORE_SOFT ) {
-        VIDCore->Vdp2DrawStart = VIDSoftVdp2DrawStart;
-        VIDCore->Vdp2DrawEnd = VIDSoftVdp2DrawEnd;
-        VIDCore->Vdp2DrawScreens = VIDSoftVdp2DrawScreens;
-      }
+      VIDCore->Vdp2DrawStart = saved_draw_start;
+      VIDCore->Vdp2DrawEnd = saved_draw_end;
+      VIDCore->Vdp2DrawScreens = saved_draw_screens;
     }
     saved = NULL;
   }
 
+#ifdef VITA
+  u64 draw_stage_start = YabauseGetTicks();
+#endif
   VIDCore->Vdp2DrawStart();
 
   // VBlank Erase
@@ -1158,6 +1224,10 @@ void vdp2VBlankOUT(void) {
     VIDCore->Vdp1EraseWrite();
   }
 
+#ifdef VITA
+  vita_draw_setup_us += YabauseGetTicks() - draw_stage_start;
+  draw_stage_start = YabauseGetTicks();
+#endif
   // Frame Change
   if (Vdp1External.swap_frame_buffer == 1)
   {
@@ -1203,11 +1273,19 @@ void vdp2VBlankOUT(void) {
   //yabsys.wait_line_count = 45;
 #endif
 
+#ifdef VITA
+  vita_draw_vdp1_us += YabauseGetTicks() - draw_stage_start;
+  draw_stage_start = YabauseGetTicks();
+#endif
   if (Vdp2Regs->TVMD & 0x8000) {
      FRAMELOG("Vdp2DrawScreens");
     VIDCore->Vdp2DrawScreens();
   }
 
+#ifdef VITA
+  vita_draw_vdp2_us += YabauseGetTicks() - draw_stage_start;
+  draw_stage_start = YabauseGetTicks();
+#endif
   if (isrender){
      FRAMELOG("Vdp1DrawEnd");
     VIDCore->Vdp1DrawEnd();
@@ -1285,6 +1363,9 @@ void vdp2VBlankOUT(void) {
       lastticks = curticks;
    }
    VdpUnLockVram();
+#ifdef VITA
+   vita_draw_tail_us += YabauseGetTicks() - draw_stage_start;
+#endif
 #if PROFILE_RENDERING
    static FILE * framefp = NULL;
    if( framefp == NULL ){
@@ -1304,6 +1385,7 @@ void vdp2VBlankOUT(void) {
 
 //////////////////////////////////////////////////////////////////////////////
 void Vdp2VBlankOUT(void) {
+   VT_SCOPE(VT_VBLANK);
   g_frame_count++;
 
   //if (g_frame_count == 60){
@@ -1886,7 +1968,7 @@ void FASTCALL Vdp2WriteWord(u32 addr, u16 val) {
          if (Vdp2Internal.ColorMode != ((val >> 12) & 0x3) ) {
            Vdp2Internal.ColorMode = (val >> 12) & 0x3;
            for (int i = 0; i < 0x1000; i += 2) {
-             YglOnUpdateColorRamWord(i);
+             NotifyColorRamWriteWord(i);
            }
          }
          
@@ -2351,6 +2433,9 @@ int Vdp2LoadState(FILE *fp, UNUSED int version, int size)
 
    // Read VDP2 ram
    yread(&check, (void *)Vdp2Ram, 0x80000, 1, fp);
+#if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
+   Vdp2AdvanceRamGeneration();
+#endif
 
    // Read CRAM
    yread(&check, (void *)Vdp2ColorRam, 0x1000, 1, fp);
@@ -2361,7 +2446,7 @@ int Vdp2LoadState(FILE *fp, UNUSED int version, int size)
    //if(VIDCore) VIDCore->Resize(0,0,-1,-1,0,0);
 
    for (int i = 0; i < 0x1000; i += 2) {
-     YglOnUpdateColorRamWord(i);
+     NotifyColorRamWriteWord(i);
    }
 
    return size;

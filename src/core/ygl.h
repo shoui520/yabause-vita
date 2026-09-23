@@ -45,7 +45,17 @@ extern "C" {
 
 #if defined(HAVE_LIBGL) || defined(__ANDROID__) || defined(IOS) || defined(NX)
 
-#if defined(__LIBRETRO__) && !defined(_USEGLEW_)
+#if !defined(YABAUSE_VITAGL)
+typedef int YglWindowCoord;
+#define YGL_WINDOW_COORD_FORMAT GL_INT
+#endif
+
+#if defined(YABAUSE_VITAGL)
+    #include <vitaGL.h>
+    /* GXM vertex streams cannot convert signed 32-bit integer attributes. */
+    typedef float YglWindowCoord;
+    #define YGL_WINDOW_COORD_FORMAT GL_FLOAT
+#elif defined(__LIBRETRO__) && !defined(_USEGLEW_)
     #include <glsym/glsym.h>
     #include <glsm/glsm.h>
 #elif defined(__ANDROID__)
@@ -262,13 +272,18 @@ typedef struct _YglCacheHash {
 	struct _YglCacheHash * next;
 } YglCacheHash;
 
+#include "../video/opengl/atlas_extent.h"
+#include "../video/opengl/atlas_snapshot.h"
 typedef struct {
+  YglAtlasExtent vita_cpu_extent;
+  YglAtlasSnapshot vita_snapshot;
 	unsigned int currentX;
 	unsigned int currentY;
 	unsigned int yMax;
 	unsigned int * texture;
 	unsigned int width;
 	unsigned int height;
+	unsigned int vita_gpu_height; /* Uploaded extent, separate from CPU capacity. */
 	YglCacheHash *HashTable[HASHSIZE];
 	YglCacheHash CashLink[HASHSIZE * 2];
 	u32 CashLink_index;
@@ -282,6 +297,14 @@ typedef struct {
   unsigned int * texture_in[2];
 
 } YglTextureManager;
+
+static inline unsigned YglTextureHeight(const YglTextureManager *tm) {
+#ifdef YABAUSE_VITAGL
+  return tm->vita_gpu_height ? tm->vita_gpu_height : tm->height;
+#else
+  return tm->height;
+#endif
+}
 
 extern YglTextureManager * YglTM;
 //extern YglTextureManager * YglTM_vdp1;
@@ -537,6 +560,9 @@ typedef struct {
 	u32 lincolor_tex;
 	u32 linecolor_pbo;
 	u32 * lincolor_buf;
+#ifdef YABAUSE_VITAGL
+  int vita_depth;
+#endif
 } YglPerLineInfo;
 
 typedef struct {
@@ -591,9 +617,9 @@ typedef struct {
    u32 * messagebuf;
 
    int bUpdateWindow;
-   int win0v[512*4];
+   YglWindowCoord win0v[512*4];
    int win0_vertexcnt;
-   int win1v[512*4];
+   YglWindowCoord win1v[512*4];
    int win1_vertexcnt;
 
    YglMatrix mtxModelView;
@@ -621,8 +647,17 @@ typedef struct {
    RBG_RESOLUTION_MODE rbg_resolution_mode;
    int rbg_use_compute_shader;
    YglTextureManager * texture_manager;
+#ifdef YABAUSE_VITAGL
+   /* Explicit pending-work state; Vita has no desktop GLsync API. */
+   unsigned int sync;
+   unsigned int frame_sync;
+   GLuint vita_feedback_tex;
+   GLuint vita_feedback_fbo;
+   int vita_feedback_width, vita_feedback_height;
+#else
    GLsync sync;
    GLsync frame_sync;
+#endif
     GLuint default_fbo;
    YglPerLineInfo bg[enBGMAX];
    u32 targetfbo;
@@ -675,6 +710,10 @@ typedef struct {
   volatile int vdp2_sync_flg;
   float rotate_mval_h;
   float rotate_mval_v;
+#if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
+  u32 vram_generation; /* Vdp2RamGeneration at hand-off, set on the emulation thread */
+  u32 vram_epoch;
+#endif
 } RBGDrawInfo;
 
 int YglGLInit(int, int);
@@ -759,8 +798,11 @@ int YglCleanUpWindow(YglProgram * prg);
 
 void YglEraseWriteVDP1();
 void YglFrameChangeVDP1();
+#ifdef YABAUSE_VITAGL
+GLuint YglVitaSnapshotVdp1(void);
+#endif
 
-#if !defined(__APPLE__) && !defined(__ANDROID__) && !defined(_USEGLEW_) && !defined(_OGLES3_) && !defined(__LIBRETRO__) &&  !defined(NX)
+#if !defined(YABAUSE_VITAGL) && !defined(__APPLE__) && !defined(__ANDROID__) && !defined(_USEGLEW_) && !defined(_OGLES3_) && !defined(__LIBRETRO__) && !defined(NX)
 
 extern GLuint (STDCALL *glCreateProgram)(void);
 extern GLuint (STDCALL *glCreateShader)(GLenum);
@@ -859,5 +901,3 @@ u32 Vdp2ColorRamGetColor(u32 colorindex, int alpha);
 #endif
 
 #endif // _YGL_H_
-
-

@@ -50,6 +50,17 @@ extern "C" {
 #endif
 
 extern u8 * Vdp2Ram;
+#if defined(VITA_ROTATION_PATTERN_CACHE) && defined(OPTIMIZED_DMA)
+#error "Pattern cache requires tracked VDP2 writers; raw-pointer optimized DMA is not supported"
+#endif
+#if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
+/* Advanced by every VDP2 VRAM writer that changes a byte (emulation thread
+ * only). Equal values at two points mean VRAM contents are unchanged. */
+extern u32 Vdp2RamGeneration;
+#ifdef VITA_ROTATION_OUTPUT_GENERATION
+extern u32 Vdp2RamGenerationEpoch;
+#endif
+#endif
 extern u8 * Vdp2ColorRam;
 extern u8 Vdp2ColorRamUpdated;
 extern u8 A0_Updated;

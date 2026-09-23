@@ -45,6 +45,20 @@
 #include <stdlib.h>
 #include <limits.h>
 
+#ifdef VITA
+extern void YuiMsg(const char *, ...);
+static u64 vita_layer_us[7];
+void VitaReportLayerStages(void) {
+   YuiMsg("layer_stages erase_us=%llu sprite_us=%llu nbg0_us=%llu nbg1_us=%llu nbg2_us=%llu nbg3_us=%llu rbg0_us=%llu",
+      vita_layer_us[0], vita_layer_us[1], vita_layer_us[2], vita_layer_us[3],
+      vita_layer_us[4], vita_layer_us[5], vita_layer_us[6]);
+   memset(vita_layer_us, 0, sizeof(vita_layer_us));
+}
+#define VITA_LAYER_TIME(index, call) do { u64 begin = YabauseGetTicks(); call; vita_layer_us[index] += YabauseGetTicks() - begin; } while (0)
+#else
+#define VITA_LAYER_TIME(index, call) do { call; } while (0)
+#endif
+
 #if defined WORDS_BIGENDIAN
 static INLINE u32 COLSAT2YAB16(int priority,u32 temp)            { return (priority | (temp & 0x7C00) << 1 | (temp & 0x3E0) << 14 | (temp & 0x1F) << 27); }
 static INLINE u32 COLSAT2YAB32(int priority,u32 temp)            { return (((temp & 0xFF) << 24) | ((temp & 0xFF00) << 8) | ((temp & 0xFF0000) >> 8) | priority); }
@@ -382,7 +396,12 @@ static INLINE void ReadVdp2ColorOffset(Vdp2 * regs, vdp2draw_struct *info, int c
 
 //////////////////////////////////////////////////////////////////////////////
 
-static INLINE int Vdp2FetchPixel(vdp2draw_struct *info, int x, int y, u32 *color, u32 *dot, u8 * ram, int charaddr, int paladdr, u8* vdp2_color_ram)
+static INLINE u32 Vdp2LookupPalette(u32 address, u8 *ram, const u32 *decoded)
+{
+   return decoded ? decoded[address & 0x7ff] : Vdp2ColorRamGetColorSoft(address, ram);
+}
+
+static INLINE int Vdp2FetchPixel(vdp2draw_struct *info, int x, int y, u32 *color, u32 *dot, u8 * ram, int charaddr, int paladdr, u8* vdp2_color_ram, const u32 *decoded_palette)
 {
    switch(info->colornumber)
    {
@@ -392,7 +411,7 @@ static INLINE int Vdp2FetchPixel(vdp2draw_struct *info, int x, int y, u32 *color
          if (!(*dot & 0xF) && info->transparencyenable) return 0;
          else
          {
-            *color = Vdp2ColorRamGetColorSoft(info->coloroffset + (paladdr | (*dot & 0xF)),vdp2_color_ram);
+            *color = Vdp2LookupPalette(info->coloroffset + (paladdr | (*dot & 0xF)),vdp2_color_ram, decoded_palette);
             return 1;
          }
       case 1: // 8 BPP
@@ -400,15 +419,17 @@ static INLINE int Vdp2FetchPixel(vdp2draw_struct *info, int x, int y, u32 *color
          if (!(*dot & 0xFF) && info->transparencyenable) return 0;
          else
          {
-            *color = Vdp2ColorRamGetColorSoft(info->coloroffset + (paladdr | (*dot & 0xFF)), vdp2_color_ram);
+            *color = Vdp2LookupPalette(info->coloroffset + (paladdr | (*dot & 0xFF)), vdp2_color_ram, decoded_palette);
             return 1;
          }
       case 2: // 16 BPP(palette)
          *dot = T1ReadWord(ram, ((charaddr + ((y * info->cellw) + x) * 2) & 0x7FFFF));
-         if ((*dot == 0) && info->transparencyenable) return 0;
+         /* VDP2 manual, table 4.3: only the lower 11 palette bits
+          * participate in the 2048-color transparency code. */
+         if (!(*dot & 0x7FF) && info->transparencyenable) return 0;
          else
          {
-            *color = Vdp2ColorRamGetColorSoft(info->coloroffset + *dot, vdp2_color_ram);
+            *color = Vdp2LookupPalette(info->coloroffset + *dot, vdp2_color_ram, decoded_palette);
             return 1;
          }
       case 3: // 16 BPP(RGB)      
@@ -685,6 +706,22 @@ static INLINE void FASTCALL Vdp2MapCalcXY(vdp2draw_struct *info, int *x, int *y,
 
 //////////////////////////////////////////////////////////////////////////////
 
+typedef struct { int start, end, x, y, step; } Vdp2RowRun;
+
+/* An eight-pixel character row never crosses a 16x16 pattern's sub-character
+ * boundary. Map once, then walk its texels in either flip direction. Caller
+ * must guarantee unit horizontal sampling, no mosaic, and normal VRAM timing. */
+static INLINE void Vdp2BeginRowRun(Vdp2RowRun *run, int output_x, int source_x,
+   int source_y, vdp2draw_struct *info, screeninfo_struct *sinfo,
+   Vdp2 *regs, u8 *ram)
+{
+   run->start = output_x;
+   run->end = output_x + 8 - (source_x & 7);
+   run->x = source_x; run->y = source_y;
+   Vdp2MapCalcXY(info, &run->x, &run->y, sinfo, regs, ram, 0);
+   run->step = (info->flipfunction & 1) ? -1 : 1;
+}
+
 static INLINE void SetupScreenVars(vdp2draw_struct *info, screeninfo_struct *sinfo, void FASTCALL (* PlaneAddr)(void *, int, Vdp2*), Vdp2* regs)
 {
    if (!info->isbitmap)
@@ -845,6 +882,16 @@ static void FASTCALL Vdp2DrawScroll(vdp2draw_struct *info, Vdp2* lines, Vdp2* re
    u32 linescrolly_table[512] = { 0 };
    float lineszoom_table[512] = { 0 };
    int num_vertical_cell_scroll_enabled = 0;
+   /* Draw-local ownership: no cache survives guest CRAM writes or a mode change.
+    * Preserve the special-color MSB (VDP2 manual 3.4/12.3). Mode 2's 1024-entry
+    * wrap is inherited when the existing decoder populates the second half. */
+   u32 palette[2048];
+   const u32 *decoded_palette = NULL;
+   if (info->colornumber <= 2) {
+      for (unsigned p = 0; p < 2048; ++p)
+         palette[p] = Vdp2ColorRamGetColorSoft(p, color_ram);
+      decoded_palette = palette;
+   }
 
    SetupScreenVars(info, &sinfo, info->PlaneAddr, regs);
 
@@ -1002,6 +1049,11 @@ static void FASTCALL Vdp2DrawScroll(vdp2draw_struct *info, Vdp2* lines, Vdp2* re
       if (!info->enable)
          continue;
 
+      Vdp2RowRun row_run = {0};
+      const int use_row_runs = !info->isbitmap && !bad_cycle &&
+         info->coordincx == 1.0f && info->mosaicxmask == 1 &&
+         !linescrollx && (info->patternwh == 1 || info->patternwh == 2);
+
       for (i = 0; i < vdp2width; i++)
       {
          u32 color, dot;
@@ -1016,6 +1068,10 @@ static void FASTCALL Vdp2DrawScroll(vdp2draw_struct *info, Vdp2* lines, Vdp2* re
             continue;
          }
 
+         if (use_row_runs && i < row_run.end) {
+            x = row_run.x + (i - row_run.start) * row_run.step;
+            y = row_run.y;
+         } else {
          //x = info->x+((int)(info->coordincx*(float)((info->mosaicxmask > 1) ? (i / info->mosaicxmask * info->mosaicxmask) : i)));
 		 x = info->x + mosaic_x[i]*info->coordincx;
          x &= sinfo.xmask;
@@ -1030,7 +1086,13 @@ static void FASTCALL Vdp2DrawScroll(vdp2draw_struct *info, Vdp2* lines, Vdp2* re
          {
             // Tile
             y=Y;
-            Vdp2MapCalcXY(info, &x, &y, &sinfo, regs, ram, bad_cycle);
+            if (use_row_runs) {
+               Vdp2BeginRowRun(&row_run, i, x, y, info, &sinfo, regs, ram);
+               x = row_run.x; y = row_run.y;
+            } else {
+               Vdp2MapCalcXY(info, &x, &y, &sinfo, regs, ram, bad_cycle);
+            }
+         }
          }
 
          if (!bad_cycle)
@@ -1044,7 +1106,7 @@ static void FASTCALL Vdp2DrawScroll(vdp2draw_struct *info, Vdp2* lines, Vdp2* re
             paladdr = info->pipe[0].paladdr;
          }
 
-         if (!Vdp2FetchPixel(info, x, y, &color, &dot, ram, charaddr, paladdr,color_ram))
+         if (!Vdp2FetchPixel(info, x, y, &color, &dot, ram, charaddr, paladdr,color_ram, decoded_palette))
          {
             continue;
          }
@@ -1198,7 +1260,7 @@ static void FASTCALL Vdp2DrawRotationFP(vdp2draw_struct *info, vdp2rotationparam
                }
  
                // Fetch pixel
-               if (!Vdp2FetchPixel(info, x, y, &color, &dot, ram, info->charaddr,info->paladdr, color_ram))
+               if (!Vdp2FetchPixel(info, x, y, &color, &dot, ram, info->charaddr,info->paladdr, color_ram, NULL))
                {
                   continue;
                }
@@ -1309,7 +1371,7 @@ static void FASTCALL Vdp2DrawRotationFP(vdp2draw_struct *info, vdp2rotationparam
          if (info->linescreen > 1)
          {
             lineColorAddr = (T1ReadWord(ram, lineAddr) & 0x780) | p->linescreen;
-            lineColor = Vdp2ColorRamGetColor(lineColorAddr, (int)color_ram);
+            lineColor = Vdp2ColorRamGetColorSoft(lineColorAddr, color_ram);
             lineAddr += lineInc;
             TitanPutLineHLine(info->linescreen, j, COLSAT2YAB32(0x3F, lineColor));
          }
@@ -1409,7 +1471,7 @@ static void FASTCALL Vdp2DrawRotationFP(vdp2draw_struct *info, vdp2rotationparam
             }
 
             // Fetch pixel
-            if (!Vdp2FetchPixel(info, x, y, &color, &dot, ram, info->charaddr, info->paladdr, color_ram))
+            if (!Vdp2FetchPixel(info, x, y, &color, &dot, ram, info->charaddr, info->paladdr, color_ram, NULL))
             {
                continue;
             }
@@ -1518,7 +1580,7 @@ static void Vdp2DrawLineScreen(void)
       for (i = 0; i < vdp2height; i++)
       {
          color = T1ReadWord(Vdp2Ram, scrAddr) & 0x7FF;
-         dot = Vdp2ColorRamGetColor(color, (int)Vdp2ColorRam);
+         dot = Vdp2ColorRamGetColorSoft(color, Vdp2ColorRam);
          scrAddr += 2;
 
          TitanPutLineHLine(1, i, COLSAT2YAB32(alpha, dot));
@@ -1528,7 +1590,7 @@ static void Vdp2DrawLineScreen(void)
    {
       /* single color, implemented but not tested... */
       color = T1ReadWord(Vdp2Ram, scrAddr) & 0x7FF;
-      dot = Vdp2ColorRamGetColor(color, (int)Vdp2ColorRam);
+      dot = Vdp2ColorRamGetColorSoft(color, Vdp2ColorRam);
       for (i = 0; i < vdp2height; i++)
          TitanPutLineHLine(1, i, COLSAT2YAB32(alpha, dot));
    }
@@ -3717,7 +3779,7 @@ void VidsoftDrawSprite(Vdp2 * vdp2_regs, u8 * spr_window_mask, u8* vdp1_front_fr
                      continue;
                   }
 
-                  dot = Vdp2ColorRamGetColor(vdp1coloroffset + pixel,(int)color_ram);
+                  dot = Vdp2ColorRamGetColorSoft(vdp1coloroffset + pixel, color_ram);
 
                   if (TestBothWindow(vdp2_regs->WCTLD >> 8, colorcalcwindow, i, i2) && (vdp2_regs->CCCTL & 0x40))
                   {
@@ -3806,7 +3868,7 @@ void VidsoftDrawSprite(Vdp2 * vdp2_regs, u8 * spr_window_mask, u8* vdp1_front_fr
                      continue;
                   }
 
-                  dot = Vdp2ColorRamGetColor(vdp1coloroffset + pixel, (int)color_ram);
+                  dot = Vdp2ColorRamGetColorSoft(vdp1coloroffset + pixel, color_ram);
 
                   if (TestBothWindow(vdp2_regs->WCTLD >> 8, colorcalcwindow, i, i2) && (vdp2_regs->CCCTL & 0x40))
                   {
@@ -3953,7 +4015,7 @@ void VIDSoftVdp2DrawScreens(void)
    layer_priority[TITAN_NBG3] = ((Vdp2Regs->PRINB >> 8) & 0x7);
    layer_priority[TITAN_RBG0] = (Vdp2Regs->PRIR & 0x7);
 
-   TitanErase();
+   VITA_LAYER_TIME(0, TitanErase());
 
    if (Vdp2Regs->SFPRMD & 0x3FF)
    {
@@ -3983,7 +4045,7 @@ void VIDSoftVdp2DrawScreens(void)
    }
    else
    {
-      VidsoftDrawSprite(Vdp2Regs, sprite_window_mask, vdp1frontframebuffer, Vdp2Ram, Vdp1Regs, Vdp2Lines, Vdp2ColorRam);
+      VITA_LAYER_TIME(1, VidsoftDrawSprite(Vdp2Regs, sprite_window_mask, vdp1frontframebuffer, Vdp2Ram, Vdp1Regs, Vdp2Lines, Vdp2ColorRam));
    }
 
    if (vidsoft_num_layer_threads > 0)
@@ -3996,11 +4058,11 @@ void VIDSoftVdp2DrawScreens(void)
    }
    else
    {
-      Vdp2DrawNBG0(Vdp2Lines, Vdp2Regs, Vdp2Ram, Vdp2ColorRam, cell_scroll_data);
-      Vdp2DrawNBG1(Vdp2Lines, Vdp2Regs, Vdp2Ram, Vdp2ColorRam, cell_scroll_data);
-      Vdp2DrawNBG2(Vdp2Lines, Vdp2Regs, Vdp2Ram, Vdp2ColorRam, cell_scroll_data);
-      Vdp2DrawNBG3(Vdp2Lines, Vdp2Regs, Vdp2Ram, Vdp2ColorRam, cell_scroll_data);
-      Vdp2DrawRBG0(Vdp2Lines, Vdp2Regs, Vdp2Ram, Vdp2ColorRam, cell_scroll_data);
+      VITA_LAYER_TIME(2, Vdp2DrawNBG0(Vdp2Lines, Vdp2Regs, Vdp2Ram, Vdp2ColorRam, cell_scroll_data));
+      VITA_LAYER_TIME(3, Vdp2DrawNBG1(Vdp2Lines, Vdp2Regs, Vdp2Ram, Vdp2ColorRam, cell_scroll_data));
+      VITA_LAYER_TIME(4, Vdp2DrawNBG2(Vdp2Lines, Vdp2Regs, Vdp2Ram, Vdp2ColorRam, cell_scroll_data));
+      VITA_LAYER_TIME(5, Vdp2DrawNBG3(Vdp2Lines, Vdp2Regs, Vdp2Ram, Vdp2ColorRam, cell_scroll_data));
+      VITA_LAYER_TIME(6, Vdp2DrawRBG0(Vdp2Lines, Vdp2Regs, Vdp2Ram, Vdp2ColorRam, cell_scroll_data));
    }
 }
 

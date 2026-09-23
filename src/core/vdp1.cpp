@@ -44,6 +44,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 
 #include <stdlib.h>
+#include "../vita/telemetry.h"
 #include "yabause.h"
 #include "vdp1.h"
 #include "debug.h"
@@ -748,6 +749,7 @@ int g_vdp1_debug_dmp = 0;
 
 extern "C" void Vdp1Draw(void)
 {
+   VT_SCOPE(VT_VDP1);
 #if _DEBUG
   if (g_vdp1_debug_dmp == 1) {
     Vdp1GenerateCCode();
