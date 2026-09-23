@@ -1,0 +1,31 @@
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -284,1 +284,3 @@
+-				mark_as_dirty(fb->depthbuffer_ptr->depthData);
++				mark_as_dirty(fb->depthbuffer_ptr->depthData);
++				if (fb->depthbuffer_ptr->stencilData)
++					mark_as_dirty(fb->depthbuffer_ptr->stencilData);
+@@ -368,1 +370,3 @@
+-		mark_as_dirty(fb->depthbuffer_ptr->depthData);
++		mark_as_dirty(fb->depthbuffer_ptr->depthData);
++		if (fb->depthbuffer_ptr->stencilData)
++			mark_as_dirty(fb->depthbuffer_ptr->stencilData);
+@@ -400,1 +404,3 @@
+-		mark_as_dirty(fb->depthbuffer_ptr->depthData);
++		mark_as_dirty(fb->depthbuffer_ptr->depthData);
++		if (fb->depthbuffer_ptr->stencilData)
++			mark_as_dirty(fb->depthbuffer_ptr->stencilData);
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -1391,1 +1391,3 @@
+-				mark_as_dirty(fb->depthbuffer_ptr->depthData);
++				mark_as_dirty(fb->depthbuffer_ptr->depthData);
++				if (fb->depthbuffer_ptr->stencilData)
++					mark_as_dirty(fb->depthbuffer_ptr->stencilData);
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -1830,1 +1830,3 @@
+-								mark_as_dirty(fb->depthbuffer_ptr->depthData);
++								mark_as_dirty(fb->depthbuffer_ptr->depthData);
++								if (fb->depthbuffer_ptr->stencilData)
++									mark_as_dirty(fb->depthbuffer_ptr->stencilData);

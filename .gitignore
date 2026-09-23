@@ -1,0 +1,6 @@
+/build/
+/CMakeUserPresets.json
+*.vpk
+*.velf
+*.self
+__pycache__/
