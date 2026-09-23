@@ -934,7 +934,9 @@ int Cs2ForceCloseTray( int coreid, const char * cdpath ){
 
 //////////////////////////////////////////////////////////////////////////////
 
+#include "../vita/telemetry.h"
 void Cs2Exec(u32 timing) {
+   VT_SCOPE(VT_CD_CONTROL);
    Cs2Area->_statuscycles += timing * 3;
    Cs2Area->_periodiccycles += timing * 3;
 

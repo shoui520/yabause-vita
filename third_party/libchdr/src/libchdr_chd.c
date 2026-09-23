@@ -52,6 +52,18 @@
 #include "LzmaDec.h"
 #include "zlib.h"
 
+/* Vita-only observability; other libchdr consumers retain the original IO. */
+#ifdef VITA
+#include "../../../src/vita/disc_io.h"
+#undef core_fread
+#undef core_fseek
+#define core_fread(file, buffer, length) VitaDiscRead(buffer, 1, length, file)
+#define core_fseek VitaDiscSeek
+#define CHD_DECODE_SCOPE() VT_SCOPE(VT_DISC_DECODE)
+#else
+#define CHD_DECODE_SCOPE() ((void)0)
+#endif
+
 #undef TRUE
 #undef FALSE
 #define TRUE 1
@@ -523,7 +535,7 @@ static chd_error lzma_codec_init(void* codec, uint32_t hunkbytes)
 		return CHDERR_DECOMPRESSION_ERROR;
 	if (LzmaEnc_SetProps(enc, &encoder_props) != SZ_OK)
 	{
-		LzmaEnc_Destroy(enc, (ISzAlloc*)&alloc, (ISzAlloc*)&alloc);
+		LzmaEnc_Destroy(enc, (ISzAlloc*)alloc, (ISzAlloc*)alloc);
 		return CHDERR_DECOMPRESSION_ERROR;
 	}
 	props_size = sizeof(decoder_props);
@@ -2203,7 +2215,10 @@ static chd_error hunk_read_into_memory(chd_file *chd, UINT32 hunknum, UINT8 *des
 				err = CHDERR_NONE;
 				codec = &chd->zlib_codec_data;
 				if (chd->codecintf[0]->decompress != NULL)
+				{
+					CHD_DECODE_SCOPE();
 					err = (*chd->codecintf[0]->decompress)(codec, compressed_bytes, entry->length, dest, chd->header.hunkbytes);
+				}
 				if (err != CHDERR_NONE)
 					return err;
 				break;
@@ -2309,7 +2324,10 @@ static chd_error hunk_read_into_memory(chd_file *chd, UINT32 hunknum, UINT8 *des
 				}
 				if (codec==NULL)
 					return CHDERR_CODEC_ERROR;
-				err = chd->codecintf[rawmap[0]]->decompress(codec, compressed_bytes, blocklen, dest, chd->header.hunkbytes);
+				{
+					CHD_DECODE_SCOPE();
+					err = chd->codecintf[rawmap[0]]->decompress(codec, compressed_bytes, blocklen, dest, chd->header.hunkbytes);
+				}
 				if (err != CHDERR_NONE)
 					return err;
 #ifdef VERIFY_BLOCK_CRC
@@ -2514,9 +2532,8 @@ static chd_error zlib_codec_init(void *codec, uint32_t hunkbytes)
 	else
 		err = CHDERR_NONE;
 
-	/* handle an error */
-	if (err != CHDERR_NONE)
-		free(data);
+	/* codec storage belongs to chd_file (and may be an embedded sub-codec).
+	 * The initializer must never free its caller's storage. */
 
 	return err;
 }

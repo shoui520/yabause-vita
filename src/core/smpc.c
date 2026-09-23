@@ -549,7 +549,9 @@ static void SmpcRESDISA(void) {
 
 //////////////////////////////////////////////////////////////////////////////
 
+#include "../vita/telemetry.h"
 void SmpcExec(s32 t) {
+   VT_SCOPE(VT_SMPC);
    if (SmpcInternalVars->timing > 0) {
 
       if (intback_wait_for_line)

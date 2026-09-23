@@ -56,6 +56,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "debug.h"
 
 static int LoadCHD(const char *chd_filename, FILE *iso_file);
+int checkCHD(const char *filename);
 static int ISOCDReadSectorFADFromCHD(u32 FAD, void *buffer);
 static int LoadBinCueMultiFile(const char *cuefilename, FILE *iso_file);
 static int LoadBinCue(const char *cuefilename, FILE *iso_file);
@@ -1627,7 +1628,12 @@ static s32 ISOCDReadTOC(u32 * TOC) {
 
 track_info_struct *currentTrack = NULL;
 
+#include "../vita/telemetry.h"
+#include "../vita/disc_io.h"
+#define fread VitaDiscRead
+#define fseek VitaDiscSeek
 static int ISOCDReadSectorFAD(u32 FAD, void *buffer) {
+   VT_SCOPE(VT_DISC_READ);
    int i,j;
    size_t num_read = 0;
    int found = 0;
@@ -1732,7 +1738,7 @@ static void ISOCDReadAheadFAD(UNUSED u32 FAD)
 typedef struct ChdInfo_ {
   chd_file *chd;
   core_file * image_file;
-  chd_header * header;
+  const chd_header * header;
   char * hunk_buffer;
   int current_hunk_id;
 } ChdInfo;

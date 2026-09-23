@@ -228,15 +228,19 @@ void SH2PowerOn(SH2_struct *context) {
 
 //////////////////////////////////////////////////////////////////////////////
 
+#include "../vita/telemetry.h"
 void FASTCALL SH2Exec(SH2_struct *context, u32 cycles)
 {
+   VT_SCOPE(context->isslave ? VT_SH2_SLAVE : VT_SH2_MASTER);
    CurrentSH2 = context;
 
    SH2Core->Exec(context, cycles);
 
-   FRTExec(cycles);
-   WDTExec(cycles);
-   DMAProc(cycles);
+   { VT_SCOPE(VT_SH2_ONCHIP);
+     FRTExec(cycles);
+     WDTExec(cycles);
+   }
+   { VT_SCOPE(VT_SH2_DMA); DMAProc(cycles); }
 
    //if (UNLIKELY(context->cycles < cycles))
    //   context->cycles = 0;
