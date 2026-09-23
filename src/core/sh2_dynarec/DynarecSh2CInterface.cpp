@@ -143,10 +143,24 @@ SH2Interface_struct SH2DynDebug = {
 };
 
 int SH2DynInit(void) {
+  try {
+    CompileBlocks::getInstance();
+  } catch (const std::bad_alloc &) {
+    return -1;
+  }
   return 0;
 }
 
 void SH2DynDeInit(void){
+  if (MSH2) {
+    delete static_cast<DynarecSh2 *>(MSH2->ext);
+    MSH2->ext = nullptr;
+  }
+  if (SSH2) {
+    delete static_cast<DynarecSh2 *>(SSH2->ext);
+    SSH2->ext = nullptr;
+  }
+  DynarecSh2::CurrentContext = nullptr;
 }
 
 void SH2DynReset(SH2_struct *context) {
@@ -343,6 +357,7 @@ void SH2DynAddCycle(SH2_struct *context, u32 value) {
 
 
 void SH2DynWriteNotify(u32 start, u32 length){
+  if (!length) return;
   CompileBlocks * block = CompileBlocks::getInstance();
   
   switch (start & 0x0FF00000){
@@ -353,14 +368,15 @@ void SH2DynWriteNotify(u32 start, u32 length){
 
   // Low Memory
   case 0x00200000:
-    for (u32 addr = start; addr< start + length; addr += 2)
-      block->LookupTableLow[ (addr&0x000FFFFF)>>1 ] = NULL;
+    block->InvalidateLow(start, length);
     break;
     // High Memory
   case 0x06000000:
-    for( u32 addr = start; addr< start+length; addr+=2 )
+    // An odd-start write may overlap two SH-2 instruction words. Widen the
+    // endpoint before addition so a wrapped address cannot suppress the loop.
+    for (u64 addr = start & ~1u; addr < static_cast<u64>(start) + length; addr += 2)
 #if defined(SET_DIRTY)
-    block->setDirty(addr);
+    block->setDirty(static_cast<u32>(addr));
 #else
     block->LookupTable[ (addr&0x000FFFFF)>>1 ] = NULL;
 #endif
@@ -369,7 +385,7 @@ void SH2DynWriteNotify(u32 start, u32 length){
     // Cache
   default:
     if ((start & 0xFF000000) == 0xC0000000){
-      block->LookupTableC[ (start&0x000FFFFF)>>1 ] = NULL;
+      block->LookupTableC.clear();
     }
     break;
   }
@@ -397,7 +413,26 @@ void SH2DynShowSttaics(SH2_struct * master, SH2_struct * slave ){
 #endif
 
 
-void memSetByte(u32 addr , u8 data )
+#ifdef VITA_SH2_WRITE_HELPER_O3
+#ifndef SET_DIRTY
+#error "Write leaf ownership checks require SET_DIRTY metadata"
+#endif
+#define WRITE_LINKAGE static __attribute__((noinline))
+#define WRITE_NAME(Name) WriteSlow##Name
+#else
+#define WRITE_LINKAGE
+#define WRITE_NAME(Name) memSet##Name
+#endif
+static __attribute__((always_inline)) inline void InvalidateHighWrite(CompileBlocks *block, u32 addr) {
+#ifdef VITA_SH2_WRITE_PREFLIGHT
+  // Same live owner test as setDirty, before its large cold-path stack frame.
+  // Never cache this result: compilation/invalidation can change ownership.
+  if (block->LookupParentTable[adress_mask(addr)].size() == 0) return;
+#endif
+  block->setDirty(addr);
+}
+
+WRITE_LINKAGE void WRITE_NAME(Byte)(u32 addr , u8 data )
 {
   dynaLock();
   u32 cycle = 0;
@@ -407,7 +442,7 @@ void memSetByte(u32 addr , u8 data )
   {
   // Low Memory
   case 0x00200000:
-    block->LookupTableLow[  (addr&0x000FFFFF)>>1 ] = NULL;
+    block->InvalidateLow(addr, 1);
     T2WriteByte(LowWram, addr & 0xFFFFF, data);
     if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 7;
     dynaFree();
@@ -416,7 +451,7 @@ void memSetByte(u32 addr , u8 data )
   // High Memory
   case 0x06000000:
 #if defined(SET_DIRTY)
-    block->setDirty(addr);
+    InvalidateHighWrite(block, addr);
 #else
     block->LookupTable[ (addr&0x000FFFFF)>>1 ] = NULL;
 #endif
@@ -430,7 +465,7 @@ void memSetByte(u32 addr , u8 data )
   default:
     if ((addr & 0xFF000000) == 0xC0000000)
     {
-      block->LookupTableC[ (addr&0x000FFFFF)>>1] = NULL;
+      block->LookupTableC.clear();
     }
   }
   MappedMemoryWriteByte(addr, data, &cycle);
@@ -438,7 +473,7 @@ void memSetByte(u32 addr , u8 data )
   dynaFree();
 }
 
-void memSetWord(u32 addr, u16 data )
+WRITE_LINKAGE void WRITE_NAME(Word)(u32 addr, u16 data )
 {
   dynaLock();
   u32 cycle = 0;
@@ -449,7 +484,7 @@ void memSetWord(u32 addr, u16 data )
   {
   // Low Memory
    case 0x00200000:
-    block->LookupTableLow[ (addr&0x000FFFFF)>>1 ] = NULL;
+    block->InvalidateLow(addr, 2);
     T2WriteWord(LowWram, addr & 0xFFFFF, data);
     if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 7;
     dynaFree();
@@ -458,7 +493,7 @@ void memSetWord(u32 addr, u16 data )
   // High Memory
    case 0x06000000:  {
 #if defined(SET_DIRTY)
-     block->setDirty(addr);
+     InvalidateHighWrite(block, addr);
 #else
      block->LookupTable[(addr & 0x000FFFFF) >> 1] = NULL;
 #endif
@@ -472,7 +507,7 @@ void memSetWord(u32 addr, u16 data )
   default:
     if ((addr & 0xFF000000) == 0xC0000000)
     {
-      block->LookupTableC[ (addr&0x000FFFFF) >> 1] = NULL;
+      block->LookupTableC.clear();
     }
   }
   MappedMemoryWriteWord(addr, data, &cycle);
@@ -480,7 +515,7 @@ void memSetWord(u32 addr, u16 data )
   dynaFree();
 }
 
-void memSetLong(u32 addr , u32 data )
+WRITE_LINKAGE void WRITE_NAME(Long)(u32 addr , u32 data )
 {
   dynaLock();
   //LOG("memSetLong %08X, %08X\n", addr, data);
@@ -491,8 +526,7 @@ void memSetLong(u32 addr , u32 data )
   {  
     // Low Memory
   case 0x00200000:
-    block->LookupTableLow[ (addr & 0x000FFFFF)>>1  ] = NULL;
-    block->LookupTableLow[ ((addr & 0x000FFFFF)>>1) + 1 ] = NULL;
+    block->InvalidateLow(addr, 4);
     T2WriteLong(LowWram, addr & 0xFFFFF, data);
     if(addr&0x20000000) DynarecSh2::CurrentContext->memcycle_ += 7;
     dynaFree();
@@ -501,8 +535,8 @@ void memSetLong(u32 addr , u32 data )
   // High Memory
   case 0x06000000:
 #if defined(SET_DIRTY)
-    block->setDirty(addr);
-    block->setDirty(addr+2);
+    InvalidateHighWrite(block, addr);
+    InvalidateHighWrite(block, addr+2);
 #else
     block->LookupTable[(addr & 0x000FFFFF) >> 1] = NULL;
     block->LookupTable[((addr & 0x000FFFFF) >> 1) + 1] = NULL;
@@ -517,7 +551,7 @@ void memSetLong(u32 addr , u32 data )
   default:
     if ((addr & 0xFF000000) == 0xC0000000)
     {
-      block->LookupTableC[ (addr&0x000FFFFF)>>1 ] = NULL;
+      block->LookupTableC.clear();
     }
   }
   MappedMemoryWriteLong(addr, data, &cycle);
@@ -525,6 +559,48 @@ void memSetLong(u32 addr , u32 data )
   dynaFree();
 }
 
+#ifdef VITA_SH2_WRITE_HELPER_O3
+#pragma GCC push_options
+#pragma GCC optimize ("O3")
+// Only the already-existing high-RAM/no-code-owner case is a leaf. All code
+// invalidation, initialization, low RAM and mapped devices use the old helper.
+#define WRITE_LEAF(Name, Type, Width) \
+  void memSet##Name(u32 addr, Type data) { \
+    CompileBlocks *block=CompileBlocks::existingInstance(); \
+    if ((addr & 0xdff00000u)==0x06000000u && block && \
+        block->LookupParentTable[adress_mask(addr)].size()==0 && \
+        ((Width)!=4 || block->LookupParentTable[adress_mask(addr+2)].size()==0)) { \
+      T2Write##Name(HighWram,addr&0xfffff,data); \
+      if(addr&0x20000000u) DynarecSh2::CurrentContext->memcycle_+=2; \
+      return; \
+    } \
+    WriteSlow##Name(addr,data); \
+  }
+WRITE_LEAF(Byte,u8,1)
+WRITE_LEAF(Word,u16,2)
+WRITE_LEAF(Long,u32,4)
+#undef WRITE_LEAF
+#pragma GCC pop_options
+#endif
+#undef WRITE_LINKAGE
+#undef WRITE_NAME
+#ifdef VITA_SH2_READ_HELPER_O3
+#pragma GCC push_options
+#pragma GCC optimize ("O3")
+/* Keep address-taken cycle scratch and the mapped callback's LR save out of
+ * direct WRAM reads. The fallback retains the same handler and cycle update. */
+#define MAPPED_READ_HELPER(Name, Type) \
+  static __attribute__((noinline)) Type ReadMapped##Name(u32 addr) { \
+    u32 cycle=0; \
+    Type value=MappedMemoryRead##Name(addr,&cycle); \
+    DynarecSh2::CurrentContext->memcycle_+=cycle; \
+    return value; \
+  }
+MAPPED_READ_HELPER(Byte,u8)
+MAPPED_READ_HELPER(Word,u16)
+MAPPED_READ_HELPER(Long,u32)
+#undef MAPPED_READ_HELPER
+#endif
 u8 memGetByte(u32 addr)
 {
   dynaLock();
@@ -548,10 +624,14 @@ u8 memGetByte(u32 addr)
     return val;
     break;
   }
+#ifdef VITA_SH2_READ_HELPER_O3
+  return ReadMappedByte(addr);
+#else
   val = MappedMemoryReadByte(addr, &cycle);
   DynarecSh2::CurrentContext->memcycle_ += cycle;
   dynaFree();
   return val;
+#endif
 }
  
 u16 memGetWord(u32 addr)
@@ -577,10 +657,14 @@ u16 memGetWord(u32 addr)
     return val;
     break;
   }
+#ifdef VITA_SH2_READ_HELPER_O3
+  return ReadMappedWord(addr);
+#else
   val = MappedMemoryReadWord(addr, &cycle);
   DynarecSh2::CurrentContext->memcycle_ += cycle;
   dynaFree();
   return val;
+#endif
 }
 
 u32 memGetLong(u32 addr)
@@ -605,12 +689,19 @@ u32 memGetLong(u32 addr)
     return val;
     break;
   }
+#ifdef VITA_SH2_READ_HELPER_O3
+  return ReadMappedLong(addr);
+#else
   val = MappedMemoryReadLong(addr, &cycle);
   DynarecSh2::CurrentContext->memcycle_ += cycle;
   dynaFree();
   return val;
+#endif
 }
 
+#ifdef VITA_SH2_READ_HELPER_O3
+#pragma GCC pop_options
+#endif
 #if defined(__arm__) || defined(__aarch64__)
 #pragma GCC pop_options
 #endif
@@ -748,4 +839,3 @@ int EachClock() {
 
 
 }
-

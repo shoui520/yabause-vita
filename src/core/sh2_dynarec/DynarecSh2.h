@@ -25,9 +25,12 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <array>
+#include <vector>
 
 #include <sys/types.h>
 #include <stdint.h>
+#include <cstddef>
 
 #include "debug.h"
 #include "threads.h"
@@ -50,22 +53,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #define I_F     10
 #define NI_F    11
 
-#ifdef _WINDOWS
-#include <Windows.h>
-#define ALLOCATE(x) VirtualAlloc(NULL, x, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-#define FREEMEM(x,a)	if(x){ VirtualFree(x, a,MEM_RELEASE ); x = NULL;}
-#elif defined(ARCH_IS_LINUX)
-#include <sys/mman.h>
-#define ALLOCATE(x) mmap (NULL, x, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_FILE|MAP_PRIVATE ,-1, 0);
-//#define ALLOCATE(x) mmap ((void*)0x6000000, x, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS ,-1, 0);
-#define FREEMEM(x,a) munmap(x,a);
-#else
-#include <sys/mman.h>
-#define ALLOCATE(x) mmap (NULL, x, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_FILE|MAP_PRIVATE ,-1, 0);
-#define FREEMEM(x,a) munmap(x,a);
-//#define ALLOCATE(x)	malloc(x)
-//#define FREEMEM(x,a)	if(x){ free(x); x = NULL;}
-#endif
+#include <cstdlib>
+#include <new>
+unsigned char *VitaSh2CodeArena();
 
 const int MAX_INSTSIZE = 0xFFFF+1;
 
@@ -87,23 +77,28 @@ typedef map<u32, CompileStaticsNode> MapCompileStatics;
 // Structs
 //****************************************************
 
-const int NUMOFBLOCKS = 1024*4;
+#include "../../vita/code_arena_layout.h"
+const int NUMOFBLOCKS = vitacode::Layout::Sh2Blocks;
 //const int MAXBLOCKSIZE = 3072-(4*4);
-const int MAXBLOCKSIZE = 4096;
+const int MAXBLOCKSIZE = vitacode::Layout::Block;
 #define MAINMEMORY_SIZE (0x100000);
 #define ROM_SIZE (0x80000);
 
 struct Block
 {
-  u8  code[MAXBLOCKSIZE];
+  u8 *code;
   u32 b_addr; //beginning PC
   u32 e_addr; //ending PC
   u32 id;
   u32 flags;
+  u32 poll;
+  u32 poll_step; // Exact single-iteration recipe; no added wait-skip authority.
 };
 
 #define BLOCK_LOOP  (0x01)
+#define BLOCK_RESIDENT_LOOP (0x04)
 #define BLOCK_WRITE (0x02)
+#define BLOCK_POLL_FUSED (0x08)
 
 #define IN_INFINITY_LOOP (-1)
 
@@ -122,6 +117,17 @@ struct tagSH2
   uintptr_t eachclock;
   u32 exitcount;
 };
+
+#ifdef VITA
+// dynalib_arm.s uses fixed byte offsets, not C++ member access. Reject ABI
+// drift at build time rather than corrupting guest state in generated code.
+static_assert(sizeof(uintptr_t) == 4, "ARM templates require 32-bit pointers");
+static_assert(offsetof(tagSH2, CtrlReg) == 64, "ARM SR/GBR/VBR offsets");
+static_assert(offsetof(tagSH2, SysReg) == 76, "ARM MACH/MACL/PR/PC offsets");
+static_assert(offsetof(tagSH2, getmembyte) == 100, "ARM memory callback offsets");
+static_assert(offsetof(tagSH2, eachclock) == 124, "ARM clock callback offset");
+static_assert(offsetof(tagSH2, exitcount) == 128, "ARM exit counter offset");
+#endif
 
 // Instruction
 struct i_desc
@@ -205,11 +211,12 @@ private:
     remove_count_ = 0;
   }
   ~CompileBlocks(){
-    FREEMEM(dCode, sizeof(Block)*NUMOFBLOCKS);
+    free(dCode);
   }
   static CompileBlocks * instance_;
   bool show_code_ = false;
 public:
+  static CompileBlocks *existingInstance() { return instance_; }
   void setShowCode( bool b ){ show_code_ = b; }
   static CompileBlocks * getInstance(){
     if( instance_ == NULL ){
@@ -226,11 +233,16 @@ public:
   u8 dsh2_instructions[MAX_INSTSIZE];
   Block* LookupTable[0x100000>>1];    
   //addrs LookupParentTable[0x100000>>1];
-  addrs * LookupParentTable;
-  Block* LookupTableRom[0x80000>>1];
+  addrs * LookupParentTable = nullptr;
+  // Dispatch indexes the full 1 MiB ROM address window, including mirrors.
+  // Do not collapse aliases: block metadata contains the original guest PC.
+  Block* LookupTableRom[0x100000>>1];
   Block* LookupTableLow[0x100000>>1];
-  Block* LookupTableC[0x8000>>1];
-  Block * dCode;
+  std::array<std::vector<Block*>, 256> low_code_pages;
+  void InvalidateLow(u32 address, u32 length);
+  // Each SH-2 has its own cache RAM. Keep both CPU identity and full guest PC.
+  std::unordered_map<u64, Block*> LookupTableC;
+  Block * dCode = nullptr;
   
   std::unordered_map<u32, int> self_modify_block;
 
@@ -328,6 +340,8 @@ public:
   void ResetCPU();  
   void ExecuteCount(u32 Count );
   int Execute();
+  int ExecuteBlock(Block *block);
+  int FinishBlock(Block *block);
   void Undecoded();
 
   void AddCycle(u32 cycle) {
@@ -336,6 +350,7 @@ public:
 
   u32 addcycle_ = 0;
   u32 memcycle_ = 0;
+  bool counted_slice_active_ = false;
   void ShowStatics();
   void ShowCompileInfo();
   void ResetCompileInfo();

@@ -81,6 +81,18 @@ extern _EachClock, _DelayEachClock, _DebugEachClock, _DebugDelayClock
 */
  
 .arch armv7-a
+.arm
+
+// Private entry skips the 28-byte normal prologue. Its caller owns the
+// aligned host frame and supplies r7=state, r8=PC, r9=cycles, r11=return.
+// Every callback must obey AAPCS (in particular preserving r11).
+.macro BLOCK_RETURN
+.ifdef VITA_SH2_CHAIN_ABI
+  bx r11
+.else
+  pop {r4-r10, pc}
+.endif
+.endm
  
 .macro opfunc name
 .section .text 
@@ -226,11 +238,20 @@ extern _EachClock, _DelayEachClock, _DebugEachClock, _DebugDelayClock
 // r9   <- Clock Counter
 .global prologue
 prologue:
+.ifdef VITA_SH2_CHAIN_ABI
+push {r4-r11, r12, lr} // 40 bytes: preserve r11 and keep 8-byte alignment
+adr r11, .Lblock_public_return
+b .Lblock_public_body
+.Lblock_public_return:
+pop {r4-r11, r12, pc}
+.Lblock_public_body:
+.else
 push {r4-r10, lr}   // push regs
+.endif
 mov r7, r0      // GenReg( r0 has adress of m_pDynaSh2)
 LDR_PC r8       // PC
 LDR_COUNT r9    // ClockCounter
-.size	prologue, .-prologue // 16
+.size	prologue, .-prologue // 16 baseline, 28 with private chain ABI
 
 
 //-----------------------------------------------------
@@ -251,7 +272,7 @@ add r8, #2    // PC += 2
 STR_PC r8
 add r9, #1    // Clock += 1  
 STR_COUNT r9
-pop {r4-r10, pc} // pop regs and resturn
+BLOCK_RETURN
 continue:
 mov r8, r0    // copy jump addr
 sub r8, #2    // PC -= 2
@@ -266,7 +287,7 @@ add r8, #2    // PC += 2
 STR_PC r8     // store to memory
 add r9, #1    // Clock += 1  
 STR_COUNT r9  // store to memory
-pop {r4-r10, pc} // pop regs and resturn
+BLOCK_RETURN
 .size seperator_delay_after, .-seperator_delay_after // 20
 
 
@@ -276,7 +297,7 @@ pop {r4-r10, pc} // pop regs and resturn
 epilogue:
 STR_PC r8     // store PC to memory
 STR_COUNT r9  // store COUNTER to memory
-pop {r4-r10, pc}  // pop regs and resturn
+BLOCK_RETURN
 .size	epilogue, .-epilogue // 12
 
 //-----------------------------------------------------
@@ -287,11 +308,11 @@ cmn r0, #1 // 7
 bne PageFlip.jmp     // 2
 STR_PC r8     // store PC to memory
 STR_COUNT r9  // store COUNTER to memory
-pop {r4-r10, pc} // pop regs and resturn
+BLOCK_RETURN
 PageFlip.jmp:
 STR_PC r0
 STR_COUNT r9  // store COUNTER to memory
-pop {r4-r10, pc} // pop regs and resturn
+BLOCK_RETURN
 
 .size	PageFlip, .-PageFlip // 22
 
@@ -306,7 +327,7 @@ STR_COUNT r9  // store to memory
 CALL_EACHCLOCK
 tst r0, #1
 bne seperator_d_normal.continue
-pop {r4-r10, pc} // pop regs and resturn
+BLOCK_RETURN
 seperator_d_normal.continue:
 
 //------------------------------------------------------
@@ -324,7 +345,7 @@ add r8, #2    // PC += 2
 STR_PC r8
 add r9, #1    // Clock += 1  
 STR_COUNT r9
-pop {r4-r10, pc} // pop regs and resturn
+BLOCK_RETURN
 seperator_d_delay.continue:
 mov r8, r0    // copy jump addr
 sub r8, #2    // PC -= 2
@@ -1243,7 +1264,7 @@ add r0, r0, r1, asl #2 // PC = MappedMemoryReadLong(VBR+(imm<<2));
 CALL_GETMEM_LONG
 
 
-opdesc BT,		32,0xff,0xff,0xff,0,0xff
+opdesc BT,		36,0xff,0xff,0xff,0,0xff
 opfunc BT
 mov r0, #0 // disp
 sxtb r0,r0
@@ -1253,8 +1274,10 @@ tst     r1, #1
 addne   r0, r2, r0, asl #1
 addne   r0, r0, #4
 mvneq   r0, #0
+// The shared separator charges 3 states; an untaken BT costs only 1.
+subeq   r9, r9, #2
 
-opdesc BF,		32,0xff,0xff,0xff,0,0xff
+opdesc BF,		36,0xff,0xff,0xff,0,0xff
 opfunc BF
 mov r0, #0 // disp
 sxtb r0,r0
@@ -1264,8 +1287,24 @@ tst     r1, #1
 addeq   r0, r2, r0, asl #1
 addeq   r0, r0, #4
 mvnne   r0, #0
+// SH7604 table 2.16: BF is also 3 states taken, 1 not taken.
+subne   r9, r9, #2
 
-opdesc BF_S,		32,0xFF,0xFF,0xFF,0,0xFF
+// Delayed BT uses a different cycle/exit separator. Keep its template separate
+// so the non-delayed BT correction cannot change BT/S accounting.
+opdesc BT_S, 36,0xff,0xff,0xff,0,0xff
+opfunc BT_S
+mov r0, #0
+sxtb r0,r0
+LDR_SR r1
+mov r2, r8
+tst r1, #1
+addne r0, r2, r0, asl #1
+addne r0, r0, #4
+addeq r0, r2, #4
+subeq r9, r9, #1
+
+opdesc BF_S,		36,0xFF,0xFF,0xFF,0,0xFF
 opfunc BF_S
 mov     r0, #0      // r0 = disp
 mov     r1, r8      // r1 = PC 
@@ -1274,7 +1313,8 @@ tst     r2, #1  //
 sxtbeq  r0,r0
 addeq   r0, r1, r0, asl #1
 addeq   r0, r0, #4
-mvnne   r0, #0
+addne   r0, r1, #4
+subne   r9, r9, #1
 
 
 //Store/Load Opcodes
@@ -1695,78 +1735,12 @@ orrne   r3, r3, #1
 biceq   r3, r3, #1
 STR_SR     r3
 
-opdesc DIV1, (64*4),0,4,0xff,0xff,0xff
+.include "sh2_dynarec/div1_a9.inc"
+opdesc DIV1, (DIV1.FINISH-x86_DIV1),0,4,0xff,0xff,0xff
 opfunc DIV1
 mov r0, #0 // m
 mov r1, #0 // n
-  LDR_SR r3
-	ldr	r4, [r7, r1]
-	cmp	r4, #0
-	ubfx	r2, r3, #8, #1
-	bicge	r3, r3, #256
-	orrlt	r3, r3, #256
-	cmp	r2, #1
-	and	r2, r3, #1
-	orr	r2, r2, r4, asl #1
-	str	r2, [r7, r1]
-	ldr	r0, [r7, r0]
-	bne	DIV1.L41
-	tst	r3, #512
-	bne	DIV1.L21
-	add	r0, r2, r0
-	str	r0, [r7, r1]
-	cmp	r0, r2
-	movcs	r2, #0
-	movcc	r2, #1
-	tst	r3, #256
-	bne	DIV1.L34
-	b	DIV1.L25
-DIV1.L41:
-	tst	r3, #512
-	beq	DIV1.L42
-	add	r0, r2, r0
-	str	r0, [r7, r1]
-	cmp	r0, r2
-	movcs	r2, #0
-	movcc	r2, #1
-	tst	r3, #256
-	bne	DIV1.L25
-DIV1.L34:
-	cmp	r2, #0
-	bne	DIV1.L27
-DIV1.L31:
-	orr	r3, r3, #256
-DIV1.L16:
-	mov	r2, r3, asr #8
-	eor	r2, r2, r3, asr #9
-	tst	r2, #1
-	orreq	r3, r3, #1
-	bicne	r3, r3, #1
-	STR_SR r3
-	b DIV1.FINISH
-DIV1.L42:
-	rsb	r0, r0, r2
-	str	r0, [r7, r1]
-	cmp	r0, r2
-	movls	r2, #0
-	movhi	r2, #1
-	tst	r3, #256
-	bne	DIV1.L34
-DIV1.L25:
-	cmp	r2, #0
-	bne	DIV1.L31
-DIV1.L27:
-	bic	r3, r3, #256
-	b	DIV1.L16
-DIV1.L21:
-	rsb	r0, r0, r2
-	str	r0, [r7, r1]
-	cmp	r0, r2
-	movls	r2, #0
-	movhi	r2, #1
-	tst	r3, #256
-	bne	DIV1.L25
-	b	DIV1.L34
+SH2_DIV1_A9
 DIV1.FINISH:
 
 
