@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Decoded RGBA tile atlas. The host must select point sampling and clamp mode.
+// This initial program does not implement Saturn priority/color calculations.
+float4 main(float2 texcoord : TEXCOORD0, uniform sampler2D atlas : TEXUNIT0) : COLOR
+{
+    float4 color = tex2D(atlas, texcoord);
+    if (color.a == 0.0) discard;
+    return color;
+}

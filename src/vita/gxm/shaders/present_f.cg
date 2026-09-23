@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// The final image is opaque, including an as-yet unrendered interlace field.
+float4 main(float2 uv : TEXCOORD0, uniform sampler2D image : TEXUNIT0) : COLOR
+{
+    return float4(tex2D(image, uv).rgb, 1.0);
+}

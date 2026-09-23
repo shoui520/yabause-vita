@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Selection/shadow/blending ported from Guillaume Duhamel's GPL Titan renderer.
+// VDP2 manual chapters 9, 11, 12. This shader preserves the reference core's
+// packed-alpha arithmetic; extended color calculation is not implemented by
+// that reference algorithm and must not be claimed on the strength of parity.
+struct Pixel { float4 color; float4 meta; };
+
+Pixel fetch_pixel(sampler2D image, float2 p, float2 size)
+{
+    Pixel v;
+    float2 uv = (float2(p.x * 2.0, p.y) + 0.5) / float2(size.x * 2.0, size.y);
+    v.color = floor(tex2D(image, uv) * 255.0 + 0.5);
+    v.meta = floor(tex2D(image, uv + float2(0.5 / size.x, 0.0)) * 255.0 + 0.5);
+    return v;
+}
+
+void insert_pixel(Pixel value, inout Pixel top, inout Pixel second)
+{
+    // Call in ascending layer order: later layers win equal priorities.
+    if (value.meta.x > 0.0) {
+        if (value.meta.x >= top.meta.x) { second = top; top = value; }
+        else if (value.meta.x >= second.meta.x) second = value;
+    }
+}
+
+float ratio(float4 p) { return fmod(p.a, 64.0); }
+float4 blend_top(float4 a, float4 b)
+{
+    float weight = ratio(a) * 4.0 + 3.0;
+    // Separate truncation matches the current reference renderer, including
+    // its rounding difference from exact Saturn 5-bit ratio arithmetic.
+    return float4(floor(a.rgb * weight / 255.0 + 0.00001) +
+                  floor(b.rgb * (255.0 - weight) / 255.0 + 0.00001), 63.0);
+}
+float4 blend(float4 a, float4 b, float mode)
+{
+    if (mode > 1.5) return float4(min(a.rgb + b.rgb, 255.0), 63.0);
+    if (mode > 0.5) {
+        if (a.a < 128.0) return a;
+        float weight = ratio(b) * 4.0 + 3.0;
+        return float4(floor(a.rgb * weight / 255.0 + 0.00001) +
+                      floor(b.rgb * (255.0 - weight) / 255.0 + 0.00001), ratio(a));
+    }
+    return blend_top(a, b);
+}
+bool calculated(float4 p, float mode)
+{
+    return mode > 0.5 ? p.a >= 128.0 : ratio(p) < 63.0;
+}
+
+float4 main(float2 uv : TEXCOORD0,
+    uniform sampler2D nbg3 : TEXUNIT0, uniform sampler2D nbg2 : TEXUNIT1,
+    uniform sampler2D nbg1 : TEXUNIT2, uniform sampler2D nbg0 : TEXUNIT3,
+    uniform sampler2D rbg0 : TEXUNIT4, uniform sampler2D sprite : TEXUNIT5,
+    uniform sampler2D line_data : TEXUNIT6,
+    uniform float2 source_size, uniform float2 field_state,
+    uniform float2 controls) : COLOR
+{
+    float2 p = min(floor(uv * source_size), source_size - 1.0);
+    // Preserve the previous field in the native-resolution color surface.
+    if (field_state.x > 1.0 && fmod(p.y, 2.0) != field_state.y) discard;
+    float native_y = p.y;
+    p.y = floor(p.y / field_state.x);
+    float2 layer_size = float2(source_size.x, source_size.y / field_state.x);
+    Pixel back;
+    back.color = floor(tex2D(line_data, float2(0.5 / 8.0, (native_y + 0.5) / source_size.y)) * 255.0 + 0.5);
+    back.meta = floor(tex2D(line_data, float2(1.5 / 8.0, (native_y + 0.5) / source_size.y)) * 255.0 + 0.5);
+    back.meta.x = 0.0;
+    Pixel top = back, second = back;
+    insert_pixel(fetch_pixel(nbg3, p, layer_size), top, second);
+    insert_pixel(fetch_pixel(nbg2, p, layer_size), top, second);
+    insert_pixel(fetch_pixel(nbg1, p, layer_size), top, second);
+    insert_pixel(fetch_pixel(nbg0, p, layer_size), top, second);
+    insert_pixel(fetch_pixel(rbg0, p, layer_size), top, second);
+    insert_pixel(fetch_pixel(sprite, p, layer_size), top, second);
+    if (top.meta.y > 0.0) {
+        float4 line = floor(tex2D(line_data,
+            float2((top.meta.y + 1.5) / 8.0, (native_y + 0.5) / source_size.y)) * 255.0 + 0.5);
+        top.color = blend(top.color, line, controls.x);
+    }
+    bool shadow = top.meta.z == 1.0 ||
+        (top.meta.z == 2.0 && all(top.color.rgb == float3(0.0)));
+    if (shadow) {
+        top.color = second.meta.w != 0.0 ? blend_top(float4(0.0, 0.0, 0.0, 32.0), second.color) : second.color;
+    } else {
+        if (calculated(top.color, controls.x)) top.color = blend(top.color, second.color, controls.x);
+        if (top.meta.z == 2.0 && controls.y == 0.0)
+            top.color = blend_top(float4(0.0, 0.0, 0.0, 32.0), top.color);
+    }
+    return float4(top.color.rgb / 255.0, 1.0);
+}
