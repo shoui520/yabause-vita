@@ -38,6 +38,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 #include "scsp.h"
 #include "scspdsp.h"
+#include "c68k/native_guard.h"
 
 
 //saturate 24 bit signed integer
@@ -247,8 +248,11 @@ void ScspDspExec(ScspDsp* dsp, int addr, u8 * sound_ram)
   }
   else if (dsp->write_pending)
   {
-    if (!(dsp->io_addr & 0x40000))
+    if (!(dsp->io_addr & 0x40000)) {
+      C68K_NATIVE_GUARD;
       sound_ram_16[dsp->io_addr] = dsp->write_value;
+      M68KWriteNotify(dsp->io_addr * 2, 2);
+    }
     dsp->write_pending = 0;
   }
   {

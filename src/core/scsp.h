@@ -58,6 +58,11 @@ extern "C"{
 #define SCSP_MUTE_SYSTEM    1
 #define SCSP_MUTE_USER      2
 
+/* Worker lifetime, for execution tiers that require owner-local event delivery. */
+int ScspHasAsyncWorker(void);
+/* Valid only within an SH-2 execution slice, not during the VBlank handoff. */
+int ScspCpuSliceIsQuiescent(void);
+
 typedef struct
 {
    int id;

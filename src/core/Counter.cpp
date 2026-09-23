@@ -30,6 +30,11 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "yabause.h"
 
 #include <atomic>
+#include "../vita/sound_budget.h"
+#include "../vita/sound_budget_api.h"
+
+static VitaSoundBudget sound_budget;
+static bool blocking_sound_budget = false;
 
 using std::atomic;
 
@@ -39,11 +44,19 @@ atomic<u64> m68k_counter_done(0);
 const u64 MAX_SCSP_COUNTER = (u64)(44100 * 256 / 60) << SCSP_FRACTIONAL_BITS;
 
 extern "C" {
+  void VitaSoundBudgetConfigure(int enabled) { blocking_sound_budget = enabled != 0; }
+  int VitaSoundBudgetBlocking() { return blocking_sound_budget; }
+  void VitaSoundBudgetStart() { if (blocking_sound_budget) sound_budget.start(); }
+  void VitaSoundBudgetStop() { if (blocking_sound_budget) sound_budget.stop(); }
+  int VitaSoundBudgetWait(uint64_t previous, uint64_t *current) {
+    return sound_budget.wait_changed(previous, SCSP_FRACTIONAL_BITS, *current);
+  }
   void SyncCPUtoSCSP();
   extern u64 g_m68K_dec_cycle;
 
   void setM68kCounter(u64 counter) {
-    m68k_counter = counter;
+    if (blocking_sound_budget) sound_budget.publish(counter);
+    else m68k_counter = counter;
   }
 
   void setM68kDoneCounter(u64 counter) {
@@ -51,7 +64,7 @@ extern "C" {
   }
 
   u64 getM68KCounter() {
-    return m68k_counter;
+    return blocking_sound_budget ? sound_budget.load() : m68k_counter.load();
   }
 
   void syncM68K() {
@@ -66,8 +79,7 @@ extern "C" {
     u64 a = (m68k_counter >> SCSP_FRACTIONAL_BITS);
     u64 b = m68k_counter_done;
     //LOG("[CPU] INC m68k_counter %lld/%lld", a, b);
-    while ( (m68k_counter >> SCSP_FRACTIONAL_BITS) > m68k_counter_done) { timeout++; };
+    while ( (getM68KCounter() >> SCSP_FRACTIONAL_BITS) > m68k_counter_done) { timeout++; };
   }
 
 }
-

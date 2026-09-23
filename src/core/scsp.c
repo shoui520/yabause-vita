@@ -103,6 +103,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 //--------------------------------------------------------------
 
 #include <stdio.h>
+#include "../vita/telemetry.h"
 #include <stdlib.h>
 #include <stdarg.h>
 #include <math.h>
@@ -117,6 +118,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "scu.h"
 #include "yabause.h"
 #include "scsp.h"
+#include "c68k/native_guard.h"
+#include "c68k/native_source.h"
+#include "../vita/c68k_runtime.h"
 #include "scspdsp.h"
 #include "threads.h"
 
@@ -1449,6 +1453,7 @@ int get_sdl_shift(int sdl)
 
 void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r, int mvol, s16 cd_in_l, s16 cd_in_r)
 {
+   VT_SCOPE(VT_SCSP_MIX);
    int step_num = 0;
    int i = 0;
    int mvol_shift = 0;
@@ -1512,8 +1517,11 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
 	   scsp_dsp.updated = 0;
    }
 
-   for (i = 0; i < scsp_dsp.last_step; i++)
-      ScspDspExec(&scsp_dsp, i, SoundRam);
+   if (scsp_dsp.last_step > 0) {
+      VT_SCOPE(VT_SCSP_DSP);
+      for (i = 0; i < scsp_dsp.last_step; i++)
+         ScspDspExec(&scsp_dsp, i, SoundRam);
+   }
 
    if (!scsp_dsp.mdec_ct){
      scsp_dsp.mdec_ct = (0x2000 << rbl);
@@ -1821,7 +1829,18 @@ static void scsp_slot_update_keyon(slot_t *slot);
 
 static int scsp_mute_flags = 0;
 static int scsp_volume = 100;
-static int thread_running = 0;
+#include <stdatomic.h>
+#include "../vita/sound_budget_api.h"
+static _Atomic int thread_running = 0;
+int ScspHasAsyncWorker(void) {
+  return atomic_load_explicit(&thread_running, memory_order_acquire) != 0;
+}
+int ScspCpuSliceIsQuiescent(void) {
+  // Legacy CPU-paced sound receives its entire budget at VBlank, where the
+  // main thread waits for q_scsp_finish before running another SH-2 slice.
+  // Incremental new-SCSP and real-time pacing do NOT provide this guarantee.
+  return !ScspHasAsyncWorker() || (!use_new_scsp && g_scsp_main_mode == 0);
+}
 static int scsp_sample_count = 0;
 static int scsp_checktime = 0;
 ////////////////////////////////////////////////////////////////
@@ -1966,7 +1985,11 @@ scsp_dma (void)
       for (int i = 0; i < cnt; i++) {
         u16 val = scsp_r_w(from);
         //if (scsp.dmfl & 0x40) val = 0;
-        T2WriteWord(SoundRam, to & 0x7FFFF, val);
+        {
+          C68K_NATIVE_GUARD;
+          T2WriteWord(SoundRam, to & 0x7FFFF, val);
+          M68KWriteNotify(to & 0x7FFFF, 2);
+        }
         from += 2;
         to += 2;
       }
@@ -2715,6 +2738,8 @@ scsp_set_b (u32 a, u8 d)
   switch (a & 0x3F)
     {
     case 0x00: // MEM4MB/DAC18B
+    {
+      C68K_NATIVE_GUARD; // Mode and all fetch banks change as one operation.
       scsp.mem4b = (d >> 1) & 0x1;
       if (scsp.mem4b)
         {
@@ -2728,6 +2753,7 @@ scsp_set_b (u32 a, u8 d)
           M68K->SetFetch(0x0C0000, 0x100000, (pointer)SoundRam);
         }
       return;
+    }
 
     case 0x01: // VER/MVOL
       scsp.mvol = d & 0xF;
@@ -2885,6 +2911,8 @@ scsp_set_w (u32 a, u16 d)
   switch (a & 0x3E)
     {
     case 0x00: // MEM4MB/DAC18B/VER/MVOL
+    {
+      C68K_NATIVE_GUARD;
       scsp.mem4b = (d >> 9) & 0x1;
       scsp.mvol = d & 0xF;
       if (scsp.mem4b)
@@ -2899,6 +2927,7 @@ scsp_set_w (u32 a, u16 d)
           M68K->SetFetch(0x0C0000, 0x100000, (pointer)SoundRam);
         }
       return;
+    }
 
     case 0x02: // RBL/RBP
       scsp.rbl = (d >> 7) & 3;
@@ -3843,6 +3872,7 @@ static void (*scsp_slot_update_p[2][2][2][2][2])(slot_t *slot) =
 void
 scsp_update (s32 *bufL, s32 *bufR, u32 len)
 {
+   VT_SCOPE(VT_SCSP_MIX);
    slot_t *slot;
 
    scsp_bufL = bufL;
@@ -3896,6 +3926,7 @@ scsp_update (s32 *bufL, s32 *bufR, u32 len)
 
    if (cdda_out_left > 0)
    {
+      VT_SCOPE(VT_CDDA);
       if (len > cdda_out_left / 4)
          scsp_buf_len = cdda_out_left / 4;
       else
@@ -4802,7 +4833,9 @@ c68k_byte_write (const u32 adr, u32 data)
     //  SCSPLOG("c68k_word_write %08X:%02X\n", adr, data);
     //}
     if (adr < 0x80000) {
+      C68K_NATIVE_GUARD;
       T2WriteByte(SoundRam, adr & 0x7FFFF, data);
+      M68KWriteNotify(adr & 0x7FFFF, 1);
     }
   }
   else{
@@ -4837,7 +4870,9 @@ c68k_word_write (const u32 adr, u32 data)
 //      SCSPLOG("c68k_word_write %08X:%04X @ %d\n", adr, data, (m68kcycle >> CLOCK_SYNC_SHIFT) );
 //    }
     if (adr < 0x80000) {
+      C68K_NATIVE_GUARD;
       T2WriteWord(SoundRam, adr, data);
+      M68KWriteNotify(adr, 2);
     }
   }
   else{
@@ -4896,6 +4931,7 @@ SoundRamWriteByte (u32 addr, u8 val)
     return;
 
   //SCSPLOG("SoundRamWriteByte %08X:%02X", addr, val);
+  C68K_NATIVE_GUARD;
   T2WriteByte (SoundRam, addr, val);
   M68K->WriteNotify (addr, 1);
 }
@@ -4969,6 +5005,7 @@ SoundRamWriteWord (u32 addr, u16 val)
   else if (addr > 0x7FFFF)
     return;
   //LOG("SoundRamWriteWord %08X:%04X", addr, val);
+  C68K_NATIVE_GUARD;
   T2WriteWord (SoundRam, addr, val);
   M68K->WriteNotify (addr, 2);
   //SyncSh2And68k();
@@ -5043,6 +5080,7 @@ SoundRamWriteLong (u32 addr, u32 val)
     return;
 
   //LOG("SoundRamWriteLong %08X:%08X", addr, val);
+  C68K_NATIVE_GUARD;
   T2WriteLong (SoundRam, addr, val);
   M68K->WriteNotify (addr, 4);
   //SyncSh2And68k();
@@ -5067,6 +5105,10 @@ ScspInit (int coreid, int scsp_sync_count_per_frame, int scsp_main_mode )
 
   M68K->SetReadB ((C68K_READ *)c68k_byte_read);
   M68K->SetReadW ((C68K_READ *)c68k_word_read);
+  // Only the known Saturn callbacks authorize bypassing reads of ordinary
+  // sound RAM. Other cores and later callback replacements remain untouched.
+  if (M68K->id == M68KCORE_C68K) C68K.DirectReadRam = SoundRam;
+  C68kNativeSourceBind(M68K->id == M68KCORE_C68K ? SoundRam : NULL);
   M68K->SetWriteB ((C68K_WRITE *)c68k_byte_write);
   M68K->SetWriteW ((C68K_WRITE *)c68k_word_write);
 
@@ -5176,6 +5218,7 @@ ScspDeInit (void)
   ScspUnMuteAudio(1);
   scsp_mute_flags = 0;
   thread_running = 0; 
+  VitaSoundBudgetStop();
 #if defined(ASYNC_SCSP)
   //if (q_scsp_finish) YabAddEventQueue(q_scsp_finish, 0);
   if (q_scsp_frame_start)YabAddEventQueue(q_scsp_frame_start, 0);
@@ -5196,6 +5239,8 @@ ScspDeInit (void)
 
   scsp_shutdown();
 
+  C68K.DirectReadRam = NULL;
+  C68kNativeSourceBind(NULL); // Worker joined above; invalidate before freeing.
   if (SoundRam)
     T2MemoryDeInit (SoundRam);
   SoundRam = NULL;
@@ -5317,6 +5362,7 @@ void new_scsp_run_sample()
 
 void new_scsp_exec(s32 cycles)
 {
+  VT_SCOPE(VT_SCSP);
    s32 cycles_temp = new_scsp_cycles - cycles;
    if (cycles_temp < 0)
    {
@@ -5417,7 +5463,8 @@ ScspConvert32uto16s (s32 *srcL, s32 *srcR, s16 *dst, u32 len)
 
 void
 ScspReceiveCDDA (const u8 *sector)
-{	
+{
+   VT_SCOPE(VT_CDDA);
    // If buffer is half empty or less, boost timing for a bit until we've buffered a few sectors
    if (cdda_out_left < (sizeof(cddabuf.data) / 2))
    {
@@ -5494,6 +5541,8 @@ void ScspExec(){
 #define __STDC_FORMAT_MACROS
 
 void ScspAsynMainCpuTime( void * p ){
+  VT_SCOPE(VT_SCSP);
+  VitaM68kNativeStart();
 
   u64 before;
   u64 now;
@@ -5527,11 +5576,17 @@ void ScspAsynMainCpuTime( void * p ){
     u64 m68k_done_counter = 0;
     u64 m68k_integer_part = 0;
     u64 m68k_cycle = 0;
+    if (VitaSoundBudgetBlocking()) {
+      VT_SCOPE(VT_SOUND_BUDGET_WAIT);
+      if (!VitaSoundBudgetWait(pre_m68k_cycle, &m68k_integer_part)) break;
+      m68k_cycle = m68k_integer_part - pre_m68k_cycle;
+    } else { VT_SCOPE(VT_SOUND_SYNC);
     do {
       m68k_integer_part = getM68KCounter() >> SCSP_FRACTIONAL_BITS;
       m68k_cycle = m68k_integer_part - pre_m68k_cycle;
       if (thread_running == 0) break;
     } while (m68k_cycle == 0);
+    }
 
     m68k_inc += m68k_cycle;
     pre_m68k_cycle = m68k_integer_part;
@@ -5556,11 +5611,13 @@ void ScspAsynMainCpuTime( void * p ){
         ScspInternalVars->scsptiming1 = scsplines;
         ScspExecAsync();
 
+        VitaM68kNativePark();
         YabAddEventQueue( q_scsp_finish , 0);
         pre_m68k_cycle = 0;
         m68k_inc = 0;
         //LOG("[SCSP] WAIT SH2");
         YabWaitEventQueue(q_scsp_frame_start);
+        VitaM68kNativeResume();
         now = YabauseGetTicks() * 1000000000 / yabsys.tickfreq;
         //LOG(" SCSPTIME = %d/16666666 %d/735", (s32)(now - before), hzcheck);
         hzcheck = 0;
@@ -5570,11 +5627,13 @@ void ScspAsynMainCpuTime( void * p ){
     }
     setM68kDoneCounter(pre_m68k_cycle);
   }
+  VitaM68kNativeStop();
   YabThreadWake(YAB_THREAD_SCSP);
 }
 
 
 void ScspAsynMainRealtime(void * p) {
+  VT_SCOPE(VT_SCSP);
 
   u64 before;
   u64 now;
@@ -5747,17 +5806,25 @@ void ScspAsynMainRealtime(void * p) {
 
 void ScspExec(){
   if (thread_running == 0){
+    VitaSoundBudgetStart();
     thread_running = 1;
+    int start_result;
     if (g_scsp_main_mode == 0) {
-      YabThreadStart(YAB_THREAD_SCSP, (void * (*)(void *))ScspAsynMainCpuTime, NULL);
+      start_result = YabThreadStart(YAB_THREAD_SCSP, (void * (*)(void *))ScspAsynMainCpuTime, NULL);
     }
     else {
-      YabThreadStart(YAB_THREAD_SCSP, (void * (*)(void *))ScspAsynMainRealtime, NULL);
+      start_result = YabThreadStart(YAB_THREAD_SCSP, (void * (*)(void *))ScspAsynMainRealtime, NULL);
+    }
+    if (start_result) {
+      thread_running = 0;
+      VitaSoundBudgetStop();
+      abort(); /* Do not wait forever for a worker that was never created. */
     }
     YabThreadUSleep(100000);
   }
 }
 void ScspExecAsync() {
+  VT_SCOPE(VT_SCSP_MIX);
   u32 audiosize;
 
 #endif
@@ -6330,6 +6397,7 @@ SoundSaveState (FILE *fp)
 int
 SoundLoadState (FILE *fp, int version, int size)
 {
+  C68K_NATIVE_GUARD;
   int i, i2;
   u32 temp;
   u8 nextphase;
@@ -6432,6 +6500,7 @@ SoundLoadState (FILE *fp, int version, int size)
 
   // Lastly, sound ram
   yread (&check, (void *)SoundRam, 0x80000, 1, fp);
+  M68KWriteNotify(0, 0x80000);
 
   if (version > 1)
     {
