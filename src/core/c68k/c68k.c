@@ -33,6 +33,8 @@
 #include <string.h>
 
 #include "c68k.h"
+#include "native_guard.h"
+#include "native_source.h"
 
 // shared global variable
 //////////////////////////
@@ -65,6 +67,7 @@ void FASTCALL C68k_Reset_Dummy(void);
 
 void C68k_Init(c68k_struc *cpu, C68K_INT_CALLBACK *int_cb)
 {
+    C68K_NATIVE_GUARD;
     memset(cpu, 0, sizeof(c68k_struc));
 
     C68k_Set_ReadB(cpu, C68k_Read_Dummy);
@@ -86,6 +89,7 @@ void C68k_Init(c68k_struc *cpu, C68K_INT_CALLBACK *int_cb)
 
 s32 FASTCALL C68k_Reset(c68k_struc *cpu)
 {
+    C68K_NATIVE_GUARD;
     memset(cpu, 0, ((u8 *)&(cpu->dirty1)) - ((u8 *)&(cpu->D[0])));
     
     cpu->flag_notZ = 1;
@@ -102,6 +106,7 @@ s32 FASTCALL C68k_Reset(c68k_struc *cpu)
 
 void FASTCALL C68k_Set_IRQ(c68k_struc *cpu, s32 level)
 {
+    C68K_NATIVE_GUARD;
     cpu->IRQLine = level;
     if (cpu->Status & C68K_RUNNING)
     {
@@ -115,6 +120,7 @@ void FASTCALL C68k_Set_IRQ(c68k_struc *cpu, s32 level)
 
 s32 FASTCALL C68k_Get_CycleToDo(c68k_struc *cpu)
 {
+    C68K_NATIVE_GUARD;
     if (!(cpu->Status & C68K_RUNNING)) return -1;
     
     return cpu->CycleToDo;
@@ -122,6 +128,7 @@ s32 FASTCALL C68k_Get_CycleToDo(c68k_struc *cpu)
 
 s32 FASTCALL C68k_Get_CycleRemaining(c68k_struc *cpu)
 {
+    C68K_NATIVE_GUARD;
     if (!(cpu->Status & C68K_RUNNING)) return -1;
 
     return (cpu->CycleIO + cpu->CycleSup);
@@ -129,6 +136,7 @@ s32 FASTCALL C68k_Get_CycleRemaining(c68k_struc *cpu)
 
 s32 FASTCALL C68k_Get_CycleDone(c68k_struc *cpu)
 {
+    C68K_NATIVE_GUARD;
     if (!(cpu->Status & C68K_RUNNING)) return -1;
 
     return (cpu->CycleToDo - (cpu->CycleIO + cpu->CycleSup));
@@ -136,11 +144,13 @@ s32 FASTCALL C68k_Get_CycleDone(c68k_struc *cpu)
 
 void FASTCALL C68k_Release_Cycle(c68k_struc *cpu)
 {
+    C68K_NATIVE_GUARD;
     if (cpu->Status & C68K_RUNNING) cpu->CycleIO = cpu->CycleSup = 0;
 }
 
 void FASTCALL C68k_Add_Cycle(c68k_struc *cpu, s32 cycle)
 {
+    C68K_NATIVE_GUARD;
     if (cpu->Status & C68K_RUNNING) cpu->CycleIO -= cycle;
 }
 
@@ -216,6 +226,8 @@ void C68k_Write_Long(c68k_struc *cpu, u32 adr, u32 data)
 
 void C68k_Set_Fetch(c68k_struc *cpu, u32 low_adr, u32 high_adr, pointer fetch_adr)
 {
+    C68K_NATIVE_GUARD;
+    C68kNativeSourceRemap();
     u32 i, j;
 
     i = (low_adr >> C68K_FETCH_SFT) & C68K_FETCH_MASK;
@@ -226,21 +238,27 @@ void C68k_Set_Fetch(c68k_struc *cpu, u32 low_adr, u32 high_adr, pointer fetch_ad
 
 void C68k_Set_ReadB(c68k_struc *cpu, C68K_READ *Func)
 {
+    C68K_NATIVE_GUARD;
+    cpu->DirectReadRam = NULL;
     cpu->Read_Byte = Func;
 }
 
 void C68k_Set_ReadW(c68k_struc *cpu, C68K_READ *Func)
 {
+    C68K_NATIVE_GUARD;
+    cpu->DirectReadRam = NULL;
     cpu->Read_Word = Func;
 }
 
 void C68k_Set_WriteB(c68k_struc *cpu, C68K_WRITE *Func)
 {
+    C68K_NATIVE_GUARD;
     cpu->Write_Byte = Func;
 }
 
 void C68k_Set_WriteW(c68k_struc *cpu, C68K_WRITE *Func)
 {
+    C68K_NATIVE_GUARD;
     cpu->Write_Word = Func;
 }
 
@@ -249,67 +267,79 @@ void C68k_Set_WriteW(c68k_struc *cpu, C68K_WRITE *Func)
 
 u32 C68k_Get_DReg(c68k_struc *cpu, u32 num)
 {
+    C68K_NATIVE_GUARD;
     return cpu->D[num];
 }
 
 u32 C68k_Get_AReg(c68k_struc *cpu, u32 num)
 {
+    C68K_NATIVE_GUARD;
     return cpu->A[num];
 }
 
 u32 C68k_Get_PC(c68k_struc *cpu)
 {
+    C68K_NATIVE_GUARD;
     return (u32)(cpu->PC - cpu->BasePC);
 }
 
 u32 C68k_Get_SR(c68k_struc *cpu)
 {
+    C68K_NATIVE_GUARD;
     c68k_struc *CPU = cpu;
     return GET_SR;
 }
 
 u32 C68k_Get_USP(c68k_struc *cpu)
 {
+    C68K_NATIVE_GUARD;
     if (cpu->flag_S) return cpu->USP;
     else return cpu->A[7];
 }
 
 u32 C68k_Get_MSP(c68k_struc *cpu)
 {
+    C68K_NATIVE_GUARD;
     if (cpu->flag_S) return cpu->A[7];
     else return cpu->USP;
 }
 
 void C68k_Set_DReg(c68k_struc *cpu, u32 num, u32 val)
 {
+    C68K_NATIVE_GUARD;
     cpu->D[num] = val;
 }
 
 void C68k_Set_AReg(c68k_struc *cpu, u32 num, u32 val)
 {
+    C68K_NATIVE_GUARD;
     cpu->A[num] = val;
 }
 
 void C68k_Set_PC(c68k_struc *cpu, u32 val)
 {
+    C68K_NATIVE_GUARD;
     cpu->BasePC = cpu->Fetch[(val >> C68K_FETCH_SFT) & C68K_FETCH_MASK];
     cpu->PC = val + cpu->BasePC;
 }
 
 void C68k_Set_SR(c68k_struc *cpu, u32 val)
 {
+    C68K_NATIVE_GUARD;
     c68k_struc *CPU = cpu;
     SET_SR(val);
 }
 
 void C68k_Set_USP(c68k_struc *cpu, u32 val)
 {
+    C68K_NATIVE_GUARD;
     if (cpu->flag_S) cpu->USP = val;
     else cpu->A[7] = val;
 }
 
 void C68k_Set_MSP(c68k_struc *cpu, u32 val)
 {
+    C68K_NATIVE_GUARD;
     if (cpu->flag_S) cpu->A[7] = val;
     else cpu->USP = val;
 }

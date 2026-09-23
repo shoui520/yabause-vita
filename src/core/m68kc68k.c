@@ -23,6 +23,8 @@
 
 #include "m68kc68k.h"
 #include "c68k/c68k.h"
+#include "c68k/native_guard.h"
+#include "c68k/native_source.h"
 #include "memory.h"
 #include "yabause.h"
 
@@ -38,6 +40,7 @@ static u8 *SoundDummy=NULL;
 
 static int M68KC68KInit(void) {
 	int i;
+	C68kNativeSourceBind(NULL);
 
 	// Setup a 64k buffer filled with invalid 68k instructions to serve
 	// as a default map
@@ -53,6 +56,7 @@ static int M68KC68KInit(void) {
 }
 
 static void M68KC68KDeInit(void) {
+	C68kNativeSourceBind(NULL);
 	if (SoundDummy)
 		T2MemoryDeInit(SoundDummy);
 	SoundDummy = NULL;
@@ -62,7 +66,9 @@ static void M68KC68KReset(void) {
 	C68k_Reset(&C68K);
 }
 
+#include "../vita/telemetry.h"
 static s32 FASTCALL M68KC68KExec(s32 cycle) {
+   VT_SCOPE(VT_M68K);
 #ifdef PROFILE_68K
     static u32 tot_cycles = 0, tot_usec = 0, tot_ticks = 0, last_report = 0;
     u32 start, end;
@@ -145,7 +151,7 @@ static void FASTCALL M68KC68KSetIRQ(s32 level) {
 }
 
 static void FASTCALL M68KC68KWriteNotify(u32 address, u32 size) {
-	/* nothing to do */
+	C68kNativeSourceChanged(address, size);
 }
 
 static void M68KC68KSetReadB(M68K_READ *Func) {
@@ -166,6 +172,7 @@ static void M68KC68KSetWriteW(M68K_WRITE *Func) {
 
 static void C68k_Save_State(c68k_struc *mcpu, FILE * fp)
 {
+   C68K_NATIVE_GUARD;
    IOCheck_struct check = { 0, 0 };
    int i = 0;
    u32 pc = 0;
@@ -206,6 +213,7 @@ static void M68KC68KSaveState(FILE *fp) {
 
 static void C68k_Load_State(c68k_struc *mcpu, FILE * fp)
 {
+   C68K_NATIVE_GUARD;
    IOCheck_struct check = { 0, 0 };
    int i = 0;
    u32 pc = 0;

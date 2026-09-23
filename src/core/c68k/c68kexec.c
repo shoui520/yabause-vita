@@ -23,6 +23,7 @@
 
 #include "../core.h"
 #include "c68k.h"
+#include "native_guard.h"
 
 // #define TRACE_WITH_Q68  // Define to use Q68 tracing code to trace insns
                            // (requires Q68 built in, of course)
@@ -165,6 +166,7 @@ void TRACE(int PC,c68k_struc *CPU,int Opcode,int CCnt) {
 
 s32 FASTCALL C68k_Exec(c68k_struc *cpu, s32 cycle)
 {
+    C68K_NATIVE_GUARD;
 #ifndef C68K_GEN
 #if 0
     register c68k_struc *CPU asm ("ebx");
@@ -195,6 +197,22 @@ s32 FASTCALL C68k_Exec(c68k_struc *cpu, s32 cycle)
 #endif
 #else
     C68k_Initialised = 1;
+#endif
+
+#ifdef C68K_NATIVE_THREADED
+    static const void *NativeJumpTable[0x10000];
+    static int NativeTableReady;
+    if (!NativeTableReady
+#ifndef C68K_CONST_JUMP_TABLE
+        && C68k_Initialised
+#endif
+    ) {
+        unsigned op;
+        for (op = 0; op < 0x10000; ++op)
+            NativeJumpTable[op] = C68kNativeOpcodeSupported(op)
+                ? &&C68k_Native_Entry : JumpTable[op];
+        NativeTableReady = 1;
+    }
 #endif
 
     CPU = cpu;
@@ -279,6 +297,20 @@ s32 FASTCALL C68k_Exec(c68k_struc *cpu, s32 cycle)
 #endif
 #endif
 
+#ifdef C68K_NATIVE_THREADED
+C68k_Native_Entry:
+    {
+        unsigned consumed = 0;
+        /* NEXT already fetched Opcode and advanced the private PC. Admission
+         * uses the instruction's start; rejection resumes that exact opcode. */
+        if (CCnt > 0) consumed = C68k_NativeTry(CPU, PC - 2, CCnt);
+        if (!consumed) goto *JumpTable[Opcode];
+        CCnt -= consumed;
+        PC = CPU->PC;
+        if (CCnt <= 0) goto C68k_Exec_End;
+        NEXT
+    }
+#endif
 #ifdef C68K_NO_JUMP_TABLE
 SwitchTable:
     switch(Opcode)

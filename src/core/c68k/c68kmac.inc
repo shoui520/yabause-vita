@@ -20,6 +20,8 @@
 // internals core macros
 /////////////////////////
 
+#include "sound_ram_read.h"
+
 #define LSL(A, C)       ((A) << (C))
 #define LSR(A, C)       ((A) >> (C))
 
@@ -46,15 +48,44 @@ extern void TRACE(int,c68k_struc*,int,int);
 #else
 # define TRACE(a,b,c,d) /*nothing*/
 #endif
+#if defined(C68K_NATIVE_REGIONS) && !defined(C68K_GEN) && !defined(C68K_DEBUG) && !defined(TRACE_WITH_Q68)
+#include "native_dispatch.h"
+#include "native_opcodes.h"
+#ifndef C68K_NO_JUMP_TABLE
+#define C68K_NATIVE_THREADED
+#define NATIVE_NEXT
+#define C68K_DISPATCH_TABLE NativeJumpTable
+#else
+#define NATIVE_NEXT                         \
+    do {                                   \
+        while (CCnt > 0) {                 \
+            unsigned native_cycles;        \
+            PRE_IO                         \
+            native_cycles = C68k_NativeTry(CPU, PC, CCnt); \
+            if (!native_cycles) break;      \
+            CCnt -= native_cycles;         \
+            PC = CPU->PC;                  \
+            if (CCnt <= 0) goto C68k_Exec_End; \
+        }                                  \
+    } while (0);
+#endif
+#else
+#define NATIVE_NEXT
+#endif
+#ifndef C68K_DISPATCH_TABLE
+#define C68K_DISPATCH_TABLE JumpTable
+#endif
 #ifndef C68K_NO_JUMP_TABLE
 #define NEXT                    \
+    NATIVE_NEXT                 \
     PRE_IO                      \
     Opcode = FETCH_WORD;        \
     PC += 2;                    \
     TRACE(PC, CPU, Opcode, CCnt); \
-    goto *JumpTable[Opcode];
+    goto *C68K_DISPATCH_TABLE[Opcode];
 #else
 #define NEXT                    \
+    NATIVE_NEXT                 \
     PRE_IO                      \
     Opcode = FETCH_WORD;        \
     PC += 2;                    \
@@ -79,51 +110,51 @@ extern void TRACE(int,c68k_struc*,int,int);
     CCnt = CPU->CycleIO;
 
 #define READ_BYTE_F(A, D)           \
-    D = CPU->Read_Byte(A) & 0xFF;
+    D = C68k_ReadByte(CPU, A) & 0xFF;
 
 #define READ_WORD_F(A, D)           \
-    D = CPU->Read_Word(A) & 0xFFFF;
+    D = C68k_ReadWord(CPU, A) & 0xFFFF;
 
 #ifdef C68K_BIG_ENDIAN
     #define READ_LONG_F(A, D)           \
-    D = CPU->Read_Word((A)) << 16;   \
-    D |= CPU->Read_Word((A) + 2) & 0xFFFF;
+    D = C68k_ReadWord(CPU, (A)) << 16;   \
+    D |= C68k_ReadWord(CPU, (A) + 2) & 0xFFFF;
 
     #define READ_LONG_DEC_F(A, D)       \
-    D = CPU->Read_Word((A) + 2) & 0xFFFF;  \
-    D |= CPU->Read_Word((A)) << 16;
+    D = C68k_ReadWord(CPU, (A) + 2) & 0xFFFF;  \
+    D |= C68k_ReadWord(CPU, (A)) << 16;
 #else
     #define READ_LONG_F(A, D)               \
-    D = CPU->Read_Word((A)) << 16;          \
-    D |= CPU->Read_Word((A) + 2) & 0xFFFF;
+    D = C68k_ReadWord(CPU, (A)) << 16;          \
+    D |= C68k_ReadWord(CPU, (A) + 2) & 0xFFFF;
 
     #define READ_LONG_DEC_F(A, D)           \
-    D = CPU->Read_Word((A) + 2) & 0xFFFF;   \
-    D |= CPU->Read_Word((A)) << 16;
+    D = C68k_ReadWord(CPU, (A) + 2) & 0xFFFF;   \
+    D |= C68k_ReadWord(CPU, (A)) << 16;
 #endif
 
 #define READSX_BYTE_F(A, D)             \
-    D = (s32)(s8)CPU->Read_Byte(A);
+    D = (s32)(s8)C68k_ReadByte(CPU, A);
 
 #define READSX_WORD_F(A, D)             \
-    D = (s32)(s16)CPU->Read_Word(A);
+    D = (s32)(s16)C68k_ReadWord(CPU, A);
     
 #ifdef C68K_BIG_ENDIAN
     #define READSX_LONG_F(A, D)         \
-    D = CPU->Read_Word((A)) << 16;   \
-    D |= CPU->Read_Word((A) + 2) & 0xFFFF;
+    D = C68k_ReadWord(CPU, (A)) << 16;   \
+    D |= C68k_ReadWord(CPU, (A) + 2) & 0xFFFF;
 
     #define READSX_LONG_DEC_F(A, D)     \
-    D = CPU->Read_Word((A) + 2) & 0xFFFF;  \
-    D |= CPU->Read_Word((A)) << 16;
+    D = C68k_ReadWord(CPU, (A) + 2) & 0xFFFF;  \
+    D |= C68k_ReadWord(CPU, (A)) << 16;
 #else
     #define READSX_LONG_F(A, D)             \
-    D = CPU->Read_Word((A)) << 16;          \
-    D |= CPU->Read_Word((A) + 2) & 0xFFFF;
+    D = C68k_ReadWord(CPU, (A)) << 16;          \
+    D |= C68k_ReadWord(CPU, (A) + 2) & 0xFFFF;
 
     #define READSX_LONG_DEC_F(A, D)         \
-    D = CPU->Read_Word((A) + 2) & 0xFFFF;   \
-    D |= CPU->Read_Word((A)) << 16;
+    D = C68k_ReadWord(CPU, (A) + 2) & 0xFFFF;   \
+    D |= C68k_ReadWord(CPU, (A)) << 16;
 #endif
 
 #define WRITE_BYTE_F(A, D)      \
@@ -154,7 +185,7 @@ extern void TRACE(int,c68k_struc*,int,int);
     CPU->Write_Word(CPU->A[7] -= 2, D); \
 
 #define POP_16_F(D)                     \
-    D = (u16)CPU->Read_Word(CPU->A[7]); \
+    D = (u16)C68k_ReadWord(CPU, CPU->A[7]); \
     CPU->A[7] += 2;
 
 #ifdef C68K_BIG_ENDIAN
@@ -164,8 +195,8 @@ extern void TRACE(int,c68k_struc*,int,int);
     CPU->Write_Word(CPU->A[7], (D) >> 16);
     
     #define POP_32_F(D)                         \
-    D = CPU->Read_Word(CPU->A[7]) << 16;     \
-    D |= CPU->Read_Word(CPU->A[7] + 2) & 0xFFFF;   \
+    D = C68k_ReadWord(CPU, CPU->A[7]) << 16;     \
+    D |= C68k_ReadWord(CPU, CPU->A[7] + 2) & 0xFFFF;   \
     CPU->A[7] += 4;
 #else
     #define PUSH_32_F(D)                            \
@@ -174,8 +205,8 @@ extern void TRACE(int,c68k_struc*,int,int);
     CPU->Write_Word(CPU->A[7], (D) >> 16);
 
     #define POP_32_F(D)                             \
-    D = CPU->Read_Word(CPU->A[7]) << 16;            \
-    D |= CPU->Read_Word(CPU->A[7] + 2) & 0xFFFF;    \
+    D = C68k_ReadWord(CPU, CPU->A[7]) << 16;            \
+    D |= C68k_ReadWord(CPU, CPU->A[7] + 2) & 0xFFFF;    \
     CPU->A[7] += 4;
 #endif
 

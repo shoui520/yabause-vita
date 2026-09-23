@@ -156,6 +156,8 @@ typedef struct {
     C68K_RESET_CALLBACK *Reset_CallBack;
 
 	pointer Fetch[C68K_FETCH_BANK];             // 32 bytes aligned
+    // Optional 512 KiB Saturn T2-layout RAM mapping; callback changes revoke it.
+    u8 *DirectReadRam;
 } c68k_struc;
 
 
@@ -210,4 +212,3 @@ void    C68k_Set_MSP(c68k_struc *cpu, u32 val);
 #endif
 
 #endif  // _C68K_H_
-
