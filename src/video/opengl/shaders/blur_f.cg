@@ -1,0 +1,3 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#define EFFECT_BLUR 1
+#include "effect_common.cg"

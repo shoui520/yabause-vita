@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Native equivalent of Yabause's VDP1 vertex programs.
+uniform column_major float4x4 u_mvpMatrix;
+uniform float2 u_texsize;
+void main(float4 a_position : POSITION, float4 a_texcoord : TEXCOORD0,
+          float4 a_grcolor : COLOR0, out float4 position : POSITION,
+          out float4 v_texcoord : TEXCOORD0, out float4 v_vtxcolor : COLOR0) {
+  position = mul(a_position, u_mvpMatrix);
+  v_texcoord = a_texcoord;
+  v_texcoord.xy /= u_texsize;
+  v_vtxcolor = a_grcolor;
+}

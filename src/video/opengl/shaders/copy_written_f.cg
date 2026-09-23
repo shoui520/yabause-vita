@@ -1,0 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// CPU framebuffer staging uses opaque white to mark untouched pixels.
+uniform sampler2D u_Src;
+float4 main(float2 uv : TEXCOORD0) : COLOR {
+  float4 color = tex2D(u_Src,uv);
+  if (all(color == float4(1.0,1.0,1.0,1.0))) discard;
+  return color;
+}

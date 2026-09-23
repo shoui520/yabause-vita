@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Native forms of the inherited normal/CRAM fragment shader family.
+// Full precision is required for packed palette indices and priority bytes.
+#include "packed_texture.h"
+uniform sampler2D s_texture;
+uniform float2 u_texsize;
+uniform float4 u_color_offset;
+#ifdef PALETTE
+uniform sampler2D s_color;
+#endif
+#ifdef LINE_OFFSET
+uniform sampler2D s_linetexture;
+#endif
+void main(float4 v_texcoord : TEXCOORD0, out float4 fragColor : COLOR
+#ifdef PRIORITY
+          , out float depth : DEPTH
+#endif
+) {
+#ifdef NORMAL_DIRECT_UV
+  float4 code = tex2D(s_texture, v_texcoord.xy);
+#else
+  int2 addr = int2(v_texcoord.xy);
+  float4 code = tex2D(s_texture, (float2(addr) + 0.5) / u_texsize);
+#endif
+#ifndef OPAQUE_CELL
+  if (code.a == 0.0) discard;
+#endif
+#ifdef PALETTE
+#ifdef PALETTE_FLOAT_ADDRESS
+  // Preserve the UNORM8 rounding before assembly. All integers through
+  // 65535 are exactly representable in float; no reduced precision or
+  // interpolated palette lookup is permitted here.
+  float index = floor(code.r * 255.0 + 0.5) +
+                floor(code.g * 255.0 + 0.5) * 256.0;
+#else
+  int index = YglPaletteIndex(code.r, code.g);
+#endif
+  float4 color = tex2D(s_color, float2((float(index) + 0.5) / 2048.0, 0.5));
+#else
+  float4 color = code;
+#endif
+#ifdef LINE_OFFSET
+  float4 offset = tex2D(s_linetexture,
+                       float2((float(int(v_texcoord.w)) + 0.5) / 512.0, 0.5));
+  fragColor = float4(color.rgb + (offset.rgb - 0.5) * 2.0, code.a);
+#elif defined(ADD_COLOR)
+  fragColor = color + u_color_offset;
+  fragColor.a = code.a > 0.5 ? 1.0 : 0.0;
+#else
+  fragColor = clamp(color + u_color_offset, 0.0, 1.0);
+#ifdef PALETTE
+  fragColor.a = code.a;
+#endif
+#endif
+#ifdef PRIORITY
+  depth = ((float(YglUnorm8(code.b)) / 10.0) + 1.0) / 2.0;
+#endif
+}

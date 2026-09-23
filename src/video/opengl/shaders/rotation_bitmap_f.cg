@@ -1,0 +1,282 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// VDP2 16/32-bit RGB bitmap sampling. Keep operation order and integer truncation;
+// the coefficients and bitmap words are emulated data, not display colors.
+#pragma argument (bestprecision)
+#include "packed_texture.h"
+uniform sampler2D s_vram;
+#ifdef ROTATION_BYTE_VRAM
+uniform usampler2D s_byte_vram;
+#endif
+#ifdef ROTATION_COEFF_PAIR
+uniform sampler2D s_coeff_pair;
+#endif
+#ifdef ROTATION_PATTERN_CACHE
+#ifdef ROTATION_INTEGER_PATTERN
+uniform usampler2D s_patterns;
+#else
+uniform sampler2D s_patterns;
+#endif
+uniform float2 u_pattern_size;
+#endif
+#ifdef ROTATION_CACHED_MAP
+uniform sampler2D s_decoded_map;
+uniform float2 u_cache_size;
+#endif
+#ifdef ROTATION_FLOAT_COEFFICIENTS
+uniform sampler2D s_coeff_float;
+#endif
+#ifdef ROTATION_SPLIT_COEFFICIENTS
+// VRAM (512x256) is replaced only when its contents change; the row table and
+// plane row (512x5) are uploaded per job. Same bytes, same fetch count.
+uniform sampler2D s_coeff;
+#define ROTATION_VRAM_ROWS 256.0
+#else
+#define ROTATION_VRAM_ROWS 261.0
+#endif
+uniform float4 u_step; // dx, dy, Xp, Yp
+uniform float4 u_bitmap; // base byte address, width, height, screen-over
+uniform float3 u_pixel; // alpha byte, transparency enabled, color-number format
+uniform float4 u_map; // plane X/Y shifts, pages per plane row, character size in cells
+uniform float4 u_pattern; // name words, auxiliary mode, supplement, bitmap flag
+uniform float4 u_palette; // color offset, bitmap palette, special color mode/code
+uniform float4 u_special; // special priority mode, priority, bitmap PR/CC bits
+#ifdef ROTATION_CONST_K
+uniform float2 u_k; // kx, ky when constant for the whole job
+#endif
+#ifdef ROTATION_UNIFORM_PLANES
+// Explicit vectors avoid vitaGL's scalar-array stride mismatch. Each upload
+// is one float4, independent of array resource layout or dynamic indexing.
+uniform float4 u_planes0, u_planes1, u_planes2, u_planes3;
+float planeAddress(int plane) {
+  float4 addresses = plane < 4 ? u_planes0 : plane < 8 ? u_planes1 :
+                     plane < 12 ? u_planes2 : u_planes3;
+  return addresses[plane & 3];
+}
+#endif
+#ifndef ROTATION_FORMAT
+#define ROTATION_FORMAT int(u_pixel.z)
+#define ROTATION_BITMAP u_pattern.w
+#define ROTATION_CELLS u_map.w
+#define ROTATION_WORDS u_pattern.x
+#define ROTATION_AUX u_pattern.y
+#endif
+#ifdef ROTATION_BYTE_VRAM
+#if ROTATION_FORMAT < 2
+#define ROTATION_BYTE_QUERY 1
+#endif
+#endif
+// tex2Dlod removes psp2cgc's dsx/dsy per conditional read (885 -> 800 static
+// cycles) but measured 6% slower on hardware; see ROTATION-VRAM-REUSE.md.
+float4 rawTexel(int texel) {
+  return tex2D(s_vram, (float2(texel & 511, texel >> 9) + 0.5) / float2(512.0,ROTATION_VRAM_ROWS));
+}
+int readByte(int address) {
+#ifdef ROTATION_BYTE_QUERY
+  // U8_R / unsigned-char query is an exact byte (Sony GPU Guide Table 12).
+  // Only paired-coefficient, cached-name variants use this representation.
+  address &= 0x7ffff;
+  // Keep the promoted result explicitly unsigned-width: native validation
+  // observed sign extension for values >=128 with an implicit int conversion.
+  return int(tex2D<unsigned char>(s_byte_vram,
+      (float2(address & 2047,address >> 11)+0.5)/float2(2048.0,256.0))) & 255;
+#else
+  float4 b = rawTexel((address & 0x7ffff) >> 2);
+  int lane = address & 3;
+  return YglUnorm8(lane == 0 ? b.r : lane == 1 ? b.g : lane == 2 ? b.b : b.a);
+#endif
+}
+int readWord(int address) {
+  float4 b = rawTexel((address & 0x7ffff) >> 2);
+#ifdef ROTATION_WORD_SELECT
+  // Select encoded lanes first: identical nearest-sampled bytes, with one
+  // shared UNORM decode rather than two integer decode branches.
+  float2 pair = (address & 2) == 0 ? b.rg : b.ba;
+  // Rounded bytes and their combined 0..65535 value are exact in FP32.
+  // Preserve floor-before-cast (raw normalized samples are not exact bytes).
+  return YglUnorm16BE(pair.x, pair.y);
+#else
+  return (address & 2) == 0 ? (YglUnorm8(b.r)<<8)|YglUnorm8(b.g) :
+                             (YglUnorm8(b.b)<<8)|YglUnorm8(b.a);
+#endif
+}
+// Exact IEEE bytes avoid interpolating emulated coefficients across vertices.
+// Sony's documented bit_cast extension reconstructs the original ARM float.
+float coefficient(int offset) {
+#ifdef ROTATION_FLOAT_COEFFICIENTS
+  // Sony Texture Query Result Formats: force float, never implicit half.
+  return tex2D<float>(s_coeff_float,
+      (float2(offset & 511, offset >> 9) + 0.5) / float2(512.0,5.0));
+#else
+#ifdef ROTATION_SPLIT_COEFFICIENTS
+  float4 bytes = tex2D(s_coeff, (float2(offset & 511, offset >> 9) + 0.5) / float2(512.0,5.0));
+#else
+  int texel = 512 * 256 + offset;
+  float4 bytes = rawTexel(texel);
+#endif
+  unsigned int bits = (unsigned int)YglUnorm8(bytes.r) | ((unsigned int)YglUnorm8(bytes.g) << 8) |
+              ((unsigned int)YglUnorm8(bytes.b) << 16) | ((unsigned int)YglUnorm8(bytes.a) << 24);
+  return bit_cast<float>(bits);
+#endif
+}
+#ifdef ROTATION_ROW_ATTRIBUTES
+float rowCoefficient(float low, float high) {
+  // Integer-valued chunks tolerate interpolator roundoff; reconstruct exact
+  // IEEE bits before performing the unchanged Saturn coordinate arithmetic.
+  unsigned int bits = (unsigned int)floor(low + 0.5) |
+                      ((unsigned int)floor(high + 0.5) << 16);
+  return bit_cast<float>(bits);
+}
+#endif
+float4 main(float2 pixel : TEXCOORD0
+#ifdef ROTATION_COEFF_VARYING
+            , float2 coefficient_uv : TEXCOORD1
+#endif
+#ifdef ROTATION_ROW_ATTRIBUTES
+            , float4 coeff_low : TEXCOORD1, float4 coeff_high : TEXCOORD2
+#endif
+            ) : COLOR {
+#ifdef ROTATION_DECODE_MAP
+  int h = int(floor(pixel.x)), v = int(floor(pixel.y));
+#else
+#ifdef ROTATION_ROW_ATTRIBUTES
+  float4 coefficients = float4(rowCoefficient(coeff_low.x, coeff_high.x),
+      rowCoefficient(coeff_low.y, coeff_high.y),
+      rowCoefficient(coeff_low.z, coeff_high.z),
+      rowCoefficient(coeff_low.w, coeff_high.w));
+#elif defined(ROTATION_CONST_K)
+  // Job-constant kx/ky (CPU verified every row bit-identical):
+  // same float bits as the table, two dependent reads instead of four.
+  int base = int(floor(pixel.y)) * 4;
+#ifdef ROTATION_COEFF_PAIR
+  // F32F32_GR stores X then Y, without UNORM decoding or half conversion.
+  int pair = base >> 1;
+#ifdef ROTATION_COEFF_VARYING
+  float2 xy = tex2D<float2>(s_coeff_pair, coefficient_uv);
+#elif defined(ROTATION_COEFF_LINEAR)
+  // Same row*16 byte offset in one 1024-texel F32F32 row. No repacking,
+  // interpolation of coefficients, or reduced precision.
+  float2 xy = tex2D<float2>(s_coeff_pair,
+      float2((float(pair)+0.5)/1024.0,0.5));
+#else
+  float2 xy = tex2D<float2>(s_coeff_pair,
+      (float2(pair & 255, pair >> 8)+0.5)/float2(256.0,4.0));
+#endif
+  float4 coefficients = float4(xy, u_k.x, u_k.y);
+#else
+  float4 coefficients = float4(coefficient(base), coefficient(base+1), u_k.x, u_k.y);
+#endif
+#else
+  int base = int(floor(pixel.y)) * 4;
+  float4 coefficients = float4(coefficient(base), coefficient(base+1),
+                               coefficient(base+2), coefficient(base+3));
+#endif
+  if (coefficients.z < -1000000.0) return float4(0.0); // transparent coefficient row
+  float index = floor(pixel.x);
+  float hval = coefficients.z * (coefficients.x + u_step.x * index) + u_step.z;
+  float vval = coefficients.w * (coefficients.y + u_step.y * index) + u_step.w;
+  int h = int(hval < 0.0 ? -floor(-hval) : floor(hval));
+  int v = int(vval < 0.0 ? -floor(-vval) : floor(vval));
+#endif
+  int width = int(u_bitmap.y), height = int(u_bitmap.z);
+  int over = int(u_bitmap.w);
+  if (over == 2 && (h < 0 || v < 0 || h >= width || v >= height)) return float4(0.0);
+  if (over == 3 && (h < 0 || v < 0 || h > 512 || v > 512)) return float4(0.0);
+  if (over == 0) { h &= width - 1; v &= height - 1; }
+#ifdef ROTATION_CACHED_MAP
+  h &= int(u_cache_size.x)-1; v &= int(u_cache_size.y)-1;
+  return tex2D(s_decoded_map, (float2(h,v) + 0.5) / u_cache_size);
+#else
+  int character = int(u_bitmap.x), linear = v * width + h;
+  int palette = int(u_palette.y), priorityBit = int(u_special.z), colorBit = int(u_special.w);
+  int format = ROTATION_FORMAT;
+  if (ROTATION_BITMAP == 0) {
+    int patternShift = 2 + int(ROTATION_CELLS);
+#ifdef ROTATION_PATTERN_CACHE
+    // Predecoded names only. Character pixels still come from this job's
+    // original VRAM snapshot, and all color/priority rules below are unchanged.
+#ifdef ROTATION_INTEGER_PATTERN
+    // Same RGBA8 bytes, point sampling and lifetime. Mask each promoted byte
+    // before combining fields; implicit uchar promotion can sign-extend.
+    int4 descriptor = int4(tex2D<unsigned char4>(s_patterns,
+        (float2(h >> patternShift,v >> patternShift)+0.5)/u_pattern_size)) & int4(255);
+    character = descriptor.r | (descriptor.g<<8);
+    palette = descriptor.b;
+    int flags = descriptor.a, flip = flags & 3;
+#else
+    float4 descriptor = tex2D(s_patterns,
+        (float2(h >> patternShift,v >> patternShift)+0.5)/u_pattern_size);
+    character = YglUnorm8(descriptor.r) | (YglUnorm8(descriptor.g)<<8);
+    palette = YglUnorm8(descriptor.b);
+    int flags = YglUnorm8(descriptor.a), flip = flags & 3;
+#endif
+    priorityBit = (flags>>2)&1; colorBit = (flags>>3)&1;
+    int x=h, y=v;
+#else
+    int shiftX = int(u_map.x), shiftY = int(u_map.y);
+    int plane = (h >> shiftX) + ((v >> shiftY) << 2);
+    int x = h & ((1 << shiftX)-1), y = v & ((1 << shiftY)-1);
+    int pageWidth = 512 >> patternShift;
+    int entry = (((y >> 9) * int(u_map.z) + (x >> 9)) * pageWidth * pageWidth) +
+                (((y & 511) >> patternShift) * pageWidth) + ((x & 511) >> patternShift);
+#ifdef ROTATION_UNIFORM_PLANES
+    // CPU admission proves wrapped coordinates select one of the 16 planes.
+    int nameAddress = int(planeAddress(plane)) + (entry << int(ROTATION_WORDS));
+#else
+    int nameAddress = int(coefficient(2048 + plane)) + (entry << int(ROTATION_WORDS));
+#endif
+    int name = readWord(nameAddress), flip;
+    if (ROTATION_WORDS == 2) {
+      character = readWord(nameAddress+2) & 0x7fff;
+      palette = name & (format == 0 ? 0x7f : 0x70);
+      flip = (name >> 14) & 3;
+      priorityBit = (name >> 13) & 1; colorBit = (name >> 12) & 1;
+    } else {
+      int supplement = int(u_pattern.z);
+      palette = format == 0 ? ((name >> 12) | ((supplement & 0xe0) >> 1)) : ((name & 0x7000) >> 8);
+      priorityBit = (supplement >> 9) & 1; colorBit = (supplement >> 8) & 1;
+      flip = ROTATION_AUX == 0 ? (name >> 10) & 3 : 0;
+      if (ROTATION_AUX == 0) {
+        character = ROTATION_CELLS == 1 ? (name & 0x3ff) | ((supplement & 0x1f) << 10) :
+          ((name & 0x3ff) << 2) | (supplement & 3) | ((supplement & 0x1c) << 10);
+      } else {
+        character = ROTATION_CELLS == 1 ? (name & 0xfff) | ((supplement & 0x1c) << 10) :
+          ((name & 0xfff) << 2) | (supplement & 3) | ((supplement & 0x10) << 10);
+      }
+    }
+#endif
+    character <<= 5;
+    int sizeMask = (1 << patternShift)-1;
+    x = (x & sizeMask) ^ ((flip & 1) != 0 ? sizeMask : 0);
+    y = (y & sizeMask) ^ ((flip & 2) != 0 ? sizeMask : 0);
+    // Figure 4.7: four 8x8 cells in top-left, top-right, bottom-left, bottom-right order.
+    linear = (((y >> 3)*2 + (x >> 3))*64) + ((y & 7)*8) + (x & 7);
+  }
+  if (format < 2) {
+    int colorCode = readByte(character + (format == 0 ? linear >> 1 : linear));
+    if (format == 0) colorCode = (colorCode >> ((linear & 1) == 0 ? 4 : 0)) & 15;
+    if (colorCode == 0 && u_pixel.y != 0.0) return float4(0.0);
+    int code = int(u_palette.x) + ((palette << 4) | colorCode);
+    int special = (int(u_palette.w) >> ((colorCode & 15) >> 1)) & 1;
+    int priority = u_special.x == 2.0 ? (int(u_special.y) & 14) | (priorityBit & special) : 0;
+    float alpha = u_pixel.x;
+    if ((u_palette.z == 1.0 && colorBit == 0) ||
+        (u_palette.z == 2.0 && (colorBit == 0 || special == 0))) alpha = 255.0;
+    return float4(code & 255, (code >> 8) & 255, priority, alpha) / 255.0;
+  }
+  int stride = format == 4 ? 4 : 2;
+  int address = (character + linear * stride) & 0x7ffff;
+  int texel = address >> 2;
+  float4 bytes = rawTexel(texel);
+  if (format == 4) {
+    if (u_pixel.y != 0.0 && (YglUnorm8(bytes.r) & 128) == 0) return float4(0.0);
+    // Saturn byte order is control, blue, green, red; bits 30..24 are unused.
+    return float4(bytes.a, bytes.b, bytes.g, u_pixel.x / 255.0);
+  }
+  int word = (address & 2) == 0 ?
+    (YglUnorm8(bytes.r) << 8) | YglUnorm8(bytes.g) :
+    (YglUnorm8(bytes.b) << 8) | YglUnorm8(bytes.a);
+  if (u_pixel.y != 0.0 && (word & 0x8000) == 0) return float4(0.0);
+  return float4((word & 31) << 3, ((word >> 5) & 31) << 3,
+                ((word >> 10) & 31) << 3, u_pixel.x) / 255.0;
+#endif
+}

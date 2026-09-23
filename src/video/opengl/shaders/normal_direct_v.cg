@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Experimental nearest sampling: normalize in the vertex stage so SGX can
+// prefetch the atlas without a fragment-dependent coordinate calculation.
+uniform column_major float4x4 u_mvpMatrix;
+uniform float2 u_texsize;
+void main(float4 a_position : POSITION, float4 a_texcoord : TEXCOORD0,
+          out float4 position : POSITION, out float4 v_texcoord : TEXCOORD0) {
+  position = mul(a_position, u_mvpMatrix);
+  v_texcoord = float4(a_texcoord.xy / u_texsize, a_texcoord.zw);
+}

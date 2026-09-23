@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#pragma argument (bestprecision)
+void main(float2 a_position : POSITION, float2 a_pixel : TEXCOORD0,
+          float4 a_coeff_low : TEXCOORD1, float4 a_coeff_high : TEXCOORD2,
+          out float4 position : POSITION, out float2 pixel : TEXCOORD0,
+          out float4 coeff_low : TEXCOORD1, out float4 coeff_high : TEXCOORD2) {
+  position = float4(a_position, 0.0, 1.0);
+  pixel = a_pixel;
+  coeff_low = a_coeff_low;
+  coeff_high = a_coeff_high;
+}

@@ -1,0 +1,3 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Unmodified sampling reference for the opt-in native differential test.
+#include "normal_common.cg"

@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Port of the inherited VDP1 shader family; alpha carries packed metadata.
+// Do not replace destination tests with host alpha blending.
+#include "packed_texture.h"
+#if defined(SPRITE_NORMAL) || defined(SPRITE_LUMINANCE)
+uniform sampler2D s_texture;
+#define SPRITE_TEXTURE s_texture
+#else
+uniform sampler2D u_sprite;
+#define SPRITE_TEXTURE u_sprite
+#endif
+#if defined(SPRITE_HALF) || defined(SPRITE_SHADOW)
+uniform sampler2D u_fbo;
+uniform int u_fbowidth;
+uniform int u_fbohegiht; // Preserve upstream uniform spelling.
+#endif
+float4 main(float4 v_texcoord : TEXCOORD0, float4 v_vtxcolor : COLOR0,
+            float4 pixel : WPOS) : COLOR {
+  float4 color = tex2D(SPRITE_TEXTURE, v_texcoord.xy / v_texcoord.w);
+#if !defined(SPRITE_NORMAL) && !defined(SPRITE_SPD)
+  if (color.a == 0.0) discard;
+#endif
+#if defined(SPRITE_MESH)
+  if (((int(pixel.x) ^ int(pixel.y)) & 1) == 0) discard;
+  color.rgb += v_vtxcolor.rgb;
+#elif defined(SPRITE_HALF) || defined(SPRITE_SHADOW)
+  float4 destination = tex2D(u_fbo, pixel.xy / float2(u_fbowidth, u_fbohegiht));
+  int metadata = YglUnorm8(destination.a);
+#if defined(SPRITE_SHADOW)
+  if ((metadata & 0xc0) != 0x80) discard;
+  color = float4(destination.rgb * 0.5, destination.a);
+#else
+#if defined(SPRITE_GOURAUD)
+  color.rgb += v_vtxcolor.rgb;
+#endif
+  if ((metadata & 0x40) == 0) {
+    color.rgb = (color.rgb + destination.rgb) * 0.5;
+#if !defined(SPRITE_GOURAUD)
+    color.a = destination.a;
+#endif
+  }
+#endif
+#elif defined(SPRITE_GOURAUD)
+  color.rgb = clamp(color.rgb + v_vtxcolor.rgb, 0.0, 1.0);
+#elif defined(SPRITE_LUMINANCE)
+  color.rgb *= 0.5;
+#endif
+  return color;
+}

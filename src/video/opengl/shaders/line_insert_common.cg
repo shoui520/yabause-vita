@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Native equivalent of Yabause's line-color insertion variants.
+#include "packed_texture.h"
+uniform sampler2D s_texture;
+uniform sampler2D s_line;
+uniform float2 u_texsize;
+uniform float4 u_color_offset;
+uniform float u_emu_height, u_vheight, u_viewport_offset;
+#ifdef LINE_PALETTE
+uniform sampler2D s_color;
+#endif
+float4 main(float4 v_texcoord : TEXCOORD0, float4 pixel : WPOS) : COLOR {
+  float4 code = tex2D(s_texture, (float2(int2(v_texcoord.xy)) + 0.5) / u_texsize);
+  int line = int((u_vheight - pixel.y - u_viewport_offset) * u_emu_height);
+  float4 linecolor = tex2D(s_line, float2((float(line) + 0.5) / 512.0, 0.5));
+  if (code.a == 0.0) discard;
+#ifdef LINE_PALETTE
+  int index = YglPaletteIndex(code.r, code.g);
+  float4 color = tex2D(s_color, float2((float(index) + 0.5) / 2048.0, 0.5));
+#else
+  float4 color = code;
+#endif
+#ifdef LINE_DEST_ALPHA
+  float4 result = color * (1.0 - linecolor.a) + linecolor * linecolor.a + u_color_offset;
+  result.a = code.a;
+#else
+  float4 result = color + linecolor + u_color_offset;
+  result.a = 1.0;
+#endif
+  return result;
+}

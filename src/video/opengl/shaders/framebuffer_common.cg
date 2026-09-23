@@ -1,0 +1,132 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Native port of Yabause's framebuffer composition family.
+#include "packed_texture.h"
+uniform sampler2D s_vdp1FrameBuffer, s_color, s_line;
+// vitaGL uploads scalar float arrays with an eight-byte element stride.
+// Explicit float4 arrays use contiguous storage in both Cg and the uploader.
+uniform float4 u_pri[2], u_alpha[2];
+uniform float4 u_coloroffset;
+uniform float u_cctl, u_emu_height, u_vheight, u_viewport_offset;
+uniform int u_color_ram_offset, u_sprite_window;
+uniform float u_from, u_to;
+// Avoid dynamically indexed scalar uniform arrays inside conditional output
+// selection: psp2cgc 3.570 reports D0409 for the rate variants with that form.
+float alphaAt(int index) {
+#ifdef FB_BALANCED_SELECT
+  float4 values = index < 4 ? u_alpha[0] : u_alpha[1];
+  int lane = index & 3;
+  if (lane < 2) return lane == 0 ? values.x : values.y;
+  return lane == 2 ? values.z : values.w;
+#else
+  if (index == 0) return u_alpha[0].x;
+  if (index == 1) return u_alpha[0].y;
+  if (index == 2) return u_alpha[0].z;
+  if (index == 3) return u_alpha[0].w;
+  if (index == 4) return u_alpha[1].x;
+  if (index == 5) return u_alpha[1].y;
+  if (index == 6) return u_alpha[1].z;
+  return u_alpha[1].w;
+#endif
+}
+float priorityAt(int index) {
+#ifdef FB_BALANCED_SELECT
+  float4 values = index < 4 ? u_pri[0] : u_pri[1];
+  int lane = index & 3;
+  if (lane < 2) return lane == 0 ? values.x : values.y;
+  return lane == 2 ? values.z : values.w;
+#else
+  if (index == 0) return u_pri[0].x;
+  if (index == 1) return u_pri[0].y;
+  if (index == 2) return u_pri[0].z;
+  if (index == 3) return u_pri[0].w;
+  if (index == 4) return u_pri[1].x;
+  if (index == 5) return u_pri[1].y;
+  if (index == 6) return u_pri[1].z;
+  return u_pri[1].w;
+#endif
+}
+float4 lineFetch(int x, int y) {
+#ifdef FB_HBLANK
+  return tex2D(s_line, (float2(x,y) + 0.5) / float2(512.0,17.0));
+#else
+  return tex2D(s_line, float2((float(x)+0.5)/512.0,0.5));
+#endif
+}
+void main(float2 v_texcoord : TEXCOORD0, float4 pixel : WPOS,
+          out float4 color : COLOR, out float fragment_depth : DEPTH) {
+  float4 fb = tex2D(s_vdp1FrameBuffer, v_texcoord);
+  int metadata = YglUnorm8(fb.a);
+  if ((metadata & 0x80) == 0) discard;
+  int priority_index = metadata & 7;
+  int alpha_index = (metadata >> 3) & 7;
+  int line = int((u_vheight - pixel.y - u_viewport_offset) * u_emu_height);
+#ifdef FB_HBLANK
+  float4 linepriority = lineFetch(line, 1 + priority_index);
+  if (linepriority.a == 0.0) discard;
+  float depth = float(YglUnorm8(linepriority.a)) / 10.0 + 0.05;
+#else
+  float depth = priorityAt(priority_index);
+#endif
+#ifdef FB_SHADOW
+  if ((metadata & 0x40) == 0 || fb.b == 0.0) discard;
+  color = float4(0.0,0.0,0.0,0.5);
+#else
+  if (depth < u_from || depth > u_to) discard;
+  float4 palette_color = float4(0.0,0.0,0.0,1.0);
+  if ((metadata & 0x40) != 0) {
+    if (fb.b != 0.0) discard;
+    int index = YglPaletteIndex(fb.r, fb.g);
+    if (index == 0 && (u_sprite_window != 0 || priority_index == 0)) discard;
+    index += u_color_ram_offset;
+    palette_color = tex2D(s_color,float2((float(index)+0.5)/2048.0,0.5));
+    color = palette_color;
+  } else {
+    if (u_sprite_window != 0 && all(fb.rgb == float3(0.0,0.0,0.0))) discard;
+    color = fb;
+  }
+#ifdef FB_HBLANK
+  color.rgb += (lineFetch(line,0).rgb - 0.5) * 2.0;
+#else
+  color += u_coloroffset;
+#endif
+#if FB_CONDITION == 0
+  bool enabled = depth <= u_cctl;
+#elif FB_CONDITION == 1
+  bool enabled = depth == u_cctl;
+#elif FB_CONDITION == 2
+  bool enabled = depth >= u_cctl;
+#else
+  bool enabled = palette_color.a != 0.0;
+#endif
+#ifdef FB_HBLANK
+  float alpha = lineFetch(line,9 + alpha_index).a;
+#else
+  float alpha = alphaAt(alpha_index);
+#endif
+#if FB_LINE == 3
+  float4 lc = lineFetch(line,0);
+  if (enabled) {
+#if FB_CONDITION == 1
+    color = lc * lc.a + color * (1.0-lc.a);
+#else
+    color = color * lc.a + lc * (1.0-lc.a);
+#endif
+  }
+#endif
+#if FB_MODE == 0
+  color.a = 1.0;
+#elif FB_MODE == 1
+  color.a = alpha;
+#elif FB_MODE == 2
+  color.a = enabled ? alpha : 1.0;
+#else
+  color.a = enabled ? 1.0 : 0.0;
+#endif
+#if FB_LINE == 1
+  color = color * color.a + lineFetch(line,0) * (1.0-color.a);
+#elif FB_LINE == 2
+  color += lineFetch(line,0) * color.a;
+#endif
+#endif
+  fragment_depth = (depth+1.0)*0.5;
+}

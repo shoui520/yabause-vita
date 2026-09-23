@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#define SPRITE_GOURAUD 1
+#define SPRITE_SPD 1
+#include "sprite_common.cg"

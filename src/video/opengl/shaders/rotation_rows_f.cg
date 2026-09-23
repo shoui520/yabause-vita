@@ -1,0 +1,3 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#define ROTATION_ROW_ATTRIBUTES
+#include "rotation_bitmap_f.cg"

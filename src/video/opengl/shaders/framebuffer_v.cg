@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+uniform column_major float4x4 u_mvpMatrix;
+void main(float4 a_position : POSITION, float2 a_texcoord : TEXCOORD0,
+          out float4 position : POSITION, out float2 v_texcoord : TEXCOORD0) {
+  position = mul(a_position,u_mvpMatrix);
+  v_texcoord = a_texcoord;
+}

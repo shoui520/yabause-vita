@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#define FB_MODE 0
+#define FB_CONDITION 0
+#define FB_LINE 0
+#define FB_HBLANK 1
+#include "framebuffer_common.cg"

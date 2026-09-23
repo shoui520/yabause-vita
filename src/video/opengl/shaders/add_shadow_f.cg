@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Native counterpart of the inherited additive-shadow pass.
+#include "packed_texture.h"
+uniform sampler2D s_vdp1FrameBuffer;
+uniform float u_from, u_to;
+void main(float2 uv : TEXCOORD0, out float4 color : COLOR,
+          out float fragment_depth : DEPTH) {
+  float4 fb = tex2D(s_vdp1FrameBuffer,uv);
+  int metadata = YglUnorm8(fb.a);
+  float alpha = float((metadata/8)*8)/255.0;
+  float depth = float(metadata & 7)/10.0 + 0.05;
+  if (depth < u_from || depth > u_to || alpha <= 0.0) discard;
+  if (alpha >= 0.75 || any(fb.rgb != float3(0.0,0.0,0.0))) discard;
+  color = float4(fb.rgb,alpha);
+  fragment_depth = (depth+1.0)*0.5;
+}

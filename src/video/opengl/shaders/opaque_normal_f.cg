@@ -1,0 +1,3 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#define OPAQUE_CELL
+#include "normal_common.cg"

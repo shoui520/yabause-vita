@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+uniform sampler2D u_Clear;
+uniform float u_emu_height, u_vheight, u_viewport_offset;
+float4 main(float4 pixel : WPOS) : COLOR {
+  int line = int((u_vheight - (pixel.y-u_viewport_offset)) * u_emu_height);
+  return tex2D(u_Clear, float2((float(line)+0.5)/512.0, 0.5));
+}

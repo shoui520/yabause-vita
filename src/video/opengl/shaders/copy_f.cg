@@ -1,0 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+uniform sampler2D u_Src;
+float4 main(float2 uv : TEXCOORD0) : COLOR {
+  return tex2D(u_Src,uv);
+}

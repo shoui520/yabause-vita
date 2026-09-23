@@ -1,0 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+uniform column_major float4x4 u_mvpMatrix;
+float4 main(float4 a_position : POSITION) : POSITION {
+  return mul(a_position, u_mvpMatrix);
+}

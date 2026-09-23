@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+uniform sampler2D u_Src;
+uniform float u_tw, u_th;
+#ifdef EFFECT_MOSAIC
+uniform int2 u_mosaic;
+// SGX rejects variable integer division; preserve truncation at cell edges.
+#include "mosaic_cell.cg"
+#endif
+#ifdef EFFECT_PERLINE
+uniform sampler2D u_Line;
+uniform int u_specialColorFunc;
+#endif
+float4 fetch(int2 pixel) {
+  return tex2D(u_Src,(float2(pixel)+0.5)/float2(u_tw,u_th));
+}
+float4 main(float2 uv : TEXCOORD0) : COLOR {
+  int2 addr = int2(int(u_tw*uv.x), int(u_th)-int(u_th*uv.y));
+#ifdef EFFECT_MOSAIC
+  addr = int2(cell(addr.x,u_mosaic.x),cell(addr.y,u_mosaic.y));
+#endif
+  float4 color = fetch(addr);
+  if (color.a == 0.0) discard;
+#ifdef EFFECT_BLUR
+  color.rgb = color.rgb*0.5
+            + fetch(addr-int2(1,0)).rgb*0.25
+            + fetch(addr-int2(2,0)).rgb*0.25;
+#endif
+#ifdef EFFECT_PERLINE
+  int line = int(u_th*uv.y);
+  float4 data = tex2D(u_Line,float2((float(line)+0.5)/512.0,0.5));
+  if (u_specialColorFunc == 0 || color.a != 1.0) color.a = data.a;
+  color.rgb += (data.rgb-0.5)*2.0;
+  if (color.a == 0.0) discard;
+#endif
+  return color;
+}

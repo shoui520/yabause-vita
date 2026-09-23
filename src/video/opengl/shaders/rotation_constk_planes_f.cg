@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#define ROTATION_CONST_K
+#define ROTATION_UNIFORM_PLANES
+#include "rotation_bitmap_f.cg"

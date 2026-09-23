@@ -1,0 +1,3 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#define EFFECT_MOSAIC 1
+#include "effect_common.cg"

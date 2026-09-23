@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#pragma argument (bestprecision)
+void main(float2 a_position : POSITION, float2 a_pixel : TEXCOORD0,
+          out float4 position : POSITION, out float2 pixel : TEXCOORD0) {
+  position = float4(a_position, 0.0, 1.0);
+  pixel = a_pixel;
+}
