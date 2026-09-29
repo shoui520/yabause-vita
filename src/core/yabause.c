@@ -994,16 +994,26 @@ int YabauseEmulate(void) {
 }
 
 
+#ifdef VITA
+/* Nonzero while the emulation thread waits for the sound thread; the rotation
+ * worker, which shares the sound thread's core, stands aside meanwhile. */
+volatile int g_vita_sound_wait;
+#endif
+
 void SyncCPUtoSCSP() {
   //LOG("[SH2] WAIT SCSP");
   if (g_scsp_main_mode == 0) {
 #ifdef VITA
     u64 sound_wait_start = YabauseGetTicks();
+    g_vita_sound_wait = 1;
 #endif
 #ifdef VITA_SCSP_EARLY_FRAME
     if (!ScspEarlyCommit())
 #endif
     YabWaitEventQueue(q_scsp_finish);
+#ifdef VITA
+    g_vita_sound_wait = 0;
+#endif
     VitaM68kNativePublish();
 #ifdef VITA
     vita_sound_wait_us += YabauseGetTicks() - sound_wait_start;

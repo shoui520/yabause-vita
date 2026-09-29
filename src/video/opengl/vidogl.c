@@ -48,6 +48,11 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #if defined(VITA_STACK_PROFILE) || defined(VITA_DIAG_ABLATE)
 #include <psp2/kernel/processmgr.h>
 #endif
+#ifdef VITA_ROTATION_SPLIT
+#include <pthread.h>
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/power.h>
+#endif
 #define EPSILON (1e-10 )
 
 
@@ -4216,62 +4221,8 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
       int x, y;
       Vdp2PerLineCellXY(info, charx, chary, &x, &y);
 
-      if (info->patternwh == 1)
-      {
-        x &= 8 - 1;
-        y &= 8 - 1;
-
-        // vertical flip
-        if (info->flipfunction & 0x2)
-          y = 8 - 1 - y;
-
-        // horizontal flip	
-        if (info->flipfunction & 0x1)
-          x = 8 - 1 - x;
-      }
-      else
-      {
-        if (info->flipfunction)
-        {
-          y &= 16 - 1;
-          if (info->flipfunction & 0x2)
-          {
-            if (!(y & 8))
-              y = 8 - 1 - y + 16;
-            else
-              y = 16 - 1 - y;
-          }
-          else if (y & 8)
-            y += 8;
-
-          if (info->flipfunction & 0x1)
-          {
-            if (!(x & 8))
-              y += 8;
-
-            x &= 8 - 1;
-            x = 8 - 1 - x;
-          }
-          else if (x & 8)
-          {
-            y += 8;
-            x &= 8 - 1;
-          }
-          else
-            x &= 8 - 1;
-        }
-        else
-        {
-          y &= 16 - 1;
-          if (y & 8)
-            y += 8;
-          if (x & 8)
-            y += 8;
-          x &= 8 - 1;
-        }
-      }
-
-      *texture->textdata++ = Vdp2RotationFetchPixel(info, x, y, info->cellw);
+      Vdp2PerLineDecodeRow(info, y, (x ^ pos) & 7, rowcache);
+      *texture->textdata++ = rowcache[pos & 7];
 
     }
     if((v & linemask) == linemask) lineindex++;
@@ -4680,6 +4631,15 @@ void Vdp2DrawRotationThread(void * p) {
 #endif
 
   printf("Vdp2DrawRotationThread\n");
+#ifdef VITA_ROTATION_SPLIT
+  {
+    /* Equal-priority threads do not time-share: SCSP spins on this core
+     * waiting for CPU0 and would hold off the rows this worker claims. */
+    int previous = sceKernelGetThreadCurrentPriority();
+    if (previous > 64 && previous <= 191) sceKernelChangeThreadPriority(0, previous - 1);
+    YuiMsg("rotation_worker_priority previous=%d observed=%d", previous, sceKernelGetThreadCurrentPriority());
+  }
+#endif
   while (Vdp2DrawRotationThread_running) {
     YabThreadSetCurrentThreadAffinityMask(0x02);
     YabThreadLock(g_rotate_mtx);
@@ -4927,6 +4887,9 @@ static void FASTCALL Vdp2DrawRotation(RBGDrawInfo * rbg)
   }
 }
 
+#ifdef VITA_ROTATION_SPLIT
+static void Vdp2RotationSplitHelp(void);
+#endif
 void Vdp2RgbTextureSync() {
 
   if (g_rotate_mtx && curret_rbg) {
@@ -4935,7 +4898,11 @@ void Vdp2RgbTextureSync() {
 
       // Render Reqested But not finied
       YGL_THREAD_DEBUG("Vdp2RgbTextureSync in %d\n", curret_rbg->vdp2_sync_flg);
+#ifdef VITA_ROTATION_SPLIT
+      while (curret_rbg->vdp2_sync_flg == RBG_REQ_RENDER) { Vdp2RotationSplitHelp(); YabThreadYield(); }
+#else
       while (curret_rbg->vdp2_sync_flg == RBG_REQ_RENDER) YabThreadYield();
+#endif
       YabThreadLock(g_rotate_mtx);
       curret_rbg->vdp2_sync_flg = RBG_TEXTURE_SYNCED;
       YGL_THREAD_DEBUG("Vdp2RgbTextureSync out %d\n", curret_rbg->vdp2_sync_flg);
@@ -4980,6 +4947,9 @@ static void Vdp2DrawRotationSync() {
   }
 }
 
+#ifdef VITA_ROTATION_SPLIT
+#include <stdatomic.h>
+#endif
 #include "rotation_coefficient.h"
 
 #define ceilf(a) ((a)+0.99999f)
@@ -5023,14 +4993,1405 @@ static INLINE int vdp2rGetKValue(vdp2rotationparameter_struct * parameter, float
 }
 
 #include "rotation_row.inc"
+
+/* Mode 2 (VDP2 manual 6.4): coefficient table A's transparency bit selects
+ * parameter B. On explicit parameters for the rotation split's workers. */
+static INLINE vdp2rotationparameter_struct *Vdp2RotationMode02(float i,
+    vdp2rotationparameter_struct *pA, vdp2rotationparameter_struct *pB)
+{
+  if (!(pA->coefenab)) return pA;
+  if (pB->coefenab) {
+    if (vdp2rGetKValue(pA, i) == 0) {
+      if (vdp2rGetKValue(pB, i) == 0) return NULL;
+      return pB;
+    }
+    return pA;
+  }
+  if (vdp2rGetKValue(pA, i) == 0) {
+    pB->lineaddr = pA->lineaddr;
+    return pB;
+  }
+  return pA;
+}
+
+/* vdp2RGetParamMode03WithK on explicit parameters (the rotation split's
+ * workers select on private copies). */
+static INLINE vdp2rotationparameter_struct *Vdp2RotationMode03K(vdp2draw_struct * info, int h, int v,
+    vdp2rotationparameter_struct *pA, vdp2rotationparameter_struct *pB)
+{
+  vdp2rotationparameter_struct * p;
+
+  // Disbaled Window always return A
+  if ((fixVdp2Regs->WCTLD & 0xA) == 0) {
+    h = ceilf(pA->KtablV + (pA->deltaKAx * h));
+    p = info->GetKValueA(pA, h);
+    if (p) return p;
+    h = ceilf(pB->KtablV + (pB->deltaKAx * h));
+    return info->GetKValueB(pB, h);
+  }
+
+  v <<= info->hres_shift;
+
+  // Final Fight Revenge
+  if (info->WindwAreaMode == WA_INSIDE) {
+    if (info->pWinInfo[v].WinShowLine == 0) {
+      h = ceilf(pA->KtablV + (pA->deltaKAx * h));
+      p = info->GetKValueA(pA, h);
+      if (p) return p;
+      h = ceilf(pB->KtablV + (pB->deltaKAx * h));
+      return info->GetKValueB(pB, h);
+    }
+    else {
+      if (h < info->pWinInfo[v].WinHStart || h >= info->pWinInfo[v].WinHEnd) {
+        h = (pA->KtablV + (pA->deltaKAx * h));
+        p = info->GetKValueA(pA, h);
+        if (p) return p;
+        h = ceilf(pB->KtablV + (pB->deltaKAx * h));
+        return info->GetKValueB(pB, h);
+      }
+      else {
+        h = (pB->KtablV + (pB->deltaKAx * h));
+        p = info->GetKValueB(pB, h);
+        if (p) return p;
+        h = ceilf(pA->KtablV + (pA->deltaKAx * h));
+        return info->GetKValueA(pA, h);
+      }
+    }
+  }
+  else {
+    if (info->pWinInfo[v].WinShowLine == 0) {
+      h = ceilf(pB->KtablV + (pB->deltaKAx * h));
+      p = info->GetKValueB(pB, h);
+      if (p) return p;
+      h = ceilf(pA->KtablV + (pA->deltaKAx * h));
+      return info->GetKValueA(pA, h);
+    }
+    else {
+      if (h < info->pWinInfo[v].WinHStart || h >= info->pWinInfo[v].WinHEnd) {
+        h = ceilf(pB->KtablV + (pB->deltaKAx * h));
+        p = info->GetKValueB(pB, h);
+        if (p) return p;
+        h = ceilf(pA->KtablV + (pA->deltaKAx * h));
+        return info->GetKValueA(pA, h);
+      }
+      else {
+        h = ceilf(pA->KtablV + (pA->deltaKAx * h));
+        p = info->GetKValueA(pA, h);
+        if (p) return p;
+        h = ceilf(pB->KtablV + (pB->deltaKAx * h));
+        return info->GetKValueB(pB, h);
+      }
+    }
+  }
+  return NULL;
+}
 #ifdef YABAUSE_VITAGL
 #include "rotation_gpu.h"
+#endif
+
+/* One rotation screen pixel for a resolved parameter (the per-dot body of
+ * Vdp2DrawRotation_in). oldcellx/oldcelly carry the pattern-name cache, whose
+ * results are also left in info. */
+static INLINE __attribute__((always_inline)) void Vdp2RotationDot(
+    const vdp2rotationparameter_struct *parameter, float i, int *h, int *v) {
+  float fh = (parameter->kx * (parameter->Xsp + parameter->dx * i) + parameter->Xp);
+  float fv = (parameter->ky * (parameter->Ysp + parameter->dy * i) + parameter->Yp);
+  *h = fh;
+  *v = fv;
+}
+
+static INLINE __attribute__((always_inline)) u32 Vdp2RotationPixel(RBGDrawInfo *rbg,
+    vdp2draw_struct *info, vdp2rotationparameter_struct *parameter, float i,
+    int cellw, int cellh, int *oldcellx, int *oldcelly) {
+  int h, v, x, y;
+  u32 color;
+  Vdp2RotationDot(parameter, i, &h, &v);
+
+  //v = jj;
+  //h = ii;
+
+  if (info->isbitmap)
+  {
+
+    switch (parameter->screenover) {
+    case OVERMODE_REPEAT:
+      h &= cellw - 1;
+      v &= cellh - 1;
+      break;
+    case OVERMODE_SELPATNAME:
+      VDP2LOG("Screen-over mode 1 not implemented");
+      h &= cellw - 1;
+      v &= cellh - 1;
+      break;
+    case OVERMODE_TRANSE:
+      if ((h < 0) || (h >= cellw) || (v < 0) || (v >= cellh)) {
+        return 0x0;
+      }
+      break;
+    case OVERMODE_512:
+      if ((h < 0) || (h > 512) || (v < 0) || (v > 512)) {
+        return 0x00;
+      }
+    }
+    // Fetch Pixel
+    info->charaddr = parameter->charaddr;
+    color = Vdp2RotationFetchPixel(info, h, v, cellw);
+  }
+  else
+  {
+    // Tile
+    int planenum;
+    switch (parameter->screenover) {
+    case OVERMODE_TRANSE:
+      if ((h < 0) || (h >= parameter->MaxH) || (v < 0) || (v >= parameter->MaxV)) {
+        return 0x00;
+      }
+      x = h;
+      y = v;
+      if ((x >> rbg->patternshift) != (*oldcellx) || (y >> rbg->patternshift) != (*oldcelly)) {
+        (*oldcellx) = x >> rbg->patternshift;
+        (*oldcelly) = y >> rbg->patternshift;
+
+        // Calculate which plane we're dealing with
+        planenum = (x >> parameter->ShiftPaneX) + ((y >> parameter->ShiftPaneY) << 2);
+        x &= parameter->MskH;
+        y &= parameter->MskV;
+        info->addr = parameter->PlaneAddrv[planenum];
+
+        // Figure out which page it's on(if plane size is not 1x1)
+        info->addr += (((y >> 9) * rbg->pagesize * info->planew) +
+          ((x >> 9) * rbg->pagesize) +
+          (((y & 511) >> rbg->patternshift) * info->pagewh) +
+          ((x & 511) >> rbg->patternshift)) << info->patterndatasize;
+
+        Vdp2PatternAddr(info); // Heh, this could be optimized
+      }
+      break;
+    case OVERMODE_512:
+      if ((h < 0) || (h > 512) || (v < 0) || (v > 512)) {
+        return 0x00;
+      }
+      x = h;
+      y = v;
+      if ((x >> rbg->patternshift) != (*oldcellx) || (y >> rbg->patternshift) != (*oldcelly)) {
+          (*oldcellx) = x >> rbg->patternshift;
+          (*oldcelly) = y >> rbg->patternshift;
+
+          // Calculate which plane we're dealing with
+          planenum = (x >> parameter->ShiftPaneX) + ((y >> parameter->ShiftPaneY) << 2);
+          x &= parameter->MskH;
+          y &= parameter->MskV;
+          info->addr = parameter->PlaneAddrv[planenum];
+
+          // Figure out which page it's on(if plane size is not 1x1)
+          info->addr += (((y >> 9) * rbg->pagesize * info->planew) +
+            ((x >> 9) * rbg->pagesize) +
+            (((y & 511) >> rbg->patternshift) * info->pagewh) +
+            ((x & 511) >> rbg->patternshift)) << info->patterndatasize;
+
+          Vdp2PatternAddr(info); // Heh, this could be optimized
+      }
+      break;
+    case OVERMODE_REPEAT: {
+      h &= (parameter->MaxH - 1);
+      v &= (parameter->MaxV - 1);
+      x = h;
+      y = v;
+      if ((x >> rbg->patternshift) != (*oldcellx) || (y >> rbg->patternshift) != (*oldcelly)) {
+          (*oldcellx) = x >> rbg->patternshift;
+          (*oldcelly) = y >> rbg->patternshift;
+
+          // Calculate which plane we're dealing with
+          planenum = (x >> parameter->ShiftPaneX) + ((y >> parameter->ShiftPaneY) << 2);
+          x &= parameter->MskH;
+          y &= parameter->MskV;
+          info->addr = parameter->PlaneAddrv[planenum];
+
+          // Figure out which page it's on(if plane size is not 1x1)
+          info->addr += (((y >> 9) * rbg->pagesize * info->planew) +
+            ((x >> 9) * rbg->pagesize) +
+            (((y & 511) >> rbg->patternshift) * info->pagewh) +
+            ((x & 511) >> rbg->patternshift)) << info->patterndatasize;
+
+          Vdp2PatternAddr(info); // Heh, this could be optimized
+        }
+      }
+      break;
+    case OVERMODE_SELPATNAME: {
+        x = h;
+        y = v;
+        if ((x >> rbg->patternshift) != (*oldcellx) || (y >> rbg->patternshift) != (*oldcelly)) {
+          (*oldcellx) = x >> rbg->patternshift;
+          (*oldcelly) = y >> rbg->patternshift;
+
+          if ((h < 0) || (h >= parameter->MaxH) || (v < 0) || (v >= parameter->MaxV)) {
+            x &= parameter->MskH;
+            y &= parameter->MskV;
+            Vdp2PatternAddrUsingPatternname(info, parameter->over_pattern_name);
+          }
+          else {
+            planenum = (x >> parameter->ShiftPaneX) + ((y >> parameter->ShiftPaneY) << 2);
+            x &= parameter->MskH;
+            y &= parameter->MskV;
+            info->addr = parameter->PlaneAddrv[planenum];
+            // Figure out which page it's on(if plane size is not 1x1)
+            info->addr += (((y >> 9) * rbg->pagesize * info->planew) +
+              ((x >> 9) * rbg->pagesize) +
+              (((y & 511) >> rbg->patternshift) * info->pagewh) +
+              ((x & 511) >> rbg->patternshift)) << info->patterndatasize;
+              Vdp2PatternAddr(info); // Heh, this could be optimized
+          }
+        }
+      }
+      break;
+    }
+
+    // Figure out which pixel in the tile we want
+    if (info->patternwh == 1)
+    {
+      x &= 8 - 1;
+      y &= 8 - 1;
+
+      // vertical flip
+      if (info->flipfunction & 0x2)
+        y = 8 - 1 - y;
+
+      // horizontal flip	
+      if (info->flipfunction & 0x1)
+        x = 8 - 1 - x;
+    }
+    else
+    {
+      if (info->flipfunction)
+      {
+        y &= 16 - 1;
+        if (info->flipfunction & 0x2)
+        {
+          if (!(y & 8))
+            y = 8 - 1 - y + 16;
+          else
+            y = 16 - 1 - y;
+        }
+        else if (y & 8)
+          y += 8;
+
+        if (info->flipfunction & 0x1)
+        {
+          if (!(x & 8))
+            y += 8;
+
+          x &= 8 - 1;
+          x = 8 - 1 - x;
+        }
+        else if (x & 8)
+        {
+          y += 8;
+          x &= 8 - 1;
+        }
+        else
+          x &= 8 - 1;
+      }
+      else
+      {
+        y &= 16 - 1;
+        if (y & 8)
+          y += 8;
+        if (x & 8)
+          y += 8;
+        x &= 8 - 1;
+      }
+    }
+
+    // Fetch pixel
+		color =  Vdp2RotationFetchPixel(info, x, y, 8);
+  }
+
+  if (info->LineColorBase != 0 && VDP2_CC_NONE != (info->blendmode&0x03)) {
+    if ((color & 0xFF000000) != 0 ) {
+      color |= 0x8000;
+      if (parameter->linecoefenab && parameter->lineaddr != 0xFFFFFFFF && parameter->lineaddr != 0x000000 ) {
+        color |= ((parameter->lineaddr & 0x7F) | 0x80) << 16;
+      }
+    }
+  }
+
+  return color;
+}
+
+#ifdef VITA_ROTATION_FAST_ROW
+/* Zero, or a normal magnitude in [2^-40, 2^40]: with i < 2^11 every product
+ * and sum of the coordinate expression is then zero or at least 2^-126 and
+ * below 2^127, so NEON (flush-to-zero, round-to-nearest, no fusion on the
+ * Cortex-A9) computes the same bits as the scalar VFP expression. */
+static INLINE int Vdp2RotationFastFloat(float f) {
+  const float a = fabsf(f);
+  return a == 0.0f || (a >= 0x1p-40f && a <= 0x1p40f);
+}
+
+/* Dots i0 .. i0+n-1 of a row of Vdp2RotationPixel for a fixed parameter in
+ * the common tile case (1x1 or 2x2 cells, repeated or pattern-name screen over):
+ * coordinates in NEON, then the same pattern-name cache, dot fetch and line
+ * colour bits. Returns 0 (nothing written) when the dots do not qualify. */
+/* For flip f and a dot at (x, y) within its pattern (x, y < 8 for 1x1
+ * cells, < 16 for 2x2), indexed y << 3 | x or y << 4 | x: y * 8 + x of the
+ * dot Vdp2RotationPixel fetches in the pattern's stacked 8x8 cells. */
+static u8 rotation_cell_offset8[4][256], rotation_cell_offset16[4][256];
+static void Vdp2RotationCellTables(void) {
+  static int done;
+  if (done) return;
+  for (int f = 0; f < 4; ++f) {
+    for (int yy = 0; yy < 8; ++yy) for (int xx = 0; xx < 8; ++xx) {
+      int x = xx, y = yy;
+      if (f & 0x2) y = 8 - 1 - y;
+      if (f & 0x1) x = 8 - 1 - x;
+      rotation_cell_offset8[f][yy << 3 | xx] = (u8)(y * 8 + x);
+    }
+    for (int yy = 0; yy < 16; ++yy) for (int xx = 0; xx < 16; ++xx) {
+      int x = xx, y = yy;
+      if (f) {
+        y &= 16 - 1;
+        if (f & 0x2) {
+          if (!(y & 8)) y = 8 - 1 - y + 16;
+          else y = 16 - 1 - y;
+        } else if (y & 8) y += 8;
+        if (f & 0x1) {
+          if (!(x & 8)) y += 8;
+          x &= 8 - 1;
+          x = 8 - 1 - x;
+        } else if (x & 8) {
+          y += 8;
+          x &= 8 - 1;
+        } else x &= 8 - 1;
+      } else {
+        y &= 16 - 1;
+        if (y & 8) y += 8;
+        if (x & 8) y += 8;
+        x &= 8 - 1;
+      }
+      rotation_cell_offset16[f][yy << 4 | xx] = (u8)(y * 8 + x);
+    }
+  }
+  done = 1;
+}
+
+/* Run-invariant inputs of Vdp2RotationRunFast's dot loop. */
+typedef struct {
+  int repeat, shift, simple, bpp8, line_color;
+  u32 coloroffset, base_alpha, line_bits;
+  const u8 (*tables)[256];
+  const u8 *vram;
+} RotationRunConst;
+/* The current pattern's state. fast: palette dots whose colour is
+ * base + dot (coloroffset + (pal | dot) with no overlapping bits) and whose
+ * characters do not wrap VRAM; or: alpha and, when the colour's alpha is
+ * non-zero (per pattern), the line colour bits. */
+typedef struct {
+  const u8 *src, *table;
+  u32 base, or, pal, a24, charaddr;
+  int fast;
+} RotationRunCell;
+
+/* Pattern state as Vdp2PatternAddr leaves it in info. */
+typedef struct {
+  u32 charaddr, paladdr;
+  int flipfunction, specialfunction, specialcolorfunction;
+} RotationRunPattern;
+
+static INLINE void Vdp2RotationRunCellState(const vdp2draw_struct *info, const RotationRunConst *k,
+                                            const RotationRunPattern *q, RotationRunCell *c) {
+  c->table = k->tables[q->flipfunction & 3];
+  c->fast = 0;
+  if (!k->simple) return;
+  c->pal = q->paladdr << 4; c->charaddr = q->charaddr;
+  c->a24 = (info->specialcolormode == 1 && q->specialcolorfunction == 0 ? 0xFF : k->base_alpha) << 24;
+  c->fast = (c->pal & (k->bpp8 ? 0xFF : 0xF)) == 0 && c->charaddr + 256 <= 0x80000;
+  c->base = k->coloroffset + c->pal;
+  c->or = c->a24 | (k->line_color && c->a24 ? k->line_bits : 0);
+  c->src = k->vram + c->charaddr;
+}
+
+/* The pattern state Vdp2PatternAddr and Vdp2PatternAddrUsingPatternname
+ * leave in info (words w0, w1 of a pattern name of size pds), kept aside so
+ * a run of misses writes info once, with the last. */
+static INLINE void Vdp2RotationRunDecode(const vdp2draw_struct *info, int pds, u32 w0, u32 w1,
+                                         RotationRunPattern *q) {
+  if (pds == 1) {
+    q->specialfunction = (info->supplementdata >> 9) & 0x1;
+    q->specialcolorfunction = (info->supplementdata >> 8) & 0x1;
+    q->paladdr = info->colornumber == 0 ? ((w0 & 0xF000) >> 12) | ((info->supplementdata & 0xE0) >> 1)
+                                        : (w0 & 0x7000) >> 8;
+    if (info->auxmode == 0) {
+      q->flipfunction = (w0 & 0xC00) >> 10;
+      q->charaddr = info->patternwh == 1 ? (w0 & 0x3FF) | ((info->supplementdata & 0x1F) << 10)
+        : ((w0 & 0x3FF) << 2) | (info->supplementdata & 0x3) | ((info->supplementdata & 0x1C) << 10);
+    } else {
+      q->flipfunction = 0;
+      q->charaddr = info->patternwh == 1 ? (w0 & 0xFFF) | ((info->supplementdata & 0x1C) << 10)
+        : ((w0 & 0xFFF) << 2) | (info->supplementdata & 0x3) | ((info->supplementdata & 0x10) << 10);
+    }
+  } else {
+    q->charaddr = w1 & 0x7FFF;
+    q->flipfunction = (w0 & 0xC000) >> 14;
+    q->paladdr = info->colornumber == 0 ? (w0 & 0x7F) : (w0 & 0x70);
+    q->specialfunction = (w0 & 0x2000) >> 13;
+    q->specialcolorfunction = (w0 & 0x1000) >> 12;
+  }
+  if (!(fixVdp2Regs->VRSIZE & 0x8000))
+    q->charaddr &= 0x3FFF;
+  q->charaddr *= 0x20;
+}
+
+/* A pattern-name cache miss at masked coordinates (x, y), as
+ * Vdp2RotationPixel fetches it; *addr is info->addr after it. */
+static INLINE void Vdp2RotationRunMiss(const RBGDrawInfo *rbg, const vdp2draw_struct *info,
+    const vdp2rotationparameter_struct *parameter, const RotationRunConst *k, const RotationRunPattern *over,
+    RotationRunPattern *q, u32 *addr, int x, int y) {
+  if (!k->repeat && ((x < 0) || (x >= parameter->MaxH) || (y < 0) || (y >= parameter->MaxV))) {
+    *q = *over;
+    return;
+  }
+  const int planenum = (x >> parameter->ShiftPaneX) + ((y >> parameter->ShiftPaneY) << 2);
+  const int px = x & parameter->MskH, py = y & parameter->MskV;
+  u32 a = parameter->PlaneAddrv[planenum];
+  a += (((py >> 9) * rbg->pagesize * info->planew) +
+    ((px >> 9) * rbg->pagesize) +
+    (((py & 511) >> k->shift) * info->pagewh) +
+    ((px & 511) >> k->shift)) << info->patterndatasize;
+  a &= 0x7FFFF;
+  if (info->patterndatasize == 1) {
+    Vdp2RotationRunDecode(info, 1, T1ReadWord(Vdp2Ram, a), 0, q);
+    *addr = a + 2;
+  } else {
+    Vdp2RotationRunDecode(info, 2, T1ReadWord(Vdp2Ram, (a & 0x7FFFF)), T1ReadWord(Vdp2Ram, (a & 0x7FFFF) + 2), q);
+    *addr = a + 4;
+  }
+}
+
+/* A dot outside the fast case; off is y * 8 + x in the stacked 8x8 cells. */
+static __attribute__((noinline)) u32 Vdp2RotationRunSlowDot(vdp2draw_struct *info,
+    const RotationRunConst *k, const RotationRunCell *c, u32 off) {
+  u32 color;
+  if (k->simple) {
+    u32 dot;
+    if (k->bpp8) {
+      dot = k->vram[(c->charaddr + off) & 0x7FFFF];
+    } else {
+      dot = k->vram[(c->charaddr + (off >> 1)) & 0x7FFFF];
+      dot = (off & 0x1) ? dot & 0xF : dot >> 4;
+    }
+    color = (dot == 0 && info->transparencyenable) ? 0 : (k->coloroffset + (c->pal | dot)) | c->a24;
+  } else {
+    color = Vdp2RotationFetchPixel(info, off & 7, off >> 3, 8);
+  }
+  if (k->line_color && (color & 0xFF000000) != 0) color |= k->line_bits;
+  return color;
+}
+
+/* Dots between misses share one pattern: each run is a tight loop over
+ * few live values. */
+static INLINE __attribute__((always_inline)) void Vdp2RotationRunDots(RBGDrawInfo *rbg,
+    vdp2draw_struct *info, const vdp2rotationparameter_struct *parameter, const RotationRunConst *k,
+    int (*hv)[1024 + 8], const int *cell, u32 *out, int n, const int bpp8) {
+  const int transp = info->transparencyenable;
+  RotationRunPattern q, over;
+  q.charaddr = info->charaddr; q.paladdr = info->paladdr; q.flipfunction = info->flipfunction;
+  q.specialfunction = info->specialfunction; q.specialcolorfunction = info->specialcolorfunction;
+  if (!k->repeat) {
+    over = q;
+    Vdp2RotationRunDecode(info, 1, parameter->over_pattern_name, 0, &over);
+  }
+  u32 addr = info->addr;
+  RotationRunCell c;
+  Vdp2RotationRunCellState(info, k, &q, &c);
+  int missed = 0;
+  for (int ii = 0; ii < n;) {
+    if (cell[ii] & 0x100) {
+      Vdp2RotationRunMiss(rbg, info, parameter, k, &over, &q, &addr, hv[0][ii], hv[1][ii]);
+      Vdp2RotationRunCellState(info, k, &q, &c);
+      missed = 1;
+    }
+    /* Up to the next miss. */
+    if (__builtin_expect(c.fast, 1)) {
+      const u8 *const table = c.table, *const src = c.src;
+      const u32 base = c.base, or = c.or;
+      do {
+        const u32 off = table[cell[ii] & 0xFF];
+        u32 dot;
+        if (bpp8) {
+          dot = src[off];
+        } else {
+          const u32 b = src[off >> 1];
+          dot = (off & 0x1) ? b & 0xF : b >> 4;
+        }
+        out[ii] = (dot == 0 && transp) ? 0 : (base + dot) | or;
+      } while (++ii < n && !(cell[ii] & 0x100));
+    } else {
+      if (!k->simple) {
+        /* Vdp2RotationFetchPixel reads the pattern from info. */
+        info->charaddr = q.charaddr; info->paladdr = q.paladdr; info->flipfunction = q.flipfunction;
+        info->specialfunction = q.specialfunction; info->specialcolorfunction = q.specialcolorfunction;
+      }
+      do out[ii] = Vdp2RotationRunSlowDot(info, k, &c, c.table[cell[ii] & 0xFF]);
+      while (++ii < n && !(cell[ii] & 0x100));
+    }
+  }
+  if (missed) {
+    info->addr = addr;
+    info->charaddr = q.charaddr; info->paladdr = q.paladdr; info->flipfunction = q.flipfunction;
+    info->specialfunction = q.specialfunction; info->specialcolorfunction = q.specialcolorfunction;
+  }
+}
+
+static int Vdp2RotationRunFast(RBGDrawInfo *rbg, vdp2draw_struct *info,
+    vdp2rotationparameter_struct *parameter, u32 *out, int i0, int n,
+    int *oldcellx, int *oldcelly) {
+  if (info->isbitmap || (info->patternwh != 1 && info->patternwh != 2) ||
+      (info->patterndatasize != 1 && info->patterndatasize != 2) || (info->auxmode != 0 && info->auxmode != 1) ||
+      (parameter->screenover != OVERMODE_REPEAT && parameter->screenover != OVERMODE_SELPATNAME) ||
+      rbg->rotate_mval_h != 1.0f || n <= 0 || i0 < 0 || i0 + n > 1024 ||
+      !Vdp2RotationFastFloat(parameter->kx) || !Vdp2RotationFastFloat(parameter->Xsp) ||
+      !Vdp2RotationFastFloat(parameter->dx) || !Vdp2RotationFastFloat(parameter->Xp) ||
+      !Vdp2RotationFastFloat(parameter->ky) || !Vdp2RotationFastFloat(parameter->Ysp) ||
+      !Vdp2RotationFastFloat(parameter->dy) || !Vdp2RotationFastFloat(parameter->Yp))
+    return 0;
+  const int shift = rbg->patternshift, maskh = parameter->MaxH - 1, maskv = parameter->MaxV - 1;
+  const int repeat = parameter->screenover == OVERMODE_REPEAT;
+  const int wh2 = info->patternwh == 2;
+  /* Per dot: masked coordinates, pattern-name cache keys and the dot's index
+   * within its pattern ((y & m) << s | (x & m)), for the flip tables. */
+  int hv[2][1024 + 8] __attribute__((aligned(16)));
+  int keys[2][4 + 1024 + 8] __attribute__((aligned(16)));
+  int cell[1024 + 8] __attribute__((aligned(16)));
+  int *const key[2] = { keys[0] + 4, keys[1] + 4 };
+  {
+    const float32x4_t kx = vdupq_n_f32(parameter->kx), Xsp = vdupq_n_f32(parameter->Xsp);
+    const float32x4_t dx = vdupq_n_f32(parameter->dx), Xp = vdupq_n_f32(parameter->Xp);
+    const float32x4_t ky = vdupq_n_f32(parameter->ky), Ysp = vdupq_n_f32(parameter->Ysp);
+    const float32x4_t dy = vdupq_n_f32(parameter->dy), Yp = vdupq_n_f32(parameter->Yp);
+    const float32x4_t four = vdupq_n_f32(4.0f);
+    const int32x4_t mh = vdupq_n_s32(repeat ? maskh : -1), mv = vdupq_n_s32(repeat ? maskv : -1);
+    const int32x4_t nshift = vdupq_n_s32(-shift);
+    const int32x4_t m = vdupq_n_s32(wh2 ? 15 : 7), s4 = vdupq_n_s32(wh2 ? 4 : 3);
+    static const float lanes[4] = {0.0f, 1.0f, 2.0f, 3.0f};
+    float32x4_t i = vaddq_f32(vld1q_f32(lanes), vdupq_n_f32((float)i0));
+    /* Eight dots a pass: two independent chains for the in-order pipeline. */
+#define ROTATION_RUN_COORDS(i, ii) do { \
+      const float32x4_t fh = vaddq_f32(vmulq_f32(kx, vaddq_f32(Xsp, vmulq_f32(dx, i))), Xp); \
+      const float32x4_t fv = vaddq_f32(vmulq_f32(ky, vaddq_f32(Ysp, vmulq_f32(dy, i))), Yp); \
+      const int32x4_t x = vandq_s32(vcvtq_s32_f32(fh), mh); \
+      const int32x4_t y = vandq_s32(vcvtq_s32_f32(fv), mv); \
+      vst1q_s32(&hv[0][ii], x); \
+      vst1q_s32(&hv[1][ii], y); \
+      vst1q_s32(&key[0][ii], vshlq_s32(x, nshift)); \
+      vst1q_s32(&key[1][ii], vshlq_s32(y, nshift)); \
+      vst1q_s32(&cell[ii], vorrq_s32(vshlq_s32(vandq_s32(y, m), s4), vandq_s32(x, m))); \
+    } while (0)
+    const float32x4_t eight = vdupq_n_f32(8.0f);
+    float32x4_t i4 = vaddq_f32(i, four);
+    for (int ii = 0; ii < n; ii += 8) {
+      ROTATION_RUN_COORDS(i, ii);
+      ROTATION_RUN_COORDS(i4, ii + 4);
+      i = vaddq_f32(i, eight);
+      i4 = vaddq_f32(i4, eight);
+    }
+#undef ROTATION_RUN_COORDS
+    /* Bit 8 of cell: the key differs from the previous dot's (the first
+     * dot's from the cache's), i.e. the dot misses the pattern-name cache:
+     * every dot here reaches the cache. */
+    key[0][-1] = *oldcellx;
+    key[1][-1] = *oldcelly;
+    const uint32x4_t flag = vdupq_n_u32(0x100);
+    for (int ii = 0; ii < n; ii += 4) {
+      const uint32x4_t same = vandq_u32(vceqq_s32(vld1q_s32(&key[0][ii]), vld1q_s32(&key[0][ii - 1])),
+                                        vceqq_s32(vld1q_s32(&key[1][ii]), vld1q_s32(&key[1][ii - 1])));
+      vst1q_s32(&cell[ii], vreinterpretq_s32_u32(vorrq_u32(vreinterpretq_u32_s32(vld1q_s32(&cell[ii])),
+                                                           vbicq_u32(flag, same))));
+    }
+  }
+#ifdef VITA_DIAG_ABLATE
+  { extern int vt_bench_mode, vt_bench_misses; if (vt_bench_mode == 2) return 1;
+    if (vt_bench_mode == 3) for (int ii = 0; ii < n; ii++) cell[ii] &= 0xFF;
+    int m = 0; for (int ii = 0; ii < n; ii++) m += (cell[ii] >> 8) & 1; if (vt_bench_mode == 0) vt_bench_misses = m; }
+#endif
+  RotationRunConst k;
+  k.repeat = repeat; k.shift = shift;
+  k.simple = info->colornumber <= 1 && info->specialprimode != 2 && info->specialcolormode <= 1;
+  k.bpp8 = info->colornumber == 1;
+  k.coloroffset = info->coloroffset; k.base_alpha = info->alpha;
+  k.line_color = info->LineColorBase != 0 && VDP2_CC_NONE != (info->blendmode&0x03);
+  k.line_bits = 0;
+  if (k.line_color) {
+    k.line_bits = 0x8000;
+    if (parameter->linecoefenab && parameter->lineaddr != 0xFFFFFFFF && parameter->lineaddr != 0x000000)
+      k.line_bits |= ((parameter->lineaddr & 0x7F) | 0x80) << 16;
+  }
+  k.tables = wh2 ? rotation_cell_offset16 : rotation_cell_offset8;
+  k.vram = Vdp2Ram;
+  if (k.bpp8) Vdp2RotationRunDots(rbg, info, parameter, &k, hv, cell, out, n, 1);
+  else Vdp2RotationRunDots(rbg, info, parameter, &k, hv, cell, out, n, 0);
+  *oldcellx = key[0][n - 1];
+  *oldcelly = key[1][n - 1];
+  return 1;
+}
+
+static INLINE int Vdp2RotationRowFast(RBGDrawInfo *rbg, vdp2draw_struct *info,
+    vdp2rotationparameter_struct *parameter, u32 *out, int hres,
+    int *oldcellx, int *oldcelly) {
+  return Vdp2RotationRunFast(rbg, info, parameter, out, 0, hres, oldcellx, oldcelly);
+}
+#endif
+
+/* Per-row screen start and coefficient table position (rows are resolved
+ * after this; see Vdp2RotationResolveRow). */
+static INLINE void Vdp2RotationRowStart(RBGDrawInfo *rbg, float j) {
+  if (rbg->rgb_type == 0) {
+    paraA.Xsp = paraA.A * ((paraA.Xst + paraA.deltaXst * j) - paraA.Px) +
+    paraA.B * ((paraA.Yst + paraA.deltaYst * j) - paraA.Py) +
+    paraA.C * (paraA.Zst - paraA.Pz);
+
+    paraA.Ysp = paraA.D * ((paraA.Xst + paraA.deltaXst *j) - paraA.Px) +
+    paraA.E * ((paraA.Yst + paraA.deltaYst * j) - paraA.Py) +
+    paraA.F * (paraA.Zst - paraA.Pz);
+
+    paraA.KtablV = paraA.deltaKAst* j;
+  }
+  if (rbg->useb)
+  {
+    paraB.Xsp = paraB.A * ((paraB.Xst + paraB.deltaXst * j) - paraB.Px) +
+      paraB.B * ((paraB.Yst + paraB.deltaYst * j) - paraB.Py) +
+      paraB.C * (paraB.Zst - paraB.Pz);
+
+    paraB.Ysp = paraB.D * ((paraB.Xst + paraB.deltaXst * j) - paraB.Px) +
+      paraB.E * ((paraB.Yst + paraB.deltaYst * j) - paraB.Py) +
+      paraB.F * (paraB.Zst - paraB.Pz);
+
+    paraB.KtablV = paraB.deltaKAst * j;
+  }
+}
+
+#ifdef VITA_ROTATION_SPLIT
+/* Frames whose rows all resolve to one parameter (or to transparency) are
+ * drawn by the rotation worker and, while it waits in Vdp2RgbTextureSync, the
+ * render thread: rows are resolved in order first (the same lookups the row
+ * loop makes), then claimed in chunks. Only the pattern-name cache couples
+ * rows: each chunk seeds it with the state the sequential loop enters the
+ * chunk with (Vdp2RotationSplitSeed), and info gets the state the last row
+ * leaves.
+ * Frames whose parameter is selected per dot (mode 2, and mode 3 with a dot
+ * coefficient increment) split the same way on private parameter copies:
+ * with coefficient mode 0 a selected parameter's kx/ky are the ones its
+ * lookup just wrote (or, without a table, never change), so a dot's parameter
+ * and coordinates do not depend on the dots before it. The globals get the
+ * last kx/ky/lineaddr each parameter's lookups wrote, as the sequential
+ * per-dot calls leave them. */
+enum { ROTATION_SPLIT_CHUNK = 8, ROTATION_SPLIT_ROWS = 512,
+       ROTATION_SPLIT_CHUNKS = ROTATION_SPLIT_ROWS / ROTATION_SPLIT_CHUNK,
+       ROTATION_SPLIT_MAX_HRES = 1024 };
+typedef struct {
+  u32 lineaddr;
+  float kx, ky;
+  int wrote_line, wrote_k;
+} RotationSplitCoef;
+/* Row inputs, written by the publishing pass. */
+typedef struct {
+  float Xsp, Ysp, kx, ky;
+  int visible;
+  /* Per-dot frames: row position and each parameter's row start. */
+  float j, XspB, YspB;
+  int KtablV, KtablVB;
+} RotationSplitRow;
+/* Row results besides the pixels: the pattern state the row leaves. */
+typedef struct {
+  u32 addr, charaddr, paladdr;
+  int flipfunction, specialfunction, specialcolorfunction;
+  RotationSplitCoef coef[2];
+} RotationSplitOut;
+typedef struct {
+  RBGDrawInfo *rbg;
+  vdp2draw_struct info;
+  vdp2rotationparameter_struct param, paramB;
+  int per_dot, spans, rows, hres, stride, cellw, cellh;
+  float hstep;
+  u32 *base;
+} RotationSplitJob;
+static RotationSplitRow rotation_split_rows[ROTATION_SPLIT_ROWS];
+static RotationSplitOut rotation_split_out[ROTATION_SPLIT_ROWS];
+static RotationSplitJob rotation_split;
+/* Frame sequence: odd while the publisher writes the job and rows, even once
+ * published. A chunk's state is seq * 4 + {0 free, 1 computing off to the
+ * side, 2 being written, 3 written}, so claims from an earlier frame fail. */
+enum { SPLIT_FREE, SPLIT_ASIDE, SPLIT_WRITING, SPLIT_WRITTEN };
+static atomic_uint rotation_split_seq;
+static atomic_uint rotation_split_chunk[ROTATION_SPLIT_CHUNKS];
+static atomic_int rotation_split_done;
+
+/* The pattern-name cache key Vdp2RotationPixel compares for a tile dot, or 0
+ * when the dot returns before reaching the cache. */
+static INLINE int Vdp2RotationPixelKey(const RBGDrawInfo *rbg, const vdp2rotationparameter_struct *p,
+                                       float i, int *kx, int *ky) {
+  int h, v;
+  Vdp2RotationDot(p, i, &h, &v);
+  switch (p->screenover) {
+  case OVERMODE_TRANSE:
+    if ((h < 0) || (h >= p->MaxH) || (v < 0) || (v >= p->MaxV)) return 0;
+    break;
+  case OVERMODE_512:
+    if ((h < 0) || (h > 512) || (v < 0) || (v > 512)) return 0;
+    break;
+  case OVERMODE_REPEAT:
+    h &= (p->MaxH - 1);
+    v &= (p->MaxV - 1);
+    break;
+  }
+  *kx = h >> rbg->patternshift;
+  *ky = v >> rbg->patternshift;
+  return 1;
+}
+
+/* The per-dot split's frame contract (see above): returns the rotation mode
+ * split per dot (2 or 3), or 0. Mode 3 rows resolve once per row unless a
+ * parameter has a dot coefficient increment or the window switches parameters
+ * within rows; mode 2 rows never do. In mode 2
+ * B takes A's line address when A is transparent: with 1-word coefficients
+ * that is not a lookup result, so only 2-word tables qualify there. */
+static int Vdp2RotationSplitPerDot(const RBGDrawInfo *rbg, const vdp2draw_struct *info) {
+  const vdp2rotationparameter_struct *a = &paraA, *b = &paraB;
+  int mode = 0;
+  if (fixVdp2Regs->RPMD == 3 && info->GetRParam == (Vdp2GetRParam_func)vdp2RGetParamMode03WithK &&
+      (a->deltaKAx != 0.0f || b->deltaKAx != 0.0f || (fixVdp2Regs->WCTLD & 0xA)) &&
+      (info->GetKValueA == vdp2rGetKValue1W || info->GetKValueA == vdp2rGetKValue2W) &&
+      (info->GetKValueB == vdp2rGetKValue1W || info->GetKValueB == vdp2rGetKValue2W) &&
+      a->coefmode == 0 && b->coefmode == 0 &&
+      (!(fixVdp2Regs->WCTLD & 0xA) || info->pWinInfo))
+    mode = 3;
+  else if (fixVdp2Regs->RPMD == 2 &&
+           (!a->coefenab || (a->coefmode == 0 && (b->coefenab || a->coefdatasize == 4))) &&
+           (!b->coefenab || b->coefmode == 0))
+    mode = 2;
+  return mode && rbg->rgb_type == 0 && rbg->useb && !info->isbitmap ? mode : 0;
+}
+
+static const u32 rotation_split_unwritten = 0x7fc0dead; /* a NaN no lookup yields */
+/* Only lookups write kx/ky, and only on parameters with a table. */
+static void Vdp2RotationSplitCoefStart(vdp2rotationparameter_struct *p) {
+  if (p->coefenab) {
+    memcpy(&p->kx, &rotation_split_unwritten, sizeof(p->kx));
+    memcpy(&p->ky, &rotation_split_unwritten, sizeof(p->ky));
+  }
+  p->lineaddr = 0xFFFFFFFFu;
+}
+static void Vdp2RotationSplitCoefEnd(const vdp2rotationparameter_struct *p, RotationSplitCoef *c) {
+  c->wrote_line = p->lineaddr != 0xFFFFFFFFu;
+  c->wrote_k = memcmp(&p->kx, &rotation_split_unwritten, sizeof(p->kx)) != 0;
+  c->lineaddr = p->lineaddr; c->kx = p->kx; c->ky = p->ky;
+}
+static void Vdp2RotationSplitCoefRestore(vdp2rotationparameter_struct *p, int which, int rows) {
+  int line = 0, k = 0;
+  for (int r = rows - 1; r >= 0 && !(line && k); --r) {
+    const RotationSplitCoef *c = &rotation_split_out[r].coef[which];
+    if (!line && c->wrote_line) { p->lineaddr = c->lineaddr; line = 1; }
+    if (!k && c->wrote_k) { p->kx = c->kx; p->ky = c->ky; k = 1; }
+  }
+}
+
+/* The parameter of dot ii of a row whose inputs are loaded (NULL: transparent). */
+static INLINE vdp2rotationparameter_struct *Vdp2RotationSplitDot(RotationSplitJob *job,
+    const RotationSplitRow *row, float i) {
+  if (job->per_dot == 3)
+    return Vdp2RotationMode03K(&job->info, (int)i, (int)row->j, &job->param, &job->paramB);
+  if (job->per_dot)
+    return Vdp2RotationMode02(i, &job->param, &job->paramB);
+  return row->visible ? &job->param : NULL;
+}
+
+static INLINE void Vdp2RotationSplitLoad(RotationSplitJob *job, const RotationSplitRow *row) {
+  vdp2rotationparameter_struct *param = &job->param, *paramB = &job->paramB;
+  param->Xsp = row->Xsp; param->Ysp = row->Ysp;
+  if (job->per_dot) {
+    param->KtablV = row->KtablV;
+    paramB->Xsp = row->XspB; paramB->Ysp = row->YspB; paramB->KtablV = row->KtablVB;
+  } else {
+    param->kx = row->kx; param->ky = row->ky;
+  }
+}
+
+/* The pattern-name cache and info pattern state the sequential loop enters
+ * row first with: the cache holds the key of the last dot that reached it,
+ * and info what the first dot of the final run of that key fetched (nothing,
+ * if the run starts the frame on the initial key). Walks back from the end of
+ * the previous row; a dot's key does not depend on the dots before it. The
+ * core 0 helper passes its frame's seq and gives up (with the result then
+ * rejected) when the rows are republished under it. */
+static void Vdp2RotationSplitSeed(RotationSplitJob *job, int first, unsigned seq,
+                                  int *oldcellx, int *oldcelly) {
+  float di[ROTATION_SPLIT_MAX_HRES];
+  const int hres = job->hres;
+  float i = 0.0f;
+  for (int ii = 0; ii < hres; ii++) { di[ii] = i; i += job->hstep; }
+  int have = 0, runx = 0, runy = 0, fr = -1, fi = 0;
+  for (int r = first - 1; r >= 0; --r) {
+    if (seq && atomic_load(&rotation_split_seq) != seq) return;
+    const RotationSplitRow *row = &rotation_split_rows[r];
+    if (!job->per_dot && !row->visible) continue;
+    Vdp2RotationSplitLoad(job, row);
+    for (int ii = hres - 1; ii >= 0; --ii) {
+      const vdp2rotationparameter_struct *p = Vdp2RotationSplitDot(job, row, di[ii]);
+      int kx, ky;
+      if (p == NULL || !Vdp2RotationPixelKey(job->rbg, p, di[ii], &kx, &ky)) continue;
+      if (!have) { have = 1; runx = kx; runy = ky; }
+      else if (kx != runx || ky != runy) goto found;
+      fr = r; fi = ii;
+    }
+  }
+  /* The run starts the frame: the loop fetched there unless the key is the
+   * initial one. */
+  if (!have || (runx == -1 && runy == -1)) return;
+found:;
+  const RotationSplitRow *row = &rotation_split_rows[fr];
+  Vdp2RotationSplitLoad(job, row);
+  vdp2rotationparameter_struct *p = Vdp2RotationSplitDot(job, row, di[fi]);
+  int nx = INT_MIN, ny = INT_MIN;
+  if (p) Vdp2RotationPixel(job->rbg, &job->info, p, di[fi], job->cellw, job->cellh, &nx, &ny);
+  *oldcellx = runx;
+  *oldcelly = runy;
+}
+
+/* Span frames (mode 3 per dot, no dot coefficient increment, one dot per
+ * screen dot): a dot's table index does not depend on its position, so its
+ * parameter, and every coefficient its lookups write, depends only on which
+ * branch of Vdp2RotationMode03K it takes. Returns the number of dots from ii
+ * on that take the same branch; the row resolves them once, at the first,
+ * leaving the copies as the per-dot calls would. */
+static INLINE int Vdp2RotationSpanLength(const RotationSplitJob *job, const RotationSplitRow *row, int ii) {
+  const int hres = job->hres;
+  if ((fixVdp2Regs->WCTLD & 0xA) == 0) return hres - ii;
+  const vdp2draw_struct *info = &job->info;
+  const int v = (int)row->j << info->hres_shift;
+  if (info->pWinInfo[v].WinShowLine == 0) return hres - ii;
+  const int start = info->pWinInfo[v].WinHStart, end = info->pWinInfo[v].WinHEnd;
+  int stop;
+  if (ii < start || ii >= end)   /* outside: up to the window start after ii */
+    stop = ii < start ? (start < end ? start : hres) : hres;
+  else
+    stop = end;
+  if (stop > hres) stop = hres;
+  return stop - ii;
+}
+
+/* Each call starts from the frame's job: the chunk's own state is private. */
+static void Vdp2RotationSplitRows(const RotationSplitJob *frame, const RotationSplitRow *rows, int first, int last,
+                                  u32 *out, size_t out_stride, RotationSplitOut *outs, unsigned seq) {
+  RotationSplitJob chunk = *frame, *job = &chunk;
+  vdp2draw_struct *info = &job->info;
+  vdp2rotationparameter_struct *param = &job->param, *paramB = &job->paramB;
+  RBGDrawInfo *rbg = job->rbg;
+  const int hres = job->hres;
+  int oldcellx = -1, oldcelly = -1;
+  if (first > 0) Vdp2RotationSplitSeed(job, first, seq, &oldcellx, &oldcelly);
+  for (int r = first; r < last; ++r, out += out_stride) {
+    const RotationSplitRow *row = &rows[r - first];
+    RotationSplitOut *o = &outs[r - first];
+    if (job->spans) {
+      Vdp2RotationSplitLoad(job, row);
+      Vdp2RotationSplitCoefStart(param);
+      Vdp2RotationSplitCoefStart(paramB);
+      for (int ii = 0; ii < hres;) {
+        const int n = Vdp2RotationSpanLength(job, row, ii);
+        vdp2rotationparameter_struct *p = Vdp2RotationSplitDot(job, row, (float)ii);
+        if (p == NULL) {
+          memset(out + ii, 0, (size_t)n * sizeof(*out));
+        }
+#ifdef VITA_DIAG_ABLATE
+        else if (({ static int bench;
+          if (!bench && n == hres && row->j >= 100.0f && sceKernelGetThreadCpuAffinityMask(0) == SCE_KERNEL_CPU_MASK_USER_1) { bench = 1;
+            static u32 tmp[1024]; int ox = oldcellx, oy = oldcelly; vdp2draw_struct saved = *info;
+            uint64_t t0 = sceKernelGetProcessTimeWide();
+            for (int k = 0; k < 200; ++k) { int a = ox, b = oy; *info = saved; Vdp2RotationRunFast(rbg, info, p, tmp, ii, n, &a, &b); }
+            uint64_t t1 = sceKernelGetProcessTimeWide();
+            *info = saved;
+            extern int vt_bench_mode, vt_bench_misses; const int misses = vt_bench_misses; double st[4];
+            for (int mode = 1; mode <= 3; ++mode) {
+              vt_bench_mode = mode;
+              uint64_t a0 = sceKernelGetProcessTimeWide();
+              for (int k = 0; k < 200; ++k) { int a = ox, b = oy; *info = saved; Vdp2RotationRunFast(rbg, info, p, tmp, ii, n, &a, &b); }
+              st[mode] = (sceKernelGetProcessTimeWide() - a0) / 200.0;
+            }
+            vt_bench_mode = 0; *info = saved;
+            YuiMsg("rotation_bench row=%g n=%d misses=%d hot_us=%.2f neon=%.2f flags=%.2f nomiss=%.2f", row->j, n, misses,
+                   (t1 - t0) / 200.0, st[1], st[2], st[3]); }
+          0; })) {}
+#endif
+        else if (!Vdp2RotationRunFast(rbg, info, p, out + ii, ii, n, &oldcellx, &oldcelly)) {
+          for (int k = ii; k < ii + n; k++)
+            out[k] = Vdp2RotationPixel(rbg, info, p, (float)k, job->cellw, job->cellh, &oldcellx, &oldcelly);
+        }
+        ii += n;
+      }
+      Vdp2RotationSplitCoefEnd(param, &o->coef[0]);
+      Vdp2RotationSplitCoefEnd(paramB, &o->coef[1]);
+    } else if (job->per_dot) {
+      Vdp2RotationSplitLoad(job, row);
+      Vdp2RotationSplitCoefStart(param);
+      Vdp2RotationSplitCoefStart(paramB);
+      float i = 0.0f;
+      for (int ii = 0; ii < hres; ii++) {
+        vdp2rotationparameter_struct *p = Vdp2RotationSplitDot(job, row, i);
+        out[ii] = p == NULL ? 0 : Vdp2RotationPixel(rbg, info, p, i,
+          job->cellw, job->cellh, &oldcellx, &oldcelly);
+        i += job->hstep;
+      }
+      Vdp2RotationSplitCoefEnd(param, &o->coef[0]);
+      Vdp2RotationSplitCoefEnd(paramB, &o->coef[1]);
+    } else if (!row->visible) {
+      memset(out, 0, (size_t)hres * sizeof(*out));
+    } else {
+      Vdp2RotationSplitLoad(job, row);
+#ifdef VITA_ROTATION_FAST_ROW
+      if (!Vdp2RotationRowFast(rbg, info, param, out, hres, &oldcellx, &oldcelly))
+#endif
+      {
+      float i = 0.0f;
+      for (int ii = 0; ii < hres; ii++) {
+        out[ii] = Vdp2RotationPixel(rbg, info, param, i,
+          job->cellw, job->cellh, &oldcellx, &oldcelly);
+        i += job->hstep;
+      }
+      }
+    }
+    o->addr = info->addr; o->charaddr = info->charaddr; o->paladdr = info->paladdr;
+    o->flipfunction = info->flipfunction; o->specialfunction = info->specialfunction;
+    o->specialcolorfunction = info->specialcolorfunction;
+  }
+}
+
+/* Claim a chunk of frame seq in state from, moving it to state to. */
+static int Vdp2RotationSplitClaim(unsigned seq, int chunks, unsigned from, unsigned to) {
+  for (int c = 0; c < chunks; ++c) {
+    unsigned expected = seq * 4 + from;
+    if (atomic_load_explicit(&rotation_split_chunk[c], memory_order_relaxed) == expected &&
+        atomic_compare_exchange_strong(&rotation_split_chunk[c], &expected, seq * 4 + to))
+      return c;
+  }
+  return -1;
+}
+
+static void Vdp2RotationSplitFinish(unsigned seq, int c, int rows) {
+  atomic_store(&rotation_split_chunk[c], seq * 4 + SPLIT_WRITTEN);
+  atomic_fetch_add(&rotation_split_done, rows);
+}
+
+extern volatile int g_vita_sound_wait;
+#ifdef VITA_DIAG_ABLATE
+/* diagnostic: rows and time per participant (0 render, 1 worker, 2 core 0 helper) */
+unsigned vt_rot_rows[3], vt_rot_us[3];
+int vt_bench_mode, vt_bench_misses;
+unsigned vt_span_us[4]; /* seed, span lookups, span render us; spans */
+unsigned vt_span_diag[4]; /* fast dots, slow dots, fast cell misses (racy) */
+#endif
+/* Rotation worker, render thread and publisher: claim free chunks, then
+ * chunks the core 0 helper is computing, and write them in place. */
+static void Vdp2RotationSplitWork(int worker) {
+  const unsigned seq = atomic_load(&rotation_split_seq);
+  if (seq & 1) return;
+  RotationSplitJob job = rotation_split;
+  if (atomic_load(&rotation_split_seq) != seq) return;
+  const int chunks = (job.rows + ROTATION_SPLIT_CHUNK - 1) / ROTATION_SPLIT_CHUNK;
+  for (;;) {
+    /* The worker shares its core with the sound thread, and the frame waits
+     * for sound: give way until it has finished. */
+    while (worker && g_vita_sound_wait && atomic_load(&rotation_split_done) < job.rows &&
+           atomic_load(&rotation_split_seq) == seq)
+      YabThreadYield();
+    int c = Vdp2RotationSplitClaim(seq, chunks, SPLIT_FREE, SPLIT_WRITING);
+    if (c < 0) c = Vdp2RotationSplitClaim(seq, chunks, SPLIT_ASIDE, SPLIT_WRITING);
+    if (c < 0) return;
+    const int first = c * ROTATION_SPLIT_CHUNK;
+    const int last = first + ROTATION_SPLIT_CHUNK < job.rows ? first + ROTATION_SPLIT_CHUNK : job.rows;
+#ifdef VITA_DIAG_ABLATE
+    const uint64_t t0 = sceKernelGetProcessTimeWide();
+#endif
+    Vdp2RotationSplitRows(&job, &rotation_split_rows[first], first, last,
+      job.base + (size_t)first * job.stride, job.stride, &rotation_split_out[first], 0);
+#ifdef VITA_DIAG_ABLATE
+    __atomic_add_fetch(&vt_rot_us[worker], (unsigned)(sceKernelGetProcessTimeWide() - t0), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&vt_rot_rows[worker], (unsigned)(last - first), __ATOMIC_RELAXED);
+#endif
+    Vdp2RotationSplitFinish(seq, c, last - first);
+  }
+}
+
+/* Core 0 helper, below the emulation thread's priority: it can be preempted
+ * holding a chunk, so it computes off to the side and writes the chunk only
+ * if nobody took it over meanwhile. A stale frame's inputs are rejected by
+ * the sequence check before computing and by the claim before writing. */
+static u32 rotation_split_aside[ROTATION_SPLIT_CHUNK * ROTATION_SPLIT_MAX_HRES];
+static void Vdp2RotationSplitHelperWork(void) {
+  const unsigned seq = atomic_load(&rotation_split_seq);
+  if (seq & 1) return;
+  RotationSplitJob job = rotation_split;
+  if (atomic_load(&rotation_split_seq) != seq || job.hres > ROTATION_SPLIT_MAX_HRES) return;
+  const int chunks = (job.rows + ROTATION_SPLIT_CHUNK - 1) / ROTATION_SPLIT_CHUNK;
+  for (;;) {
+    const int c = Vdp2RotationSplitClaim(seq, chunks, SPLIT_FREE, SPLIT_ASIDE);
+    if (c < 0) return;
+    const int first = c * ROTATION_SPLIT_CHUNK;
+    const int last = first + ROTATION_SPLIT_CHUNK < job.rows ? first + ROTATION_SPLIT_CHUNK : job.rows;
+    RotationSplitRow rows[ROTATION_SPLIT_CHUNK];
+    RotationSplitOut outs[ROTATION_SPLIT_CHUNK];
+    memcpy(rows, &rotation_split_rows[first], (size_t)(last - first) * sizeof(rows[0]));
+    if (atomic_load(&rotation_split_seq) != seq) return;
+#ifdef VITA_DIAG_ABLATE
+    const uint64_t t0 = sceKernelGetProcessTimeWide();
+#endif
+    Vdp2RotationSplitRows(&job, rows, first, last, rotation_split_aside, (size_t)job.hres, outs, seq);
+#ifdef VITA_DIAG_ABLATE
+    __atomic_add_fetch(&vt_rot_us[2], (unsigned)(sceKernelGetProcessTimeWide() - t0), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&vt_rot_rows[2], (unsigned)(last - first), __ATOMIC_RELAXED);
+#endif
+    unsigned expected = seq * 4 + SPLIT_ASIDE;
+    if (!atomic_compare_exchange_strong(&rotation_split_chunk[c], &expected, seq * 4 + SPLIT_WRITING))
+      continue;
+    for (int r = first; r < last; ++r)
+      memcpy(job.base + (size_t)r * job.stride, rotation_split_aside + (size_t)(r - first) * job.hres,
+             (size_t)job.hres * sizeof(u32));
+    memcpy(&rotation_split_out[first], outs, (size_t)(last - first) * sizeof(outs[0]));
+    Vdp2RotationSplitFinish(seq, c, last - first);
+  }
+}
+
+static SceUID rotation_split_wake = -1;
+static void *Vdp2RotationSplitHelperMain(void *arg) {
+  (void)arg;
+  sceKernelChangeThreadCpuAffinityMask(0, SCE_KERNEL_CPU_MASK_USER_0);
+  sceKernelChangeThreadPriority(0, 176);
+  for (;;) {
+    if (sceKernelWaitSema(rotation_split_wake, 1, NULL) < 0) return NULL;
+    Vdp2RotationSplitHelperWork();
+  }
+}
+
+static void Vdp2RotationSplitStartHelper(void) {
+  static int started;
+  if (started) return;
+  started = 1;
+  rotation_split_wake = sceKernelCreateSema("rotation_split", 0, 0, 1, NULL);
+  if (rotation_split_wake < 0) return;
+  pthread_t thread;
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 64 * 1024);
+  if (pthread_create(&thread, &attr, Vdp2RotationSplitHelperMain, NULL) != 0) {
+    sceKernelDeleteSema(rotation_split_wake);
+    rotation_split_wake = -1;
+  }
+  pthread_attr_destroy(&attr);
+}
+
+/* Render thread, waiting for the rotation worker. */
+static void Vdp2RotationSplitHelp(void) {
+  Vdp2RotationSplitWork(0);
+}
+
+#ifdef VITA_ROTATION_CPU_REUSE
+/* Exact reuse of a per-dot frame's pixels (games often redraw a rotation
+ * screen unchanged every other frame). The key holds every input the split
+ * reads: both parameters and info (less the fields each frame overwrites
+ * before reading: the row starts, lineaddr, table-written kx/ky and the
+ * pattern state), the registers it reads, the rows' window entries, the
+ * geometry and the VRAM generation. Frames reading CRAM (coefficients there,
+ * special colour mode 3) or entering on the initial pattern key (which reads
+ * the pattern state left by the frame before) are not kept. */
+typedef struct {
+  vdp2rotationparameter_struct a, b;
+  vdp2draw_struct info;
+  u32 gen, epoch, lcta;
+  u16 rpmd, wctld, vrsize, ccctl, ccrlb, ovpnra, ovpnrb, pad;
+  int per_dot, spans, useb, rgb_type, pagesize, patternshift, hres, vres, cellw, cellh, wins;
+  float mval_h, mval_v, vstep, hstep;
+} RotationReuseKey;
+enum { ROTATION_REUSE_WINS = 1024 };
+static struct {
+  int valid, fetched, cur;
+  RotationReuseKey key;
+  vdp2WindowInfo win[ROTATION_REUSE_WINS];
+  u32 *buf[2];
+  size_t cap;
+  /* After-state: the coefficients the lookups last wrote, the pattern state. */
+  int wrote_line[2], wrote_k[2];
+  u32 lineaddr[2];
+  float kx[2], ky[2];
+  u32 addr, charaddr, paladdr;
+  int flipfunction, specialfunction, specialcolorfunction;
+  unsigned hits, misses;
+} rotation_reuse;
+
+static void Vdp2RotationReuseParam(vdp2rotationparameter_struct *k, const vdp2rotationparameter_struct *p) {
+  *k = *p;
+  k->Xsp = k->Ysp = 0.0f; k->KtablV = 0; k->lineaddr = 0;
+  if (k->coefenab) k->kx = k->ky = 0.0f;
+}
+
+/* Returns 0 when the frame's inputs cannot be keyed. */
+static int Vdp2RotationReuseKeyOf(RotationReuseKey *k, const RBGDrawInfo *rbg, const vdp2draw_struct *info,
+                                  int per_dot, int spans, int cellw, int cellh, float vstep, float hstep) {
+  if (!per_dot || rbg->vram_epoch == UINT32_MAX || info->specialcolormode == 3 ||
+      (paraA.coefenab && paraA.k_mem_type != 0) || (paraB.coefenab && paraB.k_mem_type != 0))
+    return 0;
+  memset(k, 0, sizeof(*k));
+  Vdp2RotationReuseParam(&k->a, &paraA);
+  Vdp2RotationReuseParam(&k->b, &paraB);
+  k->info = *info;
+  k->info.addr = k->info.charaddr = k->info.paladdr = 0;
+  k->info.flipfunction = k->info.specialfunction = k->info.specialcolorfunction = 0;
+  k->gen = rbg->vram_generation; k->epoch = rbg->vram_epoch;
+  k->lcta = fixVdp2Regs->LCTA.all;
+  k->rpmd = fixVdp2Regs->RPMD; k->wctld = fixVdp2Regs->WCTLD; k->vrsize = fixVdp2Regs->VRSIZE;
+  k->ccctl = fixVdp2Regs->CCCTL; k->ccrlb = fixVdp2Regs->CCRLB;
+  k->ovpnra = fixVdp2Regs->OVPNRA; k->ovpnrb = fixVdp2Regs->OVPNRB;
+  k->per_dot = per_dot; k->spans = spans;
+  k->useb = rbg->useb; k->rgb_type = rbg->rgb_type; k->pagesize = rbg->pagesize;
+  k->patternshift = rbg->patternshift; k->hres = rbg->hres; k->vres = rbg->vres;
+  k->cellw = cellw; k->cellh = cellh;
+  k->mval_h = rbg->rotate_mval_h; k->mval_v = rbg->rotate_mval_v; k->vstep = vstep; k->hstep = hstep;
+  if ((fixVdp2Regs->WCTLD & 0xA) && info->pWinInfo) {
+    /* Rows index the window table by (int)j << hres_shift. */
+    k->wins = ((int)rotation_split_rows[rbg->vres - 1].j << info->hres_shift) + 1;
+    if (k->wins <= 0 || k->wins > ROTATION_REUSE_WINS) return 0;
+  }
+  return 1;
+}
+
+static int Vdp2RotationReuseMatch(const RotationReuseKey *k, const vdp2draw_struct *info) {
+  return rotation_reuse.valid && !memcmp(k, &rotation_reuse.key, sizeof(*k)) &&
+         (!k->wins || !memcmp(info->pWinInfo, rotation_reuse.win, (size_t)k->wins * sizeof(vdp2WindowInfo)));
+}
+
+/* The first dot of the published frame that reaches the pattern-name cache:
+ * 1 with a key other than the initial one, -1 with the initial key, 0 none. */
+static int Vdp2RotationReuseFirstKey(void) {
+  RotationSplitJob job = rotation_split;
+  Vdp2RotationSplitCoefStart(&job.param);
+  Vdp2RotationSplitCoefStart(&job.paramB);
+  for (int r = 0; r < job.rows; ++r) {
+    const RotationSplitRow *row = &rotation_split_rows[r];
+    Vdp2RotationSplitLoad(&job, row);
+    float i = 0.0f;
+    for (int ii = 0; ii < job.hres; ii++, i += job.hstep) {
+      const vdp2rotationparameter_struct *p = Vdp2RotationSplitDot(&job, row, i);
+      int kx, ky;
+      if (p && Vdp2RotationPixelKey(job.rbg, p, i, &kx, &ky)) return kx == -1 && ky == -1 ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+static u32 *Vdp2RotationReuseBuffer(size_t n) {
+  if (rotation_reuse.cap < n) {
+    for (int b = 0; b < 2; ++b) {
+      free(rotation_reuse.buf[b]);
+      rotation_reuse.buf[b] = malloc(n * sizeof(u32));
+    }
+    rotation_reuse.valid = 0;
+    rotation_reuse.cap = rotation_reuse.buf[0] && rotation_reuse.buf[1] ? n : 0;
+    if (!rotation_reuse.cap) return NULL;
+  }
+  return rotation_reuse.buf[rotation_reuse.cur ^ 1];
+}
+
+static void Vdp2RotationReuseCopy(YglTexture *texture, const u32 *src, int hres, int vres) {
+  const size_t stride = (size_t)hres + texture->w;
+  for (int r = 0; r < vres; ++r)
+    memcpy(texture->textdata + (size_t)r * stride, src + (size_t)r * hres, (size_t)hres * sizeof(u32));
+}
+
+static void Vdp2RotationReuseApply(vdp2draw_struct *info) {
+  vdp2rotationparameter_struct *p[2] = { &paraA, &paraB };
+  for (int w = 0; w < 2; ++w) {
+    if (rotation_reuse.wrote_line[w]) p[w]->lineaddr = rotation_reuse.lineaddr[w];
+    if (rotation_reuse.wrote_k[w]) { p[w]->kx = rotation_reuse.kx[w]; p[w]->ky = rotation_reuse.ky[w]; }
+  }
+  if (rotation_reuse.fetched) {
+    info->addr = rotation_reuse.addr; info->charaddr = rotation_reuse.charaddr;
+    info->paladdr = rotation_reuse.paladdr; info->flipfunction = rotation_reuse.flipfunction;
+    info->specialfunction = rotation_reuse.specialfunction;
+    info->specialcolorfunction = rotation_reuse.specialcolorfunction;
+  }
+}
+
+/* After a computed frame: keep its pixels (in buffer cur ^ 1) and after-state. */
+static void Vdp2RotationReuseStore(const RotationReuseKey *k, const vdp2draw_struct *info, int vres) {
+  const int first = Vdp2RotationReuseFirstKey();
+  if (first < 0) { rotation_reuse.valid = 0; return; }
+  rotation_reuse.key = *k;
+  if (k->wins) memcpy(rotation_reuse.win, info->pWinInfo, (size_t)k->wins * sizeof(vdp2WindowInfo));
+  rotation_reuse.fetched = first;
+  for (int w = 0; w < 2; ++w) {
+    rotation_reuse.wrote_line[w] = rotation_reuse.wrote_k[w] = 0;
+    for (int r = vres - 1; r >= 0; --r) {
+      const RotationSplitCoef *c = &rotation_split_out[r].coef[w];
+      if (!rotation_reuse.wrote_line[w] && c->wrote_line) { rotation_reuse.wrote_line[w] = 1; rotation_reuse.lineaddr[w] = c->lineaddr; }
+      if (!rotation_reuse.wrote_k[w] && c->wrote_k) { rotation_reuse.wrote_k[w] = 1; rotation_reuse.kx[w] = c->kx; rotation_reuse.ky[w] = c->ky; }
+    }
+  }
+  rotation_reuse.addr = info->addr; rotation_reuse.charaddr = info->charaddr;
+  rotation_reuse.paladdr = info->paladdr; rotation_reuse.flipfunction = info->flipfunction;
+  rotation_reuse.specialfunction = info->specialfunction;
+  rotation_reuse.specialcolorfunction = info->specialcolorfunction;
+  rotation_reuse.cur ^= 1;
+  rotation_reuse.valid = 1;
+}
+#endif
+
+/* Rotation worker: returns 0 (nothing drawn) unless the frame qualifies. */
+/* Line colour: a pixel reads its parameter's lineaddr, which in mode 3 per
+ * dot with 2-word tables its own lookup has just written; the line texture
+ * rows are written here as the row loop writes them. */
+static int Vdp2RotationSplit(RBGDrawInfo *rbg, vdp2draw_struct *info, YglTexture *texture,
+                             int cellw, int cellh, float vstep, float hstep,
+                             YglTexture *line_texture, int lineInc, int linecl) {
+  if (info->isbitmap || rbg->hres <= 0 || rbg->hres > ROTATION_SPLIT_MAX_HRES ||
+      rbg->vres <= 0 || rbg->vres > ROTATION_SPLIT_ROWS) return 0;
+  const int per_dot = Vdp2RotationSplitPerDot(rbg, info);
+  if (info->LineColorBase != 0 &&
+      (per_dot != 3 || info->GetKValueA != vdp2rGetKValue2W || info->GetKValueB != vdp2rGetKValue2W))
+    return 0;
+  Vdp2RotationSplitStartHelper();
+  /* Close the previous frame to late claims before rewriting the rows. */
+  unsigned seq = atomic_load(&rotation_split_seq);
+  if (!(seq & 1)) atomic_store(&rotation_split_seq, ++seq);
+  vdp2rotationparameter_struct *single = NULL;
+  float j = 0.0f;
+  for (int jj = 0; jj < rbg->vres; jj++) {
+    vdp2rotationparameter_struct *p;
+    Vdp2RotationRowStart(rbg, j);
+    if (per_dot) {
+      RotationSplitRow *row = &rotation_split_rows[jj];
+      row->j = j;
+      row->Xsp = paraA.Xsp; row->Ysp = paraA.Ysp; row->KtablV = paraA.KtablV;
+      row->XspB = paraB.Xsp; row->YspB = paraB.Ysp; row->KtablVB = paraB.KtablV;
+      j += vstep;
+      continue;
+    }
+    if (!Vdp2RotationResolveRow(info, fixVdp2Regs->RPMD | rbg->rgb_type, (int)j, rbg->hres, &p))
+      return 0;
+    RotationSplitRow *row = &rotation_split_rows[jj];
+    row->visible = p != NULL;
+    if (p) {
+      if (single && p != single) return 0;
+      single = p;
+      row->Xsp = p->Xsp; row->Ysp = p->Ysp; row->kx = p->kx; row->ky = p->ky;
+    }
+    j += vstep;
+  }
+  if (info->LineColorBase != 0) {
+    j = 0.0f;
+    for (int jj = 0; jj < rbg->vres; jj++, j += vstep) {
+      if ((fixVdp2Regs->LCTA.part.U & 0x8000) != 0) {
+        rbg->LineColorRamAdress = T1ReadWord(Vdp2Ram, info->LineColorBase + lineInc*(int)(j));
+        *line_texture->textdata++ = rbg->LineColorRamAdress | (linecl << 24);
+      } else {
+        *line_texture->textdata++ = rbg->LineColorRamAdress;
+      }
+    }
+  }
+  const int spans = per_dot == 3 && paraA.deltaKAx == 0.0f && paraB.deltaKAx == 0.0f &&
+                    hstep == 1.0f && rbg->rotate_mval_h == 1.0f;
+  u32 *out = texture->textdata;
+  size_t out_stride = (size_t)rbg->hres + texture->w;
+#ifdef VITA_ROTATION_CPU_REUSE
+  RotationReuseKey reuse_key;
+  const int reusable = Vdp2RotationReuseKeyOf(&reuse_key, rbg, info, per_dot, spans, cellw, cellh, vstep, hstep);
+  int validate = 0;
+  if (reusable && Vdp2RotationReuseMatch(&reuse_key, info)) {
+#ifdef VITA_DIAG_ABLATE
+    extern unsigned vt_ablate;
+    validate = (vt_ablate & 8192) != 0;
+    if (!validate)
+#endif
+    {
+      Vdp2RotationReuseCopy(texture, rotation_reuse.buf[rotation_reuse.cur], rbg->hres, rbg->vres);
+      Vdp2RotationReuseApply(info);
+      texture->textdata += (size_t)rbg->vres * out_stride;
+      ++rotation_reuse.hits;
+      return 1;
+    }
+  }
+  u32 *const reuse_out = reusable ? Vdp2RotationReuseBuffer((size_t)rbg->hres * rbg->vres) : NULL;
+  if (reuse_out) { out = reuse_out; out_stride = (size_t)rbg->hres; }
+#endif
+  rotation_split.rbg = rbg;
+  rotation_split.info = *info;
+  rotation_split.per_dot = per_dot;
+  rotation_split.spans = spans;
+  if (per_dot) { rotation_split.param = paraA; rotation_split.paramB = paraB; }
+  else if (single) rotation_split.param = *single;
+  rotation_split.rows = rbg->vres;
+  rotation_split.hres = rbg->hres;
+  rotation_split.base = out;
+  rotation_split.stride = (int)out_stride;
+  rotation_split.cellw = cellw; rotation_split.cellh = cellh;
+  rotation_split.hstep = hstep;
+  const int chunks = (rbg->vres + ROTATION_SPLIT_CHUNK - 1) / ROTATION_SPLIT_CHUNK;
+  ++seq;
+  for (int c = 0; c < chunks; ++c) atomic_store(&rotation_split_chunk[c], seq * 4 + SPLIT_FREE);
+  atomic_store(&rotation_split_done, 0);
+  atomic_store(&rotation_split_seq, seq);
+  if (rotation_split_wake >= 0) sceKernelSignalSema(rotation_split_wake, 1);
+  do {
+    Vdp2RotationSplitWork(1);
+    if (atomic_load(&rotation_split_done) >= rbg->vres) break;
+    YabThreadYield();
+  } while (atomic_load(&rotation_split_done) < rbg->vres);
+  if (per_dot) {
+    Vdp2RotationSplitCoefRestore(&paraA, 0, rbg->vres);
+    Vdp2RotationSplitCoefRestore(&paraB, 1, rbg->vres);
+  }
+  {
+    const RotationSplitOut *o = &rotation_split_out[rbg->vres - 1];
+    info->addr = o->addr; info->charaddr = o->charaddr; info->paladdr = o->paladdr;
+    info->flipfunction = o->flipfunction; info->specialfunction = o->specialfunction;
+    info->specialcolorfunction = o->specialcolorfunction;
+  }
+#ifdef VITA_ROTATION_CPU_REUSE
+  if (reuse_out) {
+    Vdp2RotationReuseCopy(texture, reuse_out, rbg->hres, rbg->vres);
+#ifdef VITA_DIAG_ABLATE
+    if (validate) {
+      /* The frame was computed anyway: the kept frame must match it. */
+      static unsigned checks, bad;
+      const vdp2rotationparameter_struct a = paraA, b = paraB;
+      const vdp2draw_struct in = *info;
+      Vdp2RotationReuseApply(info);
+      const int same = !memcmp(reuse_out, rotation_reuse.buf[rotation_reuse.cur],
+                               (size_t)rbg->hres * rbg->vres * sizeof(u32)) &&
+                       !memcmp(&a, &paraA, sizeof(a)) && !memcmp(&b, &paraB, sizeof(b)) &&
+                       !memcmp(&in, info, sizeof(in));
+      paraA = a; paraB = b; *info = in;
+      ++checks;
+      if (!same) ++bad;
+      if (!same || (checks & 255) == 1) YuiMsg("rotation_reuse_check checks=%u bad=%u", checks, bad);
+    }
+#endif
+    Vdp2RotationReuseStore(&reuse_key, info, rbg->vres);
+    ++rotation_reuse.misses;
+  }
+#ifdef VITA_DIAG_ABLATE
+  if (((rotation_reuse.hits + rotation_reuse.misses) & 255) == 1)
+    YuiMsg("rotation_reuse hits=%u misses=%u", rotation_reuse.hits, rotation_reuse.misses);
+#endif
+#endif
+  texture->textdata += (size_t)rbg->vres * ((size_t)rbg->hres + texture->w);
+  return 1;
+}
 #endif
 
 static void Vdp2DrawRotation_in(RBGDrawInfo * rbg) {
   VT_SCOPE(VT_VDP2_ROTATION);
 
   if (rbg == NULL) return;
+#ifdef VITA_ROTATION_FAST_ROW
+  Vdp2RotationCellTables();
+#endif
 
   vdp2draw_struct *info = &rbg->info;
   int rgb_type = rbg->rgb_type;
@@ -5136,7 +6497,24 @@ static void Vdp2DrawRotation_in(RBGDrawInfo * rbg) {
   if (rotation_mode == 0 || rotation_mode == 1 ||
       (rgb_type == 4 && (info->GetRParam == (Vdp2GetRParam_func)vdp2RGetParamMode01NoK ||
                          info->GetRParam == (Vdp2GetRParam_func)vdp2RGetParamMode01WithK)))
+  {
+#ifdef VITA_ROTATION_ROUTE
+    /* The frontend moves this screen to the CPU rows while the SGX limits. */
+    extern volatile int vita_rotation_cpu;
+    extern volatile unsigned vita_rotation_eligible;
+    __atomic_add_fetch(&vita_rotation_eligible, 1, __ATOMIC_RELAXED);
+    if (!vita_rotation_cpu)
+#endif
+#ifdef VITA_DIAG_ABLATE
+    { extern unsigned vt_ablate; if (!(vt_ablate & 16)) // diagnostic: CPU rotation path
+#endif
     gpu_rotation = YglVitaRotationBegin(rbg, rotation_mode == 0 ? &paraA : &paraB, Vdp2Ram);
+#ifdef VITA_DIAG_ABLATE
+    }
+#endif
+  }
+#endif
+#ifdef VITA_ROTATION_SPLIT
 #endif
   //for (j = 0; j < vres; j += vstep)
   j = 0.0f;
@@ -5146,56 +6524,7 @@ static void Vdp2DrawRotation_in(RBGDrawInfo * rbg) {
     Vdp2 * regs = Vdp2RestoreRegs(j, Vdp2Lines);
 #endif
 
-    if (rgb_type == 0) {
-#if 0 // PERLINE
-      paraA.charaddr = (regs->MPOFR & 0x7) * 0x20000;
-      ReadPlaneSizeR(&paraA, regs->PLSZ >> 8);
-      for (i = 0; i < 16; i++) {
-        paraA.PlaneAddr(info, i, regs);
-        paraA.PlaneAddrv[i] = info->addr;
-      }
-#endif
-      paraA.Xsp = paraA.A * ((paraA.Xst + paraA.deltaXst * j) - paraA.Px) +
-      paraA.B * ((paraA.Yst + paraA.deltaYst * j) - paraA.Py) +
-      paraA.C * (paraA.Zst - paraA.Pz);
-
-      paraA.Ysp = paraA.D * ((paraA.Xst + paraA.deltaXst *j) - paraA.Px) +
-      paraA.E * ((paraA.Yst + paraA.deltaYst * j) - paraA.Py) +
-      paraA.F * (paraA.Zst - paraA.Pz);
-
-      paraA.KtablV = paraA.deltaKAst* j;
-    }
-    if (rbg->useb)
-    {
-#if 0 // PERLINE
-      Vdp2ReadRotationTable(1, &paraB, regs, Vdp2Ram);
-      paraB.dx = paraB.A * paraB.deltaX + paraB.B * paraB.deltaY;
-      paraB.dy = paraB.D * paraB.deltaX + paraB.E * paraB.deltaY;
-      paraB.Xp = paraB.A * (paraB.Px - paraB.Cx) + paraB.B * (paraB.Py - paraB.Cy)
-        + paraB.C * (paraB.Pz - paraB.Cz) + paraB.Cx + paraB.Mx;
-      paraB.Yp = paraB.D * (paraB.Px - paraB.Cx) + paraB.E * (paraB.Py - paraB.Cy)
-        + paraB.F * (paraB.Pz - paraB.Cz) + paraB.Cy + paraB.My;
-
-      ReadPlaneSize(info, regs->PLSZ >> 12);
-      ReadPatternData(info, regs->PNCN0, regs->CHCTLA & 0x1);
-
-      paraB.charaddr = (regs->MPOFR & 0x70) * 0x2000;
-      ReadPlaneSizeR(&paraB, regs->PLSZ >> 12);
-      for (i = 0; i < 16; i++) {
-        paraB.PlaneAddr(info, i, regs);
-        paraB.PlaneAddrv[i] = info->addr;
-      }
-#endif
-      paraB.Xsp = paraB.A * ((paraB.Xst + paraB.deltaXst * j) - paraB.Px) +
-        paraB.B * ((paraB.Yst + paraB.deltaYst * j) - paraB.Py) +
-        paraB.C * (paraB.Zst - paraB.Pz);
-
-      paraB.Ysp = paraB.D * ((paraB.Xst + paraB.deltaXst * j) - paraB.Px) +
-        paraB.E * ((paraB.Yst + paraB.deltaYst * j) - paraB.Py) +
-        paraB.F * (paraB.Zst - paraB.Pz);
-
-      paraB.KtablV = paraB.deltaKAst * j;
-  }
+    Vdp2RotationRowStart(rbg, j);
 
     if (info->LineColorBase != 0)
     {
@@ -5213,7 +6542,7 @@ static void Vdp2DrawRotation_in(RBGDrawInfo * rbg) {
     //	  if (regs) ReadVdp2ColorOffset(regs, info, info->linecheck_mask);
     vdp2rotationparameter_struct *row_parameter = NULL;
     const int row_constant = rbg->hres > 0 && Vdp2RotationResolveRow(
-      info, fixVdp2Regs->RPMD | rgb_type, (int)j, &row_parameter);
+      info, fixVdp2Regs->RPMD | rgb_type, (int)j, rbg->hres, &row_parameter);
 #ifdef YABAUSE_VITAGL
     if (gpu_rotation >= 0) {
       if (!row_constant) abort();
@@ -5230,6 +6559,14 @@ static void Vdp2DrawRotation_in(RBGDrawInfo * rbg) {
       continue;
     }
 
+#ifdef VITA_ROTATION_FAST_ROW
+    if (row_constant && Vdp2RotationRowFast(rbg, info, row_parameter, texture->textdata,
+                                            rbg->hres, &oldcellx, &oldcelly)) {
+      texture->textdata += rbg->hres + texture->w;
+      j += vstep;
+      continue;
+    }
+#endif
     //for (i = 0; i < hres; i += hstep)
     i = 0.0;
     for( int ii=0; ii< rbg->hres; ii++ )
@@ -5264,31 +6601,7 @@ static void Vdp2DrawRotation_in(RBGDrawInfo * rbg) {
         }
         break;
       case 2:
-        if (!(paraA.coefenab)) {
-          parameter = &paraA;
-        } else {
-          if (paraB.coefenab) {
-            parameter = &paraA;
-            if (vdp2rGetKValue(parameter, i) == 0) {
-              parameter = &paraB;
-              if( vdp2rGetKValue(parameter, i) == 0) {
-                *(texture->textdata++) = 0x00000000;
-                i += hstep;
-                continue;
-              }
-            }
-          }
-          else {
-            parameter = &paraA;
-            if (vdp2rGetKValue(parameter, i) == 0) {
-              paraB.lineaddr = paraA.lineaddr;
-              parameter = &paraB;
-			}
-			else {
-				int a = 0;
-			}
-          }
-        }
+        parameter = Vdp2RotationMode02(i, &paraA, &paraB);
         break;
       default:
         parameter = info->GetRParam(info, (int)i, (int)j);
@@ -5301,228 +6614,7 @@ static void Vdp2DrawRotation_in(RBGDrawInfo * rbg) {
         continue;
       }
 
-      float fh = (parameter->kx * (parameter->Xsp + parameter->dx * i) + parameter->Xp);
-      float fv = (parameter->ky * (parameter->Ysp + parameter->dy * i) + parameter->Yp);
-      h = fh;
-      v = fv;
-
-      //v = jj;
-      //h = ii;
-
-      if (info->isbitmap)
-      {
-
-        switch (parameter->screenover) {
-        case OVERMODE_REPEAT:
-          h &= cellw - 1;
-          v &= cellh - 1;
-          break;
-        case OVERMODE_SELPATNAME:
-          VDP2LOG("Screen-over mode 1 not implemented");
-          h &= cellw - 1;
-          v &= cellh - 1;
-          break;
-        case OVERMODE_TRANSE:
-          if ((h < 0) || (h >= cellw) || (v < 0) || (v >= cellh)) {
-            *(texture->textdata++) = 0x0;
-            i += hstep;
-            continue;
-          }
-          break;
-        case OVERMODE_512:
-          if ((h < 0) || (h > 512) || (v < 0) || (v > 512)) {
-            *(texture->textdata++) = 0x00;
-            i += hstep;
-            continue;
-          }
-        }
-        // Fetch Pixel
-        info->charaddr = parameter->charaddr;
-        color = Vdp2RotationFetchPixel(info, h, v, cellw);
-      }
-      else
-      {
-        // Tile
-        int planenum;
-        switch (parameter->screenover) {
-        case OVERMODE_TRANSE:
-          if ((h < 0) || (h >= parameter->MaxH) || (v < 0) || (v >= parameter->MaxV)) {
-            *(texture->textdata++) = 0x00;
-            i += hstep;
-            continue;
-          }
-          x = h;
-          y = v;
-          if ((x >> rbg->patternshift) != oldcellx || (y >> rbg->patternshift) != oldcelly) {
-            oldcellx = x >> rbg->patternshift;
-            oldcelly = y >> rbg->patternshift;
-
-            // Calculate which plane we're dealing with
-            planenum = (x >> parameter->ShiftPaneX) + ((y >> parameter->ShiftPaneY) << 2);
-            x &= parameter->MskH;
-            y &= parameter->MskV;
-            info->addr = parameter->PlaneAddrv[planenum];
-
-            // Figure out which page it's on(if plane size is not 1x1)
-            info->addr += (((y >> 9) * rbg->pagesize * info->planew) +
-              ((x >> 9) * rbg->pagesize) +
-              (((y & 511) >> rbg->patternshift) * info->pagewh) +
-              ((x & 511) >> rbg->patternshift)) << info->patterndatasize;
-
-            Vdp2PatternAddr(info); // Heh, this could be optimized
-          }
-          break;
-        case OVERMODE_512:
-          if ((h < 0) || (h > 512) || (v < 0) || (v > 512)) {
-            *(texture->textdata++) = 0x00;
-            i += hstep;
-            continue;
-          }
-          x = h;
-          y = v;
-          if ((x >> rbg->patternshift) != oldcellx || (y >> rbg->patternshift) != oldcelly) {
-              oldcellx = x >> rbg->patternshift;
-              oldcelly = y >> rbg->patternshift;
-
-              // Calculate which plane we're dealing with
-              planenum = (x >> parameter->ShiftPaneX) + ((y >> parameter->ShiftPaneY) << 2);
-              x &= parameter->MskH;
-              y &= parameter->MskV;
-              info->addr = parameter->PlaneAddrv[planenum];
-
-              // Figure out which page it's on(if plane size is not 1x1)
-              info->addr += (((y >> 9) * rbg->pagesize * info->planew) +
-                ((x >> 9) * rbg->pagesize) +
-                (((y & 511) >> rbg->patternshift) * info->pagewh) +
-                ((x & 511) >> rbg->patternshift)) << info->patterndatasize;
-
-              Vdp2PatternAddr(info); // Heh, this could be optimized
-          }
-          break;
-        case OVERMODE_REPEAT: {
-          h &= (parameter->MaxH - 1);
-          v &= (parameter->MaxV - 1);
-          x = h;
-          y = v;
-          if ((x >> rbg->patternshift) != oldcellx || (y >> rbg->patternshift) != oldcelly) {
-              oldcellx = x >> rbg->patternshift;
-              oldcelly = y >> rbg->patternshift;
-
-              // Calculate which plane we're dealing with
-              planenum = (x >> parameter->ShiftPaneX) + ((y >> parameter->ShiftPaneY) << 2);
-              x &= parameter->MskH;
-              y &= parameter->MskV;
-              info->addr = parameter->PlaneAddrv[planenum];
-
-              // Figure out which page it's on(if plane size is not 1x1)
-              info->addr += (((y >> 9) * rbg->pagesize * info->planew) +
-                ((x >> 9) * rbg->pagesize) +
-                (((y & 511) >> rbg->patternshift) * info->pagewh) +
-                ((x & 511) >> rbg->patternshift)) << info->patterndatasize;
-
-              Vdp2PatternAddr(info); // Heh, this could be optimized
-            }
-          }
-          break;
-        case OVERMODE_SELPATNAME: {
-            x = h;
-            y = v;
-            if ((x >> rbg->patternshift) != oldcellx || (y >> rbg->patternshift) != oldcelly) {
-              oldcellx = x >> rbg->patternshift;
-              oldcelly = y >> rbg->patternshift;
-
-              if ((h < 0) || (h >= parameter->MaxH) || (v < 0) || (v >= parameter->MaxV)) {
-                x &= parameter->MskH;
-                y &= parameter->MskV;
-                Vdp2PatternAddrUsingPatternname(info, parameter->over_pattern_name);
-              }
-              else {
-                planenum = (x >> parameter->ShiftPaneX) + ((y >> parameter->ShiftPaneY) << 2);
-                x &= parameter->MskH;
-                y &= parameter->MskV;
-                info->addr = parameter->PlaneAddrv[planenum];
-                // Figure out which page it's on(if plane size is not 1x1)
-                info->addr += (((y >> 9) * rbg->pagesize * info->planew) +
-                  ((x >> 9) * rbg->pagesize) +
-                  (((y & 511) >> rbg->patternshift) * info->pagewh) +
-                  ((x & 511) >> rbg->patternshift)) << info->patterndatasize;
-                  Vdp2PatternAddr(info); // Heh, this could be optimized
-              }
-            }
-          }
-          break;
-        }
-
-        // Figure out which pixel in the tile we want
-        if (info->patternwh == 1)
-        {
-          x &= 8 - 1;
-          y &= 8 - 1;
-
-          // vertical flip
-          if (info->flipfunction & 0x2)
-            y = 8 - 1 - y;
-
-          // horizontal flip	
-          if (info->flipfunction & 0x1)
-            x = 8 - 1 - x;
-        }
-        else
-        {
-          if (info->flipfunction)
-          {
-            y &= 16 - 1;
-            if (info->flipfunction & 0x2)
-            {
-              if (!(y & 8))
-                y = 8 - 1 - y + 16;
-              else
-                y = 16 - 1 - y;
-            }
-            else if (y & 8)
-              y += 8;
-
-            if (info->flipfunction & 0x1)
-            {
-              if (!(x & 8))
-                y += 8;
-
-              x &= 8 - 1;
-              x = 8 - 1 - x;
-            }
-            else if (x & 8)
-            {
-              y += 8;
-              x &= 8 - 1;
-            }
-            else
-              x &= 8 - 1;
-          }
-          else
-          {
-            y &= 16 - 1;
-            if (y & 8)
-              y += 8;
-            if (x & 8)
-              y += 8;
-            x &= 8 - 1;
-          }
-        }
-
-        // Fetch pixel
-		color =  Vdp2RotationFetchPixel(info, x, y, 8);
-      }
-
-      if (info->LineColorBase != 0 && VDP2_CC_NONE != (info->blendmode&0x03)) {
-        if ((color & 0xFF000000) != 0 ) {
-          color |= 0x8000;
-          if (parameter->linecoefenab && parameter->lineaddr != 0xFFFFFFFF && parameter->lineaddr != 0x000000 ) {
-            color |= ((parameter->lineaddr & 0x7F) | 0x80) << 16;
-          }
-        }
-      }
-
-      *(texture->textdata++) = color;
+      *(texture->textdata++) = Vdp2RotationPixel(rbg, info, parameter, i, cellw, cellh, &oldcellx, &oldcelly);
       i += hstep;
     }
     texture->textdata += texture->w;
@@ -9602,71 +10694,7 @@ vdp2rotationparameter_struct * FASTCALL vdp2RGetParamMode03WithKB(vdp2draw_struc
 
 vdp2rotationparameter_struct * FASTCALL vdp2RGetParamMode03WithK(vdp2draw_struct * info, int h, int v)
 {
-  vdp2rotationparameter_struct * p;
-
-  // Disbaled Window always return A
-  if ((fixVdp2Regs->WCTLD & 0xA) == 0) {
-    h = ceilf(paraA.KtablV + (paraA.deltaKAx * h));
-    p = info->GetKValueA(&paraA, h);
-    if (p) return p;
-    h = ceilf(paraB.KtablV + (paraB.deltaKAx * h));
-    return info->GetKValueB(&paraB, h);
-  }
-
-  v <<= info->hres_shift;
-
-  // Final Fight Revenge
-  if (info->WindwAreaMode == WA_INSIDE) {
-    if (info->pWinInfo[v].WinShowLine == 0) {
-      h = ceilf(paraA.KtablV + (paraA.deltaKAx * h));
-      p = info->GetKValueA(&paraA, h);
-      if (p) return p;
-      h = ceilf(paraB.KtablV + (paraB.deltaKAx * h));
-      return info->GetKValueB(&paraB, h);
-    }
-    else {
-      if (h < info->pWinInfo[v].WinHStart || h >= info->pWinInfo[v].WinHEnd) {
-        h = (paraA.KtablV + (paraA.deltaKAx * h));
-        p = info->GetKValueA(&paraA, h);
-        if (p) return p;
-        h = ceilf(paraB.KtablV + (paraB.deltaKAx * h));
-        return info->GetKValueB(&paraB, h);
-      }
-      else {
-        h = (paraB.KtablV + (paraB.deltaKAx * h));
-        p = info->GetKValueB(&paraB, h);
-        if (p) return p;
-        h = ceilf(paraA.KtablV + (paraA.deltaKAx * h));
-        return info->GetKValueA(&paraA, h);
-      }
-    }
-  }
-  else {
-    if (info->pWinInfo[v].WinShowLine == 0) {
-      h = ceilf(paraB.KtablV + (paraB.deltaKAx * h));
-      p = info->GetKValueB(&paraB, h);
-      if (p) return p;
-      h = ceilf(paraA.KtablV + (paraA.deltaKAx * h));
-      return info->GetKValueA(&paraA, h);
-    }
-    else {
-      if (h < info->pWinInfo[v].WinHStart || h >= info->pWinInfo[v].WinHEnd) {
-        h = ceilf(paraB.KtablV + (paraB.deltaKAx * h));
-        p = info->GetKValueB(&paraB, h);
-        if (p) return p;
-        h = ceilf(paraA.KtablV + (paraA.deltaKAx * h));
-        return info->GetKValueA(&paraA, h);
-      }
-      else {
-        h = ceilf(paraA.KtablV + (paraA.deltaKAx * h));
-        p = info->GetKValueA(&paraA, h);
-        if (p) return p;
-        h = ceilf(paraB.KtablV + (paraB.deltaKAx * h));
-        return info->GetKValueB(&paraB, h);
-      }
-    }
-  }
-  return NULL;
+  return Vdp2RotationMode03K(info, h, v, &paraA, &paraB);
 }
 
 void VIDOGLSetFilterMode(int type) {

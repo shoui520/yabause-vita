@@ -253,6 +253,7 @@ void FASTCALL Vdp2RamWriteWord(u32 addr, u16 val) {
 #endif
 }
 
+
 //////////////////////////////////////////////////////////////////////////////
 
 void FASTCALL Vdp2RamWriteLong(u32 addr, u32 val) {

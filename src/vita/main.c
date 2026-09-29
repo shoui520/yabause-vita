@@ -158,6 +158,13 @@ static int audio_verify;
 static unsigned audio_packets;
 static uint64_t audio_hash;
 static uint64_t present_us;
+#ifdef VITA_ROTATION_ROUTE
+#include "rotation_route.h"
+volatile int vita_rotation_cpu;
+volatile unsigned vita_rotation_eligible;
+static volatile uint32_t route_wait_us; /* render thread adds, frontend takes */
+static VitaRotationRoute rotation_route;
+#endif
 static uint64_t copy_us;
 static VitaPresentMap present_map;
 static PerPad_struct *pad;
@@ -250,6 +257,9 @@ void YuiSwapBuffers(void) {
   vglSwapBuffers(GL_FALSE);
 #ifdef VITA_DIAG_GPU_STAGES
   { extern void YglVitaGpuStage(int); YglVitaGpuStage(5); }
+#endif
+#ifdef VITA_ROTATION_ROUTE
+  __atomic_add_fetch(&route_wait_us, (uint32_t)(sceKernelGetProcessTimeWide() - start), __ATOMIC_RELAXED);
 #endif
   present_us += sceKernelGetProcessTimeWide() - start;
 #else
@@ -454,6 +464,27 @@ static void input(unsigned frame) {
   }
 }
 
+/* Lists the saves in internal backup RAM: 64-byte blocks of the odd bytes;
+ * a save's first block starts 0x80000000, then its 11-byte name. */
+static void VitaLogBackupRam(const char *path) {
+  unsigned saves = 0;
+  if (!BupRam) return;
+  for (u32 block = 2; block < 512; ++block) {
+    const u32 base = block * 128;
+    if (T1ReadByte(BupRam, base + 1) != 0x80 || T1ReadByte(BupRam, base + 3) ||
+        T1ReadByte(BupRam, base + 5) || T1ReadByte(BupRam, base + 7)) continue;
+    char name[12];
+    for (int i = 0; i < 11; ++i) {
+      const u8 c = T1ReadByte(BupRam, base + 9 + 2 * i);
+      name[i] = c >= 0x20 && c < 0x7F ? (char)c : '?';
+    }
+    name[11] = 0;
+    YuiMsg("backup_ram_save block=%u name=%s", (unsigned)block, name);
+    ++saves;
+  }
+  YuiMsg("backup_ram path=%s saves=%u", path, saves);
+}
+
 int main(void) {
   SceAppUtilInitParam ap = {0}; SceAppUtilBootParam bp = {0};
   sceAppUtilInit(&ap, &bp);
@@ -611,6 +642,10 @@ int main(void) {
   YuiMsg("gxm_resource_probe_pass");
 #endif
   if (YabauseInit(&init) != 0) { YuiMsg("init_failed"); goto done; }
+#ifdef VITA_ROTATION_ROUTE
+  VitaRotationRouteInit(&rotation_route);
+#endif
+  VitaLogBackupRam(init.buppath);
 #ifdef YABAUSE_VITAGL
   if (VIDCore->ColorRamWriteWord != YglOnUpdateColorRamWord) {
     YuiMsg("fatal: accelerated renderer palette notification is not connected");
@@ -660,6 +695,21 @@ int main(void) {
     if (exec_result < 0) { YuiMsg("execution_failed"); break; }
     ++frames; ++batch;
     uint64_t now = sceKernelGetProcessTimeWide();
+#ifdef VITA_ROTATION_ROUTE
+    {
+      static uint64_t route_last;
+      const uint32_t wall = route_last ? (uint32_t)(now - route_last) : 0;
+      route_last = now;
+      const int was = rotation_route.cpu;
+      vita_rotation_cpu = VitaRotationRouteFrame(&rotation_route, wall,
+          __atomic_exchange_n(&route_wait_us, 0, __ATOMIC_RELAXED),
+          __atomic_exchange_n(&vita_rotation_eligible, 0, __ATOMIC_RELAXED));
+      if (was != rotation_route.cpu)
+        YuiMsg("rotation_route frame=%u cpu=%d probing=%d base_period_us=%u holdoff=%u switches=%u",
+               frames, rotation_route.cpu, rotation_route.probing, rotation_route.base_period,
+               rotation_route.holdoff, rotation_route.switches);
+    }
+#endif
     if (benchmark_frames && frames == benchmark_start_frame)
       benchmark_start = now;
     if (benchmark_frames && frames == benchmark_frames) {
