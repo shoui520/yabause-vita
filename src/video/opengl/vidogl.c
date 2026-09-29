@@ -571,8 +571,15 @@ static u32 FASTCALL Vdp1ReadPolygonColor(vdp1cmd_struct *cmd)
 #include "vdp2_bitmap_decode.h"
 #include <arm_neon.h>
 #include "vdp1_sprite_decode.h"
+#ifdef VITA_VDP1_SPRITE_REUSE
+#include "vdp1_sprite_reuse.h"
+#endif
 #include "../../vita/telemetry.h"
 #include "../../vita/diag_timers.h"
+#ifdef VITA_VDP2_BITMAP_REUSE_VERIFY
+unsigned vita_bitmap_verify[2];
+#endif
+static void FASTCALL Vdp1ReadTextureInner(vdp1cmd_struct *cmd, YglSprite *sprite, YglTexture *texture);
 #ifdef VITA_STACK_PROFILE
 static unsigned vt_rt_hit, vt_rt_miss, vt_rt_why[5]; static uint64_t vt_rt_us, vt_rt_texels;
 extern unsigned vita_atlas_frame, vita_atlas_prev_frame;
@@ -2440,36 +2447,6 @@ static void FASTCALL Vdp2DrawBitmapInner(vdp2draw_struct *info, YglTexture *text
         info->char_bank[info->charaddr >> 17], fixVdp2Regs->CCCTL); }
 #endif
 
-#if defined(VITA_VDP2_FAST_CELL) && defined(VITA_VDP2_FAST_BITMAP)
-  /* Same per-line output as the switch below for 4/8 bpp when only the dot
-   * varies per pixel (vdp2_cell_decode.h, bit-identical to Vdp2GetPixel4/8bpp;
-   * same 512 KiB address mask). Access-denied lines stay transparent. */
-  if ((info->colornumber == 0 || info->colornumber == 1) && info->specialprimode != 2) {
-    uint32_t alpha;
-    if (Vdp2CellConstantAlpha((fixVdp2Regs->CCCTL >> 8) & 1, info->specialcolormode,
-                              info->specialcolorfunction, (uint32_t)info->alpha, &alpha)) {
-      const uint32_t co = (uint32_t)info->coloroffset, pal = (uint32_t)(info->paladdr << 4);
-      const uint32_t abits = alpha << 24;
-      const int transparent = info->transparencyenable != 0;
-      /* Whole words, as the per-word loops below (j += 4 / j += 2). */
-      const unsigned words = info->colornumber == 0 ? (info->cellw + 3) / 4 : (info->cellw + 1) / 2;
-      const unsigned pixels = info->colornumber == 0 ? words * 4 : words * 2;
-      for (i = 0; i < info->cellh; i++) {
-        if (info->char_bank[info->charaddr >> 17] == 0) {
-          memset(texture->textdata, 0, pixels * sizeof(*texture->textdata));
-          texture->textdata += pixels;
-        } else {
-          texture->textdata = info->colornumber == 0 ?
-            Vdp2DecodeWords4(Vdp2Ram, info->charaddr, words, texture->textdata, co, pal, abits, transparent) :
-            Vdp2DecodeWords8(Vdp2Ram, info->charaddr, words, texture->textdata, co, pal, abits, transparent);
-        }
-        info->charaddr += 2 * words;
-        texture->textdata += texture->w;
-      }
-      return;
-    }
-  }
-#endif
   switch (info->colornumber)
   {
   case 0: // 4 BPP
@@ -3210,8 +3187,33 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
   const unsigned cell_pitch = texture->w + tile.cellw; /* YglTMAllocate: w = width - cellw */
   YglProgram *cell_program = ygl_last_offset_program;
   const int cell_prg = ygl_last_offset_prg;
+  /* The atlas may be video memory, slow for CPU reads: for the fast 4/8bpp
+   * decode, decide from the source whether every texel has alpha 0. */
+  int cell_clear = -1;
+  {
+    uint32_t clear_alpha;
+    const unsigned clear_cell_bytes = info->colornumber == 0 ? 32u : 64u;
+    const unsigned clear_cells = (unsigned)(info->patternwh * info->patternwh);
+    if ((info->patternwh == 1 || info->patternwh == 2) && (info->colornumber == 0 || info->colornumber == 1) &&
+        info->specialprimode != 2 && info->cellw == 8 && info->cellh == 8 &&
+        (uint32_t)info->charaddr + clear_cells * clear_cell_bytes <= 0x80000 &&
+        Vdp2CellConstantAlpha((fixVdp2Regs->CCCTL >> 8) & 1, info->specialcolormode,
+                              info->specialcolorfunction, (uint32_t)info->alpha, &clear_alpha))
+      cell_clear = Vdp2CellsTransparent(Vdp2Ram, (uint32_t)info->charaddr, clear_cells, clear_cell_bytes,
+                                        info->char_bank, clear_alpha << 24, info->transparencyenable != 0);
+  }
+#ifndef VITA_VDP2_CELL_REUSE_VERIFY
+  /* Every texel alpha 0: the quad is dropped below and its texels are never
+   * sampled, so they need not be written. */
+  const int cell_skip = cell_clear == 1;
+#else
+  const int cell_skip = 0;   /* decode anyway, for the checks below */
+#endif
+#else
+  const int cell_skip = 0;
 #endif
 
+  if (!cell_skip)
   switch (info->patternwh)
   {
   case 1:
@@ -3238,8 +3240,19 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
       cell_prg == PG_VDP2_NORMAL_CRAM_SPECIAL_PRIORITY || cell_prg == PG_VDP2_ADDCOLOR_CRAM ||
       cell_prg == PG_LINECOLOR_INSERT || cell_prg == PG_LINECOLOR_INSERT_CRAM)) {
     unsigned int alpha = 0;
-    for (int row = 0; row < tile.cellh && !alpha; ++row)
-      for (int col = 0; col < tile.cellw; ++col) alpha |= cell_texels[row * cell_pitch + col] & 0xFF000000u;
+    if (cell_clear >= 0) {
+      alpha = !cell_clear;
+#ifdef VITA_VDP2_CELL_REUSE_VERIFY
+      { static unsigned checked, wrong; unsigned scan = 0;
+        for (int row = 0; row < tile.cellh && !scan; ++row)
+          for (int col = 0; col < tile.cellw; ++col) scan |= cell_texels[row * cell_pitch + col] & 0xFF000000u;
+        wrong += !scan != !alpha;
+        if ((++checked & 8191) == 0) YuiMsg("cell_clear_check checked=%u wrong=%u", checked, wrong); }
+#endif
+    } else {
+      for (int row = 0; row < tile.cellh && !alpha; ++row)
+        for (int col = 0; col < tile.cellw; ++col) alpha |= cell_texels[row * cell_pitch + col] & 0xFF000000u;
+    }
     if (!alpha) {
       if (cell_program->currentQuad < 12) abort();
       cell_program->currentQuad -= 12;
