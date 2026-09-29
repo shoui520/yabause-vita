@@ -37,6 +37,7 @@ extern "C" {
 }
 
 #include "DynarecSh2.h"
+#include "spin_step.h"
 #include "a9_register_region.h"
 #include "a9_ram_load.h"
 #include "cached_dispatch.h"
@@ -111,7 +112,13 @@ u32 g_prof_dispatch[9]; // native returns by first failing sh2_dispatch check; [
 u32 g_prof_spec[4];     // stack spec: high-RAM compiles scanned, plans active, planned accesses, bails
 #endif
 extern "C" void YuiMsg(const char *, ...);
+#ifdef VITA_SH2_SPIN_VERIFY
+u32 g_spin_verify[2]; // predictions matched / mismatched at slice end
+#endif
 extern "C" void VitaSh2ReportExecution() {
+#ifdef VITA_SH2_SPIN_VERIFY
+  YuiMsg("jit_spin_verify match=%u mismatch=%u", g_spin_verify[0], g_spin_verify[1]);
+#endif
   if (VitaTelemetrySamplingEnabled()) {
     const auto sorted = hot_samples.Ranked();
     YuiMsg("jit_hot_summary samples=%llu dropped=%llu policy=periodic_1024 cpu_busy=unmeasured",
