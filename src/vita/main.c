@@ -396,7 +396,11 @@ static void audio_submit(const int16_t *samples) {
     if(++audio_packets%128==0)
       YuiMsg("audio_pcm_prefix packets=%u hash=%016llx timing_sample_invalid=1",audio_packets,(unsigned long long)audio_hash);
   }
-#ifdef VITA_ASYNC_AUDIO_OUTPUT
+#if defined(VITA_DIAG_AUDIO_UNPACED)
+  /* Diagnostic throughput builds only: generated samples are hashed above but
+   * not played, so blocking playback (the real-time pacer) is bypassed. */
+  (void)samples;
+#elif defined(VITA_ASYNC_AUDIO_OUTPUT)
   int rc=VitaAudioQueuePush(&audio_queue,samples);
   if(rc<0) { YuiMsg("audio_queue_failed=%08x",rc); abort(); }
 #else
@@ -703,6 +707,11 @@ int main(void) {
 #ifdef VITA_STACK_PROFILE
       { extern void ScspAccessReport(void); ScspAccessReport(); }
       { extern void VitaSh2MemReport(void); VitaSh2MemReport(); }
+#endif
+#ifdef VITA_SCSP_MIX_AFTER_SYNC
+      { extern u32 g_scsp_mix_waits, g_scsp_mix_spins;
+        YuiMsg("scsp_mix_gate waits=%u spins=%u", g_scsp_mix_waits, g_scsp_mix_spins);
+        g_scsp_mix_waits = g_scsp_mix_spins = 0; }
 #endif
       YuiMsg("progress frames=%u elapsed_us=%llu fps=%.3f presentation_us=%llu copy_us=%llu master_pc=%08x slave_pc=%08x",
         frames, now-start, batch * 1000000.0/(now-last), present_us, copy_us,

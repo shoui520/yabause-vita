@@ -160,6 +160,10 @@ pthread_mutex_t sync_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 int use_new_scsp = 0;
+#ifdef VITA_SCSP_OUTPUT_AFTER_SYNC
+static int scsp_defer_output;
+static void ScspFlushOutput(void);
+#endif
 int new_scsp_outbuf_pos = 0;
 s32 new_scsp_outbuf_l[900] = { 0 };
 s32 new_scsp_outbuf_r[900] = { 0 };
@@ -1832,6 +1836,26 @@ static int scsp_volume = 100;
 #include <stdatomic.h>
 #include "../vita/sound_budget_api.h"
 static _Atomic int thread_running = 0;
+#ifdef VITA_SCSP_MIX_AFTER_SYNC
+/* The CPU-paced worker mixes a frame after releasing the SH-2s. The legacy
+ * mix (scsp_update, scsp_update_monitor) reads sound RAM and the CDDA ring and
+ * updates slot/monitor state; it never writes sound RAM. Every emulation-side
+ * entry point that could write what it reads or observe what it writes
+ * (SCSP registers, sound RAM writes, CDDA delivery, 68000 start/stop/reset,
+ * volume, state save/load) first waits for the mix; sound RAM reads need not.
+ * The 68000 never runs during a mix, so the shared register handlers need no
+ * thread test. Release/acquire on the flag publishes the mix's results. */
+static _Atomic int scsp_mix_busy;
+u32 g_scsp_mix_waits, g_scsp_mix_spins;
+static void ScspWaitMix(void) {
+  if (!atomic_load_explicit(&scsp_mix_busy, memory_order_acquire)) return;
+  ++g_scsp_mix_waits;
+  while (atomic_load_explicit(&scsp_mix_busy, memory_order_acquire)) { ++g_scsp_mix_spins; __asm__ volatile("yield"); }
+}
+#define SCSP_MIX_GATE() ScspWaitMix()
+#else
+#define SCSP_MIX_GATE() ((void)0)
+#endif
 int ScspHasAsyncWorker(void) {
   return atomic_load_explicit(&thread_running, memory_order_acquire) != 0;
 }
@@ -3869,6 +3893,181 @@ static void (*scsp_slot_update_p[2][2][2][2][2])(slot_t *slot) =
   }
 };
 
+#ifdef VITA_SCSP_FAST_MIX
+extern void YuiMsg(const char *, ...);
+/* The scsp_slot_update_* functions above, with each slot's per-sample state
+ * held in locals instead of being reloaded and stored around every mix-buffer
+ * store (s32 stores may alias slot fields and the file-scope position).
+ * Same expressions, types and order per sample: GET_OUT, GET_ENV(_LFO), OUT,
+ * UPDATE_PHASE(_LFO), UPDATE_ENV, UPDATE_LFO. State is written back before
+ * every envelope transition call (which may change ecnt/einc/ecmp/ecurp/enxt,
+ * then reloaded) and on every exit, including the key-off return. */
+static inline __attribute__((always_inline)) void
+scsp_fast_slot (slot_t *slot, const int fm, const int em, const int b16, const int L, const int R)
+{
+   u32 pos = scsp_buf_pos;
+   const u32 len = scsp_buf_len;
+   s32 *const bl = scsp_bufL, *const br = scsp_bufR;
+   u32 fcnt = slot->fcnt;
+   const u32 finc = slot->finc, lea = slot->lea, lsa = slot->lsa;
+   const u8 lpctl = slot->lpctl;
+   s32 ecnt = slot->ecnt, ecmp = slot->ecmp, env = slot->env;
+   s32 *einc = slot->einc;
+   const s32 tl = slot->tl;
+   const u8 disll = slot->disll, dislr = slot->dislr;
+   u32 lfocnt = slot->lfocnt;
+   const s32 lfoinc = slot->lfoinc;
+   const s32 *const lfofmw = slot->lfofmw, *const lfoemw = slot->lfoemw;
+   const u8 lfofms = slot->lfofms, lfoems = slot->lfoems, fsft = slot->fsft;
+   const s16 *const buf16 = slot->buf16;
+   const s8 *const buf8 = slot->buf8;
+#define SCSP_FAST_SAVE() do { slot->fcnt = fcnt; slot->ecnt = ecnt; slot->env = env; \
+                              slot->lfocnt = lfocnt; scsp_buf_pos = pos; } while (0)
+   for (; pos < len; pos++)
+   {
+      s32 out = 0;
+      if (L || R)
+      {
+#ifdef WORDS_BIGENDIAN
+         out = b16 ? (s32) buf16[fcnt >> SCSP_FREQ_LB] : (s32) buf8[fcnt >> SCSP_FREQ_LB];
+#else
+         out = b16 ? (s32) buf16[fcnt >> SCSP_FREQ_LB] : (s32) buf8[(fcnt >> SCSP_FREQ_LB) ^ 1];
+#endif
+      }
+      if (em)
+         env = (scsp_env_table[ecnt >> SCSP_ENV_LB] * tl / 1024) -
+               (lfoemw[(lfocnt >> SCSP_LFO_LB) & SCSP_LFO_MASK] >> lfoems);
+      else
+         env = scsp_env_table[ecnt >> SCSP_ENV_LB] * tl / 1024;
+      if ((L || R) && (out) && (env > 0))
+      {
+         out *= env;
+         if (L) bl[pos] += out >> (b16 ? disll : disll - 8);
+         if (R) br[pos] += out >> (b16 ? dislr : dislr - 8);
+      }
+      if (fm)
+         fcnt += ((lfofmw[(lfocnt >> SCSP_LFO_LB) & SCSP_LFO_MASK] << (lfofms-7)) >> (fsft+1));
+      if ((fcnt += finc) > lea)
+      {
+         if (lpctl) fcnt = lsa;
+         else { ecnt = SCSP_ENV_DE; SCSP_FAST_SAVE(); return; }
+      }
+      if (einc) ecnt += *einc;
+      if (ecnt >= ecmp)
+      {
+         SCSP_FAST_SAVE();
+         slot->enxt(slot);
+         ecnt = slot->ecnt; einc = slot->einc; ecmp = slot->ecmp;
+         if (ecnt >= SCSP_ENV_DE) return;
+      }
+      if (fm || em) lfocnt += lfoinc;
+   }
+   SCSP_FAST_SAVE();
+#undef SCSP_FAST_SAVE
+}
+#define SCSP_FAST_FN(name, fm, em, b16, l, r) \
+   static void name (slot_t *slot) { scsp_fast_slot(slot, fm, em, b16, l, r); }
+SCSP_FAST_FN(scsp_fast_null, 0, 0, 1, 0, 0)
+SCSP_FAST_FN(scsp_fast_8B_L, 0, 0, 0, 1, 0)       SCSP_FAST_FN(scsp_fast_8B_R, 0, 0, 0, 0, 1)
+SCSP_FAST_FN(scsp_fast_8B_LR, 0, 0, 0, 1, 1)      SCSP_FAST_FN(scsp_fast_16B_L, 0, 0, 1, 1, 0)
+SCSP_FAST_FN(scsp_fast_16B_R, 0, 0, 1, 0, 1)      SCSP_FAST_FN(scsp_fast_16B_LR, 0, 0, 1, 1, 1)
+SCSP_FAST_FN(scsp_fast_E_8B_L, 0, 1, 0, 1, 0)     SCSP_FAST_FN(scsp_fast_E_8B_R, 0, 1, 0, 0, 1)
+SCSP_FAST_FN(scsp_fast_E_8B_LR, 0, 1, 0, 1, 1)    SCSP_FAST_FN(scsp_fast_E_16B_L, 0, 1, 1, 1, 0)
+SCSP_FAST_FN(scsp_fast_E_16B_R, 0, 1, 1, 0, 1)    SCSP_FAST_FN(scsp_fast_E_16B_LR, 0, 1, 1, 1, 1)
+SCSP_FAST_FN(scsp_fast_F_8B_L, 1, 0, 0, 1, 0)     SCSP_FAST_FN(scsp_fast_F_8B_R, 1, 0, 0, 0, 1)
+SCSP_FAST_FN(scsp_fast_F_8B_LR, 1, 0, 0, 1, 1)    SCSP_FAST_FN(scsp_fast_F_16B_L, 1, 0, 1, 1, 0)
+SCSP_FAST_FN(scsp_fast_F_16B_R, 1, 0, 1, 0, 1)    SCSP_FAST_FN(scsp_fast_F_16B_LR, 1, 0, 1, 1, 1)
+SCSP_FAST_FN(scsp_fast_F_E_8B_L, 1, 1, 0, 1, 0)   SCSP_FAST_FN(scsp_fast_F_E_8B_R, 1, 1, 0, 0, 1)
+SCSP_FAST_FN(scsp_fast_F_E_8B_LR, 1, 1, 0, 1, 1)  SCSP_FAST_FN(scsp_fast_F_E_16B_L, 1, 1, 1, 1, 0)
+SCSP_FAST_FN(scsp_fast_F_E_16B_R, 1, 1, 1, 0, 1)  SCSP_FAST_FN(scsp_fast_F_E_16B_LR, 1, 1, 1, 1, 1)
+#undef SCSP_FAST_FN
+/* Same shape as scsp_slot_update_p: [FMS][EMS][16 bits][left][right]; the
+ * no-output entries are the null update (no LFO step), exactly as there. */
+static void (*scsp_fast_update_p[2][2][2][2][2])(slot_t *slot) = {
+  { { { { scsp_fast_null, scsp_fast_8B_R }, { scsp_fast_8B_L, scsp_fast_8B_LR } },
+      { { scsp_fast_null, scsp_fast_16B_R }, { scsp_fast_16B_L, scsp_fast_16B_LR } } },
+    { { { scsp_fast_null, scsp_fast_E_8B_R }, { scsp_fast_E_8B_L, scsp_fast_E_8B_LR } },
+      { { scsp_fast_null, scsp_fast_E_16B_R }, { scsp_fast_E_16B_L, scsp_fast_E_16B_LR } } } },
+  { { { { scsp_fast_null, scsp_fast_F_8B_R }, { scsp_fast_F_8B_L, scsp_fast_F_8B_LR } },
+      { { scsp_fast_null, scsp_fast_F_16B_R }, { scsp_fast_F_16B_L, scsp_fast_F_16B_LR } } },
+    { { { scsp_fast_null, scsp_fast_F_E_8B_R }, { scsp_fast_F_E_8B_L, scsp_fast_F_E_8B_LR } },
+      { { scsp_fast_null, scsp_fast_F_E_16B_R }, { scsp_fast_F_E_16B_L, scsp_fast_F_E_16B_LR } } } }
+};
+
+/* Startup differential check of every table entry against the original on
+ * randomized slot states (loop and key-off ends, every envelope phase and
+ * its transitions, LFO tables, all levels). Aborts on the first mismatch. */
+static void ScspFastMixSelfTest (void)
+{
+   static s16 ram16[0x4000];
+   static s32 mix[4][SCSP_LFO_LEN > 1024 ? SCSP_LFO_LEN : 1024];
+   const s32 *lfo_f[4] = {scsp_lfo_sawt_f, scsp_lfo_squa_f, scsp_lfo_tri_f, scsp_lfo_noi_f};
+   const s32 *lfo_e[4] = {scsp_lfo_sawt_e, scsp_lfo_squa_e, scsp_lfo_tri_e, scsp_lfo_noi_e};
+   void (*phases[4])(slot_t *) = {scsp_attack_next, scsp_decay_next, scsp_sustain_next, scsp_release_next};
+   u32 seed = 0x5C5Fu, cases = 0;
+#define SCSP_RND() (seed = seed * 1664525u + 1013904223u, seed >> 8)
+   for (unsigned i = 0; i < 0x4000; ++i) ram16[i] = (s16)SCSP_RND();
+   for (unsigned n = 0; n < 4096; ++n)
+   {
+      slot_t a;
+      memset(&a, 0, sizeof(a));
+      const unsigned fm = SCSP_RND() & 1, em = SCSP_RND() & 1, b16 = SCSP_RND() & 1;
+      a.pcm8b = !b16;
+      a.buf16 = ram16 + (SCSP_RND() & 0xFF);
+      a.buf8 = (s8 *)ram16 + (SCSP_RND() & 0x1FF);
+      a.fcnt = (SCSP_RND() % 0x2000) << SCSP_FREQ_LB;
+      a.finc = SCSP_RND() % (3 << SCSP_FREQ_LB);
+      a.lsa = (64 + SCSP_RND() % 0x1000) << SCSP_FREQ_LB; /* FM steps stay >= 0 */
+      a.lea = a.lsa + ((SCSP_RND() % 0x2000) << SCSP_FREQ_LB);
+      a.lpctl = SCSP_RND() & 1;
+      a.tl = SCSP_RND() % 1024;
+      a.disll = SCSP_RND() & 1 ? 31 : 8 + SCSP_RND() % 23;
+      a.dislr = SCSP_RND() & 1 ? 31 : 8 + SCSP_RND() % 23;
+      a.einca = SCSP_RND() % 0x40000; a.eincd = SCSP_RND() % 0x4000;
+      a.eincs = SCSP_RND() % 0x4000; a.eincr = SCSP_RND() % 0x40000;
+      a.sl = SCSP_ENV_DS + (SCSP_RND() % (SCSP_ENV_DE - SCSP_ENV_DS));
+      switch (SCSP_RND() & 3) {
+      case 0: a.ecnt = SCSP_RND() % SCSP_ENV_DS; a.einc = &a.einca; a.ecmp = SCSP_ENV_DS; break;
+      case 1: a.ecnt = SCSP_ENV_DS + SCSP_RND() % (a.sl - SCSP_ENV_DS + 1); a.einc = &a.eincd; a.ecmp = a.sl; break;
+      case 2: a.ecnt = a.sl + SCSP_RND() % (SCSP_ENV_DE - a.sl); a.einc = &a.eincs; a.ecmp = SCSP_ENV_DE; break;
+      default: a.ecnt = SCSP_ENV_DS + SCSP_RND() % (SCSP_ENV_DE - SCSP_ENV_DS); a.einc = SCSP_RND() & 1 ? &a.eincr : NULL; a.ecmp = SCSP_ENV_DE; break;
+      }
+      a.enxt = phases[SCSP_RND() & 3];
+      a.lfocnt = SCSP_RND(); a.lfoinc = SCSP_RND() % 0x10000;
+      a.lfofmw = (s32 *)lfo_f[SCSP_RND() & 3]; a.lfoemw = (s32 *)lfo_e[SCSP_RND() & 3];
+      a.lfofms = fm ? 7 + (SCSP_RND() & 7) : 31;
+      a.lfoems = em ? 4 + (SCSP_RND() & 7) : 31;
+      a.fsft = SCSP_RND() & 15;
+      /* Keep sample reads inside ram16 (as keyon clamps lea to sound RAM). */
+      if ((a.lea >> SCSP_FREQ_LB) + 4 * (a.finc >> SCSP_FREQ_LB) + 1024 > 0x3E00) a.lea = 0x3000u << SCSP_FREQ_LB;
+      if (a.fcnt > a.lea) a.fcnt = a.lea;
+      if (a.fcnt < a.lsa) a.fcnt = a.lsa;
+      if (fm) a.lpctl = 1, a.finc &= 0x3FF; /* FM may step backwards: keep indices non-negative */
+      slot_t b = a;
+      if (a.einc) b.einc = (s32 *)((u8 *)&b + ((u8 *)a.einc - (u8 *)&a));
+      const u32 len = 1 + SCSP_RND() % 1024;
+      const u32 start = SCSP_RND() % 4 ? 0 : SCSP_RND() % len;
+      for (unsigned i = 0; i < 1024; ++i) mix[0][i] = mix[2][i] = (s32)SCSP_RND(), mix[1][i] = mix[3][i] = (s32)SCSP_RND();
+      const int il = a.disll != 31, ir = a.dislr != 31;
+      scsp_bufL = mix[0]; scsp_bufR = mix[1]; scsp_buf_len = len; scsp_buf_pos = start;
+      scsp_slot_update_p[fm][em][b16][il][ir](&a);
+      const u32 pos_a = scsp_buf_pos;
+      scsp_bufL = mix[2]; scsp_bufR = mix[3]; scsp_buf_len = len; scsp_buf_pos = start;
+      scsp_fast_update_p[fm][em][b16][il][ir](&b);
+      if (b.einc) b.einc = (s32 *)((u8 *)&a + ((u8 *)b.einc - (u8 *)&b));
+      if (memcmp(&a, &b, sizeof(a)) || pos_a != scsp_buf_pos ||
+          memcmp(mix[0], mix[2], sizeof(mix[0])) || memcmp(mix[1], mix[3], sizeof(mix[1])))
+      {
+         YuiMsg("scsp_fast_mix_test_failed case=%u fm=%u em=%u b16=%u l=%d r=%d", n, fm, em, b16, il, ir);
+         abort();
+      }
+      ++cases;
+   }
+#undef SCSP_RND
+   YuiMsg("scsp_fast_mix_test_pass cases=%u", cases);
+}
+#endif
+
 void
 scsp_update (s32 *bufL, s32 *bufR, u32 len)
 {
@@ -3917,7 +4116,12 @@ scsp_update (s32 *bufL, s32 *bufR, u32 len)
 
       // SCSPLOG("update : VL=%d  VR=%d CNT=%.8X STEP=%.8X\n", slot->disll, slot->dislr, slot->fcnt, slot->finc);
 
-      scsp_slot_update_p[(slot->lfofms == 31) ? 0 : 1]
+#ifdef VITA_SCSP_FAST_MIX
+      scsp_fast_update_p
+#else
+      scsp_slot_update_p
+#endif
+         [(slot->lfofms == 31) ? 0 : 1]
          [(slot->lfoems == 31) ? 0 : 1]
       [(slot->pcm8b == 0) ? 1 : 0]
       [(slot->disll == 31) ? 0 : 1]
@@ -4194,6 +4398,8 @@ void ScspAccessReport(void) {
 void FASTCALL
 scsp_w_b (u32 a, u8 d)
 {
+  SCSP_MIX_GATE();
+  SCSP_MAIN_ACCESS(3);
   a &= 0xFFF;
 
   if (a < 0x400)
@@ -4303,6 +4509,8 @@ scsp_w_b (u32 a, u8 d)
 void FASTCALL
 scsp_w_w (u32 a, u16 d)
 {
+  SCSP_MIX_GATE();
+  SCSP_MAIN_ACCESS(3);
   if (a & 1)
     {
       SCSPLOG ("ERROR: scsp w_w misaligned : %.8X\n", a);
@@ -4387,6 +4595,8 @@ scsp_w_w (u32 a, u16 d)
 void FASTCALL
 scsp_w_d (u32 a, u32 d)
 {
+  SCSP_MIX_GATE();
+  SCSP_MAIN_ACCESS(3);
   if (a & 3)
     {
       SCSPLOG ("ERROR: scsp w_d misaligned : %.8X\n", a);
@@ -4439,6 +4649,8 @@ scsp_w_d (u32 a, u32 d)
 u8 FASTCALL
 scsp_r_b (u32 a)
 {
+  SCSP_MIX_GATE();
+  SCSP_MAIN_ACCESS(2);
   a &= 0xFFF;
 
   if (a < 0x400)
@@ -4477,6 +4689,8 @@ scsp_r_b (u32 a)
 u16 FASTCALL
 scsp_r_w (u32 a)
 {
+  SCSP_MIX_GATE();
+  SCSP_MAIN_ACCESS(2);
   if (a & 1)
     {
       SCSPLOG ("ERROR: scsp r_w misaligned : %.8X\n", a);
@@ -4569,6 +4783,8 @@ scsp_r_w (u32 a)
 u32 FASTCALL
 scsp_r_d (u32 a)
 {
+  SCSP_MIX_GATE();
+  SCSP_MAIN_ACCESS(2);
   if (a & 3)
     {
       SCSPLOG ("ERROR: scsp r_d misaligned : %.8X\n", a);
@@ -4954,6 +5170,8 @@ SoundRamReadByte (u32 addr)
 void FASTCALL
 SoundRamWriteByte (u32 addr, u8 val)
 {
+  SCSP_MIX_GATE();
+  SCSP_MAIN_ACCESS(1);
   addr &= 0xFFFFF;
 
   // If mem4b is set, mirror ram every 256k
@@ -4996,6 +5214,11 @@ void SyncSh2And68k(){
       pthread_mutex_unlock(&sync_mutex);
 #else
       sh2_read_req++;
+#ifdef VITA_SCSP_NO_QUIESCENT_YIELD
+      /* CPU-paced sound runs its whole budget at VBlank while the SH-2s wait:
+       * nothing consumes sh2_read_req, and a yield costs a kernel delay. */
+      if (!ScspCpuSliceIsQuiescent())
+#endif
       YabThreadYield();
 #endif  
       mem_access_counter = 0;
@@ -5030,6 +5253,8 @@ SoundRamReadWord (u32 addr)
 void FASTCALL
 SoundRamWriteWord (u32 addr, u16 val)
 {
+  SCSP_MIX_GATE();
+  SCSP_MAIN_ACCESS(1);
   addr &= 0xFFFFF;
 
   // If mem4b is set, mirror ram every 256k
@@ -5104,6 +5329,8 @@ SoundRamReadLong (u32 addr)
 void FASTCALL
 SoundRamWriteLong (u32 addr, u32 val)
 {
+  SCSP_MIX_GATE();
+  SCSP_MAIN_ACCESS(1);
   addr &= 0xFFFFF;
   //u32 pre_cycle = m68kcycle;
 
@@ -5154,6 +5381,9 @@ ScspInit (int coreid, int scsp_sync_count_per_frame, int scsp_main_mode )
   IsM68KRunning = 0;
 
   scsp_init (SoundRam, &c68k_interrupt_handler, &scu_interrupt_handler);
+#ifdef VITA_SCSP_FAST_MIX
+  ScspFastMixSelfTest();
+#endif
   ScspInternalVars->scsptiming1 = 0;
   ScspInternalVars->scsptiming2 = 0;
 
@@ -5530,6 +5760,7 @@ ScspConvert32uto16s (s32 *srcL, s32 *srcR, s16 *dst, u32 len)
 void
 ScspReceiveCDDA (const u8 *sector)
 {
+  SCSP_MIX_GATE();
    VT_SCOPE(VT_CDDA);
    // If buffer is half empty or less, boost timing for a bit until we've buffered a few sectors
    if (cdda_out_left < (sizeof(cddabuf.data) / 2))
@@ -5892,6 +6123,22 @@ void ScspExec(){
     YabThreadUSleep(100000);
   }
 }
+#ifdef VITA_SCSP_OUTPUT_AFTER_SYNC
+/* Hand already-mixed samples to the host audio core. Touches no emulated
+ * state: only scspsoundoutleft and the output ring the next mix appends to,
+ * both owned by the sound worker that calls this before its next mix. */
+static void ScspFlushOutput(void) {
+  u32 audiosize;
+  while (scspsoundoutleft > 0 && (audiosize = SNDCore->GetAudioSpace()) > 0) {
+    s32 outstart = (s32)scspsoundgenpos - (s32)scspsoundoutleft;
+    if (outstart < 0) outstart += scspsoundbufsize;
+    if (audiosize > scspsoundoutleft) audiosize = scspsoundoutleft;
+    if (audiosize > scspsoundbufsize - outstart) audiosize = scspsoundbufsize - outstart;
+    SNDCore->UpdateAudio(&scspchannel[0].data32[outstart], &scspchannel[1].data32[outstart], audiosize);
+    scspsoundoutleft -= audiosize;
+  }
+}
+#endif
 void ScspExecAsync() {
   VT_SCOPE(VT_SCSP_MIX);
   u32 audiosize;
@@ -5931,6 +6178,10 @@ void ScspExecAsync() {
      scspsoundoutleft += scspsoundlen;
   }
 
+#ifdef VITA_SCSP_OUTPUT_AFTER_SYNC
+  /* Host output only: deferred until the main CPU has been released. */
+  if (!scsp_defer_output)
+#endif
   while (scspsoundoutleft > 0 &&
      (audiosize = SNDCore->GetAudioSpace()) > 0)
   {
@@ -6036,6 +6287,7 @@ M68KSetRegisters (m68kregs_struct *regs)
 void
 ScspMuteAudio (int flags)
 {
+  SCSP_MIX_GATE();
   scsp_mute_flags |= flags;
   if (SNDCore && scsp_mute_flags)
     SNDCore->MuteAudio ();
@@ -6048,6 +6300,7 @@ ScspMuteAudio (int flags)
 void
 ScspUnMuteAudio (int flags)
 {
+  SCSP_MIX_GATE();
   scsp_mute_flags &= ~flags;
   if (SNDCore && (scsp_mute_flags == 0))
     SNDCore->UnMuteAudio ();
@@ -6060,6 +6313,7 @@ ScspUnMuteAudio (int flags)
 void
 ScspSetVolume (int volume)
 {
+  SCSP_MIX_GATE();
   scsp_volume = volume;
   if (SNDCore)
     SNDCore->SetVolume (volume);
