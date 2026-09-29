@@ -567,6 +567,8 @@ static u32 FASTCALL Vdp1ReadPolygonColor(vdp1cmd_struct *cmd)
   return color;
 }
 
+#include "vdp2_cell_decode.h"
+#include "vdp2_bitmap_decode.h"
 #include <arm_neon.h>
 #include "vdp1_sprite_decode.h"
 #include "../../vita/telemetry.h"
@@ -2438,6 +2440,36 @@ static void FASTCALL Vdp2DrawBitmapInner(vdp2draw_struct *info, YglTexture *text
         info->char_bank[info->charaddr >> 17], fixVdp2Regs->CCCTL); }
 #endif
 
+#if defined(VITA_VDP2_FAST_CELL) && defined(VITA_VDP2_FAST_BITMAP)
+  /* Same per-line output as the switch below for 4/8 bpp when only the dot
+   * varies per pixel (vdp2_cell_decode.h, bit-identical to Vdp2GetPixel4/8bpp;
+   * same 512 KiB address mask). Access-denied lines stay transparent. */
+  if ((info->colornumber == 0 || info->colornumber == 1) && info->specialprimode != 2) {
+    uint32_t alpha;
+    if (Vdp2CellConstantAlpha((fixVdp2Regs->CCCTL >> 8) & 1, info->specialcolormode,
+                              info->specialcolorfunction, (uint32_t)info->alpha, &alpha)) {
+      const uint32_t co = (uint32_t)info->coloroffset, pal = (uint32_t)(info->paladdr << 4);
+      const uint32_t abits = alpha << 24;
+      const int transparent = info->transparencyenable != 0;
+      /* Whole words, as the per-word loops below (j += 4 / j += 2). */
+      const unsigned words = info->colornumber == 0 ? (info->cellw + 3) / 4 : (info->cellw + 1) / 2;
+      const unsigned pixels = info->colornumber == 0 ? words * 4 : words * 2;
+      for (i = 0; i < info->cellh; i++) {
+        if (info->char_bank[info->charaddr >> 17] == 0) {
+          memset(texture->textdata, 0, pixels * sizeof(*texture->textdata));
+          texture->textdata += pixels;
+        } else {
+          texture->textdata = info->colornumber == 0 ?
+            Vdp2DecodeWords4(Vdp2Ram, info->charaddr, words, texture->textdata, co, pal, abits, transparent) :
+            Vdp2DecodeWords8(Vdp2Ram, info->charaddr, words, texture->textdata, co, pal, abits, transparent);
+        }
+        info->charaddr += 2 * words;
+        texture->textdata += texture->w;
+      }
+      return;
+    }
+  }
+#endif
   switch (info->colornumber)
   {
   case 0: // 4 BPP
@@ -2523,6 +2555,14 @@ static void FASTCALL Vdp2DrawBitmapInner(vdp2draw_struct *info, YglTexture *text
         }
       }
       else {
+#ifdef VITA_VDP2_FAST_BITMAP
+        /* Row inside VRAM: same texels as Vdp2GetPixel16bppbmp (vdp2_bitmap_decode.h). */
+        if (info->cellw > 0 && info->charaddr + 2u * (u32)info->cellw <= 0x80000u) {
+          texture->textdata = Vdp2DecodeRow16(Vdp2Ram + info->charaddr, (unsigned)info->cellw,
+            texture->textdata, (u32)info->alpha << 24, info->transparencyenable != 0);
+          info->charaddr += 2u * (u32)info->cellw;
+        } else
+#endif
         for (j = 0; j < info->cellw; j++)
         {
           *texture->textdata++ = Vdp2GetPixel16bppbmp(info, info->charaddr);
@@ -2552,6 +2592,14 @@ static void FASTCALL Vdp2DrawBitmapInner(vdp2draw_struct *info, YglTexture *text
         }
       }
 */
+#ifdef VITA_VDP2_FAST_BITMAP
+      /* Row inside VRAM: same texels as Vdp2GetPixel32bppbmp (vdp2_bitmap_decode.h). */
+      if (info->cellw > 0 && info->charaddr + 4u * (u32)info->cellw <= 0x80000u) {
+        texture->textdata = Vdp2DecodeRow32(Vdp2Ram + info->charaddr, (unsigned)info->cellw,
+          texture->textdata, (u32)info->alpha << 24, info->transparencyenable != 0);
+        info->charaddr += 4u * (u32)info->cellw;
+      } else
+#endif
       for (j = 0; j < info->cellw; j++)
       {
         *texture->textdata++ = Vdp2GetPixel32bppbmp(info, info->charaddr);
@@ -2591,6 +2639,63 @@ static void FASTCALL Vdp2DrawCell(vdp2draw_struct *info, YglTexture *texture)
         counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7]);
       memset(counts, 0, sizeof(counts)); total = 0;
     }
+  }
+#endif
+#ifdef VITA_VDP2_FAST_CELL
+  /* Common case: only the dot varies per pixel. Hoist the per-cell constants
+   * (vdp2_cell_decode.h); results are bit-identical to Vdp2GetPixel4/8bpp. */
+  if ((info->colornumber == 0 || info->colornumber == 1) && info->specialprimode != 2) {
+    uint32_t alpha;
+    if (Vdp2CellConstantAlpha((fixVdp2Regs->CCCTL >> 8) & 1, info->specialcolormode,
+                              info->specialcolorfunction, (uint32_t)info->alpha, &alpha)) {
+      const uint32_t co = (uint32_t)info->coloroffset, pal = (uint32_t)(info->paladdr << 4);
+      const uint32_t abits = alpha << 24;
+      const int transparent = info->transparencyenable != 0;
+      const unsigned words = info->colornumber == 0 ? info->cellw / 4 : info->cellw / 2;
+      for (i = 0; i < info->cellh; i++) {
+        texture->textdata = info->colornumber == 0 ?
+          Vdp2DecodeWords4(Vdp2Ram, info->charaddr, words, texture->textdata, co, pal, abits, transparent) :
+          Vdp2DecodeWords8(Vdp2Ram, info->charaddr, words, texture->textdata, co, pal, abits, transparent);
+        info->charaddr += 2 * words;
+        texture->textdata += texture->w;
+      }
+      return;
+    }
+#ifdef VITA_VDP2_FAST_CELL_MSB
+    if (info->specialcolormode == 3) {
+      /* Vdp2GetAlpha, mode 3: the dot's colour RAM MSB selects the alpha. */
+      const int ccmd = (fixVdp2Regs->CCCTL >> 8) & 1;
+      const uint32_t alpha_msb = ccmd ? 0xFFu << 24 : (uint32_t)info->alpha << 24;
+      const uint32_t alpha_clear = (ccmd ? 0x40u : 0xFFu) << 24;
+      const int cram_shift = Vdp2Internal.ColorMode <= 1 ? 1 : Vdp2Internal.ColorMode == 2 ? 2 : -1;
+      const uint32_t co = (uint32_t)info->coloroffset, pal = (uint32_t)(info->paladdr << 4);
+      const int transparent = info->transparencyenable != 0;
+      const unsigned words = info->colornumber == 0 ? info->cellw / 4 : info->cellw / 2;
+      for (i = 0; i < info->cellh; i++) {
+        texture->textdata = info->colornumber == 0 ?
+          Vdp2DecodeWords4Msb(Vdp2Ram, info->charaddr, words, texture->textdata, co, pal, transparent,
+                              Vdp2ColorRam, cram_shift, alpha_msb, alpha_clear) :
+          Vdp2DecodeWords8Msb(Vdp2Ram, info->charaddr, words, texture->textdata, co, pal, transparent,
+                              Vdp2ColorRam, cram_shift, alpha_msb, alpha_clear);
+#ifdef VITA_VDP2_FAST_CELL_MSB_VERIFY
+        { /* The original per-dot decode of the same row into scratch. */
+          u32 ref[16]; YglTexture scratch = *texture; scratch.textdata = ref;
+          const unsigned n = words * (info->colornumber == 0 ? 4 : 2);
+          for (unsigned k = 0; k < words; ++k) {
+            if (info->colornumber == 0) Vdp2GetPixel4bpp(info, info->charaddr + 2 * k, &scratch);
+            else Vdp2GetPixel8bpp(info, info->charaddr + 2 * k, &scratch);
+          }
+          static unsigned verify[2];
+          ++verify[n <= 16 && memcmp(ref, texture->textdata - n, n * 4) != 0];
+          if (((verify[0] + verify[1]) & 16383) == 0)
+            YuiMsg("vdp2_cell_msb_verify match=%u mismatch=%u", verify[0], verify[1]); }
+#endif
+        info->charaddr += 2 * words;
+        texture->textdata += texture->w;
+      }
+      return;
+    }
+#endif
   }
 #endif
   switch (info->colornumber)
@@ -2751,6 +2856,13 @@ static void FASTCALL Vdp2DrawBitmapLineScroll(vdp2draw_struct *info, YglTexture 
         }
       }
       else {
+#ifdef VITA_VDP2_FAST_BITMAP
+        /* Line inside VRAM: same texels as Vdp2GetPixel16bppbmp (vdp2_bitmap_decode.h). */
+        if (vdp2width > 0 && baseaddr + 2u * (u32)vdp2width <= 0x80000u)
+          texture->textdata = Vdp2DecodeRow16(Vdp2Ram + baseaddr, (unsigned)vdp2width,
+            texture->textdata, (u32)info->alpha << 24, info->transparencyenable != 0);
+        else
+#endif
         for (j = 0; j < vdp2width; j++)
         {
           *texture->textdata++ = Vdp2GetPixel16bppbmp(info, baseaddr);
@@ -2768,6 +2880,13 @@ static void FASTCALL Vdp2DrawBitmapLineScroll(vdp2draw_struct *info, YglTexture 
         }
       }
       else {
+#ifdef VITA_VDP2_FAST_BITMAP
+        /* Line inside VRAM: same texels as Vdp2GetPixel32bppbmp (vdp2_bitmap_decode.h). */
+        if (vdp2width > 0 && baseaddr + 4u * (u32)vdp2width <= 0x80000u)
+          texture->textdata = Vdp2DecodeRow32(Vdp2Ram + baseaddr, (unsigned)vdp2width,
+            texture->textdata, (u32)info->alpha << 24, info->transparencyenable != 0);
+        else
+#endif
         for (j = 0; j < vdp2width; j++)
         {
           //if (info->isverticalscroll){
@@ -3651,9 +3770,205 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
   }
 
 
+  /* No vertical line scroll and no line zoom: every line samples the source
+   * columns ((j * inch) >> 8) + sx of one source row, j being the screen
+   * column. Lines whose source rows share one cell row form a band, whose
+   * pattern lookups are made once per cell column. For 4/8bpp cells without
+   * per-dot special modes (Vdp2PerLineCellRowFast), each band cell holds its
+   * row address at the band's first row and the step per row (both cell
+   * mappings are linear within 8 rows), and each line computes the dots it
+   * samples directly. Otherwise each line decodes the cells its columns span
+   * into a row and gathers from it. Vertical cell scroll is applied below as
+   * one offset for the whole screen, as the per-dot path does, so it only
+   * moves the source rows. */
+  enum { PL_SRC_MAX = 4096, PL_CELLS = PL_SRC_MAX / 8 + 2, PL_BAND_CELLS = 1024 };
+#ifdef VITA_VDP2_PERLINE_VERIFY
+  static int verify_ref;
+  if (!verify_ref)
+#endif
 #ifdef VITA_STACK_PROFILE
   if (vt_pl_mode != 4)
 #endif
+  if (!VDPLINE_SY(info->islinescroll) && !VDPLINE_SZ(info->islinescroll) && incv > 0 &&
+      vdp2height <= 512 && info->draww <= 1024) {
+    float cx = info->coordincx;
+    if (cx < info->maxzoom) cx = info->maxzoom;
+    const int inch0 = 1.0 / cx*256.0;
+    const int draww = info->draww;
+    const int span = inch0 > 0 ? (((draww - 1) * inch0) >> 8) + 1 : 0;
+    if (inch0 > 0 && span + 16 <= PL_SRC_MAX) {
+      int sxl[512];
+      {
+        int li = 0;
+        for (int vv = 0; vv < vdp2height; ++vv) {
+          sxl[vv] = VDPLINE_SX(info->islinescroll) ? info->sh + info->lineinfo[li << res_shift].LineScrollValH : info->sh;
+          if ((vv & linemask) == linemask) li++;
+        }
+      }
+      info->coordincx = cx;
+      int hmap[1024];
+      for (int j = 0; j < draww; ++j) hmap[j] = (j * inch0) >> 8;
+      const int pitch = draww + texture->w;
+      u32 *const out0 = texture->textdata;
+      typedef struct { u32 a0; int dy, fx; u32 base, a24; } PlCell;
+      typedef struct { u32 charaddr; int paladdr, flip, sf, scf, charx; } PlPattern;
+      static PlCell cells[PL_BAND_CELLS];
+      static PlPattern pats[PL_BAND_CELLS];
+      static u32 srcrow[PL_SRC_MAX + 8];
+      const int cell_fast = Vdp2PerLineCellRowFast(info);
+      const int colornumber = info->colornumber, patternwh = info->patternwh, transp = info->transparencyenable;
+      const int row_bytes = colornumber == 0 ? 4 : 8;
+      int premap = -1;
+      int sv = info->sv;
+      if (info->isverticalscroll) sv += T1ReadLong(Vdp2Ram, info->verticalscrolltbl) >> 16;
+      int prev_tv = 0, prev_sx = 0, have_prev = 0;
+      int band_row = 0, band_cmin = 0, band_ok = 0;
+      for (int vl = 0; vl < vdp2height; ++vl) {
+        const int tv = sv + ((vl * incv) >> 8);
+        const int sx0 = sxl[vl];
+        int my = tv >> planeh_shift;
+        const int dpy = tv - (my << planeh_shift);
+        my &= 0x01;
+        const int chary = dpy & plane_mask & page_mask;
+        if (!have_prev || (tv >> 3) != band_row) {
+          /* A new band: look up the patterns of every cell column its lines
+           * sample. */
+          band_row = tv >> 3;
+          int cmin = sx0 >> 3, cmax = (sx0 + span - 1) >> 3;
+          for (int vv = vl + 1; vv < vdp2height && ((sv + ((vv * incv) >> 8)) >> 3) == band_row; ++vv) {
+            if ((sxl[vv] >> 3) < cmin) cmin = sxl[vv] >> 3;
+            if (((sxl[vv] + span - 1) >> 3) > cmax) cmax = (sxl[vv] + span - 1) >> 3;
+          }
+          band_ok = cmax - cmin < PL_BAND_CELLS;
+          band_cmin = cmin;
+          if (band_ok) {
+            const int ply = (dpy >> plane_shift) & (info->planeh - 1);
+            int pgy = (dpy & plane_mask) >> page_shift;
+            if (pgy < 0) pgy = info->pagewh - 1 + pgy;
+            const int chary0 = chary & ~7;
+            for (int c = cmin; c <= cmax; ++c) {
+              const int pos = c * 8;
+              const int mx0 = pos >> planew_shift;
+              const int dpx = pos - (mx0 << planew_shift);
+              const int mid = info->mapwh * my + (mx0 & 0x01);
+              if (mid != premap) {
+                info->PlaneAddr(info, mid, fixVdp2Regs);
+                premap = mid;
+              }
+              const int plx = (dpx >> plane_shift) & (info->planew - 1);
+              int pgx = (dpx & plane_mask) >> page_shift;
+              if (pgx < 0) pgx = info->pagewh - 1 + pgx;
+              Vdp2PatternAddrPos(info, plx, pgx, ply, pgy);
+              const int charx = dpx & plane_mask & page_mask;
+              PlPattern *pt = &pats[c - cmin];
+              pt->charaddr = info->charaddr;
+              pt->paladdr = info->paladdr;
+              pt->flip = info->flipfunction;
+              pt->sf = info->specialfunction;
+              pt->scf = info->specialcolorfunction;
+              pt->charx = charx;
+              if (cell_fast) {
+                int x0, y0, x1, y1;
+                Vdp2PerLineCellXYF(patternwh, info->flipfunction, charx, chary0, &x0, &y0);
+                Vdp2PerLineCellXYF(patternwh, info->flipfunction, charx, chary0 + 1, &x1, &y1);
+                PlCell *e = &cells[c - cmin];
+                e->a0 = info->charaddr + y0 * row_bytes;
+                e->dy = (y1 - y0) * row_bytes;
+                e->fx = x0 & 7;
+                e->base = info->coloroffset + (info->paladdr << 4);
+                e->a24 = (u32)((info->specialcolormode == 1 && info->specialcolorfunction == 0) ? 0xFF : info->alpha) << 24;
+              }
+            }
+          }
+        }
+        const int c0 = sx0 >> 3, c1 = (sx0 + span - 1) >> 3;
+        if (have_prev && tv == prev_tv && sx0 == prev_sx) {
+          /* Same source row and offset as the line above: srcrow holds it. */
+        } else if (band_ok && cell_fast) {
+          const int r = tv & 7;
+          const PlCell *e = &cells[c0 - band_cmin];
+          u32 *dst = srcrow;
+          for (int c = c0; c <= c1; ++c, ++e, dst += 8)
+            Vdp2PerLineDecodeCellRow((e->a0 + r * e->dy) & 0x7FFFF, colornumber, e->fx, e->base, e->a24, transp, dst);
+        } else {
+          u32 *dst = srcrow;
+          for (int c = c0; c <= c1; ++c, dst += 8) {
+            const int pos = c * 8;
+            const int mx0 = pos >> planew_shift;
+            const int dpx = pos - (mx0 << planew_shift);
+            const int charx = dpx & plane_mask & page_mask;
+            if (band_ok) {
+              const PlPattern *pt = &pats[c - band_cmin];
+              info->charaddr = pt->charaddr;
+              info->paladdr = pt->paladdr;
+              info->flipfunction = pt->flip;
+              info->specialfunction = pt->sf;
+              info->specialcolorfunction = pt->scf;
+            } else {
+              const int ply = (dpy >> plane_shift) & (info->planeh - 1);
+              int pgy = (dpy & plane_mask) >> page_shift;
+              if (pgy < 0) pgy = info->pagewh - 1 + pgy;
+              const int mid = info->mapwh * my + (mx0 & 0x01);
+              if (mid != premap) {
+                info->PlaneAddr(info, mid, fixVdp2Regs);
+                premap = mid;
+              }
+              const int plx = (dpx >> plane_shift) & (info->planew - 1);
+              int pgx = (dpx & plane_mask) >> page_shift;
+              if (pgx < 0) pgx = info->pagewh - 1 + pgx;
+              Vdp2PatternAddrPos(info, plx, pgx, ply, pgy);
+            }
+            int x, y;
+            Vdp2PerLineCellXY(info, charx, chary, &x, &y);
+            Vdp2PerLineDecodeRow(info, y, x & 7, dst);
+          }
+        }
+        prev_tv = tv;
+        prev_sx = sx0;
+        have_prev = 1;
+        u32 *o = out0 + vl * pitch;
+        const u32 *src = srcrow + (sx0 - c0 * 8);
+        int j = 0;
+        if (inch0 == 256) {
+          for (; j + 4 <= draww; j += 4) vst1q_u32(o + j, vld1q_u32(src + j));
+          for (; j < draww; ++j) o[j] = src[j];
+        } else {
+          for (; j + 4 <= draww; j += 4) {
+            uint32x4_t q = vdupq_n_u32(src[hmap[j]]);
+            q = vsetq_lane_u32(src[hmap[j + 1]], q, 1);
+            q = vsetq_lane_u32(src[hmap[j + 2]], q, 2);
+            q = vsetq_lane_u32(src[hmap[j + 3]], q, 3);
+            vst1q_u32(o + j, q);
+          }
+          for (; j < draww; ++j) o[j] = src[hmap[j]];
+        }
+      }
+      texture->textdata = out0 + vdp2height * pitch;
+#ifdef VITA_VDP2_PERLINE_VERIFY
+      {
+        /* Draw again through the per-dot path into scratch and compare. */
+        static u32 scratch[512 * 1024];
+        static unsigned ver_calls, ver_bad;
+        YglTexture ref = { 0 };
+        ref.textdata = scratch;
+        ref.w = 0;
+        vdp2draw_struct saved = *info;
+        verify_ref = 1;
+        Vdp2DrawMapPerLine(info, &ref);
+        verify_ref = 0;
+        *info = saved;
+        int bad = 0;
+        for (int vl = 0; vl < vdp2height && !bad; ++vl)
+          bad = memcmp(out0 + vl * pitch, scratch + vl * draww, draww * sizeof(u32)) != 0;
+        ver_bad += bad;
+        if ((++ver_calls & 31) == 0 || (bad && ver_bad < 4))
+          YuiMsg("vdp2_perline_verify calls=%u mismatch=%u inch=%d incv=%d", ver_calls, ver_bad, inch0, incv);
+      }
+#endif
+      return;
+    }
+  }
+
   u32 linebuf[1024];
 #ifdef VITA_STACK_PROFILE
   static uint64_t dpl_copy_us, dpl_total_us; static unsigned dpl_calls;

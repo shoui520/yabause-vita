@@ -4176,7 +4176,7 @@ void YglRender(void) {
           glVertexAttribPointer(level->prg[j].texcoordp, 4, GL_FLOAT, GL_FALSE, 0, (GLvoid *)level->prg[j].textcoords);
           if (level->prg[j].vaid != 0) { glVertexAttribPointer(level->prg[j].vaid, 4, GL_FLOAT, GL_FALSE, 0, level->prg[j].vertexAttribute); }
 #ifdef VITA_VDP2_OPAQUE_RUNS
-          if(YglDrawOpaqueRuns(&level->prg[j],&dmtx.m[0][0])) { }
+          if(ABL(4) || YglDrawOpaqueRuns(&level->prg[j],&dmtx.m[0][0])) { }
           else
 #endif
 #ifdef VITA_VDP2_INDEXED_QUADS
