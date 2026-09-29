@@ -39,6 +39,8 @@ extern "C" {
 #include "DynarecSh2.h"
 #include "spin_step.h"
 #include "a9_register_region.h"
+u32 g_code_epoch;
+#include <algorithm>
 #include "a9_ram_load.h"
 #include "cached_dispatch.h"
 static_assert(offsetof(tagSH2, GenReg) == 0 && offsetof(tagSH2, CtrlReg) == 64 && offsetof(tagSH2, SysReg) == 76,
@@ -118,6 +120,37 @@ u32 g_spin_verify[2]; // predictions matched / mismatched at slice end
 extern "C" void VitaSh2ReportExecution() {
 #ifdef VITA_SH2_SPIN_VERIFY
   YuiMsg("jit_spin_verify match=%u mismatch=%u", g_spin_verify[0], g_spin_verify[1]);
+#endif
+#ifdef VITA_STACK_PROFILE
+  YuiMsg("jit_compiles high=%u low=%u cache=%u other=%u self_modify_reuse=%u removed=%u",
+    g_prof_compiles[0], g_prof_compiles[1], g_prof_compiles[2], g_prof_compiles[3],
+    g_prof_self_modify_reuse, CompileBlocks::getInstance()->remove_count_);
+  memset(g_prof_compiles, 0, sizeof(g_prof_compiles)); g_prof_self_modify_reuse = 0;
+  { unsigned best[6] = {0}; for (unsigned r = 0; r < 6; ++r) { unsigned bi = 0; for (unsigned k = 0; k < 64; ++k) { bool used = false; for (unsigned q = 0; q < r; ++q) used |= best[q] == k; if (!used && g_prof_smc_n[k] > g_prof_smc_n[bi]) bi = k; } best[r] = bi; }
+    YuiMsg("jit_smc hit=%u miss=%u top %08x:%u %08x:%u %08x:%u %08x:%u %08x:%u %08x:%u", g_prof_smc_hit, g_prof_smc_miss,
+      g_prof_smc_pc[best[0]], g_prof_smc_n[best[0]], g_prof_smc_pc[best[1]], g_prof_smc_n[best[1]], g_prof_smc_pc[best[2]], g_prof_smc_n[best[2]],
+      g_prof_smc_pc[best[3]], g_prof_smc_n[best[3]], g_prof_smc_pc[best[4]], g_prof_smc_n[best[4]], g_prof_smc_pc[best[5]], g_prof_smc_n[best[5]]);
+    memset(g_prof_smc_n, 0, sizeof(g_prof_smc_n)); g_prof_smc_hit = g_prof_smc_miss = 0; }
+  for (unsigned c = 0; c < 2; ++c)
+    YuiMsg("jit_slices cpu=%s slices=%u blocks=%u idle_first=%u idle_skips=%u selfloop=%u", c ? "slave" : "master",
+      g_prof_slices[c], g_prof_blocks[c], g_prof_idle_first[c], g_prof_idle_skips[c], g_prof_selfloop[c]);
+  memset(g_prof_slices, 0, sizeof(g_prof_slices)); memset(g_prof_blocks, 0, sizeof(g_prof_blocks));
+  memset(g_prof_idle_first, 0, sizeof(g_prof_idle_first)); memset(g_prof_idle_skips, 0, sizeof(g_prof_idle_skips));
+  memset(g_prof_selfloop, 0, sizeof(g_prof_selfloop));
+  { static unsigned reports; if (++reports % 8 == 0) {
+      char line[1024]; int m = snprintf(line, sizeof(line), "jit_code_pages:");
+      const u8 *cp = CompileBlocks::getInstance()->code_pages;
+      for (unsigned p = 0; p < 1024 && m < 1000; ++p) if (cp[p]) m += snprintf(line + m, sizeof(line) - m, " %03x", p);
+      YuiMsg("%s", line); } }
+  extern u32 g_prof_spin[4];
+  YuiMsg("jit_spin forwards=%u skipped_cycles=%u aborts=%u overflows=%u", g_prof_spin[0], g_prof_spin[1], g_prof_spin[2], g_prof_spin[3]);
+  memset(g_prof_spin, 0, sizeof(g_prof_spin));
+  YuiMsg("jit_dispatch_exit budget=%u count=%u interrupt=%u memcycle=%u loop=%u region=%u missing=%u tag=%u chained=%u",
+    g_prof_dispatch[0], g_prof_dispatch[1], g_prof_dispatch[2], g_prof_dispatch[3], g_prof_dispatch[4],
+    g_prof_dispatch[5], g_prof_dispatch[6], g_prof_dispatch[7], g_prof_dispatch[8]);
+  memset(g_prof_dispatch, 0, sizeof(g_prof_dispatch));
+  YuiMsg("jit_stack_spec scanned=%u active=%u accesses=%u bails=%u", g_prof_spec[0], g_prof_spec[1], g_prof_spec[2], g_prof_spec[3]);
+  memset(g_prof_spec, 0, sizeof(g_prof_spec));
 #endif
   if (VitaTelemetrySamplingEnabled()) {
     const auto sorted = hot_samples.Ranked();
@@ -899,6 +932,10 @@ void CompileBlocks::Init()
   if (LookupParentTable) {
     for (unsigned i = 0; i < (0x100000 >> 1); ++i) LookupParentTable[i].clear();
   }
+  memset(code_pages, 0, sizeof(code_pages));
+#ifdef VITA_SH2_CODE_LINES
+  memset(code_lines, 0, sizeof(code_lines));
+#endif
   if (!dCode) {
     dCode = (Block*)calloc(NUMOFBLOCKS, sizeof(Block));
     if (!dCode) throw std::bad_alloc();
@@ -969,6 +1006,7 @@ void CompileBlocks::Init()
 #endif
 
   memset(LookupTable, 0, sizeof(LookupTable));
+  ++g_code_epoch;
   memset(LookupTableRom, 0, sizeof(LookupTableRom));
   memset(LookupTableLow, 0, sizeof(LookupTableLow));
   for (auto &page : low_code_pages) page.clear();
@@ -1754,7 +1792,11 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #ifdef VITA_SH2_RAM_STORES
     // Only high-RAM compiles maintain LookupParentTable, hence code_pages.
     if (ParentT && g_sh2_region_stores)
+#ifdef VITA_SH2_CODE_LINES
+      region.code_pages = reinterpret_cast<uintptr_t>(code_lines);
+#else
       region.code_pages = reinterpret_cast<uintptr_t>(code_pages);
+#endif
 #endif
 #ifdef VITA_SH2_STACK_SPEC
     if (stack_plan.active) { region.spec_plan = Sh2StackPlanLookup; region.spec_ctx = &stack_plan; }
@@ -2661,6 +2703,1234 @@ void DynarecSh2::ResetCPU(){
   m_IntruptTbl.clear();
 }
 
+#ifdef VITA_SH2_LEAN_DISPATCH
+/* Same slice semantics as ExecuteCount + cached ExecuteBlock + FinishBlock for
+ * the non-debug build, with the state pointer and lookup tables held in
+ * locals across the native call (the compiler otherwise reloads them from
+ * `this` after every block). Every 1024th return still takes ExecuteBlock's
+ * instrumented path, and uncached PCs take Execute(), unchanged. */
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+extern "C" { u32 g_wram_epoch, g_mem_io_reads, g_mem_io_last, g_mem_io_ftcsr, g_mem_io_edsr; }
+#ifdef VITA_SH2_IDLE_EDSR
+#include "vdp1.h"
+/* The one I/O read an idle run may make: this CPU's FTCSR byte, or the VDP1
+ * EDSR word (Vdp1ReadWord returns the register; nothing but VDP1 register
+ * writes, draws started at h/vblank and the command walk on this thread
+ * change it, never during a store-free slice). The skip re-reads it. */
+static inline u32 IdleIoValue(u32 addr) { return addr == 0xFFFFFE11u ? CurrentSH2->onchip.FTCSR : Vdp1Regs->EDSR; }
+#else
+static inline u32 IdleIoValue(u32) { return CurrentSH2->onchip.FTCSR; }
+#endif
+// Bumped at the end of every SH-2 slice that may have stored to memory
+// through native code (which does not bump g_wram_epoch): any chained run,
+// any possibly-storing block, any interpreter/sampled path, any interrupt.
+u32 g_native_write_epoch;
+u32 g_prof_spin[4];  // spin fast-forward: forwards, skipped cycles, record aborts, record overflows
+u32 g_idle_skips, g_idle_records;
+#ifdef VITA_SH2_SPIN_REASONS
+/* Diagnostic only: why a valid cross-slice spin proof was not used, per CPU:
+ * pending level, work-RAM epoch, native-store epoch, FTCSR value, no state match. */
+static u32 g_spin_reason[2][5];
+/* Diagnostic: slices that start and end inside [VITA_LOOP_LO, VITA_LOOP_HI)
+ * (environment, hex), per CPU, and all slices. */
+static u32 g_loop_slices[2][2];
+/* Diagnostic: why native chaining returned to C (budget, count, interrupt,
+ * memory cycles, BLOCK_LOOP, PC outside high RAM, no block, other) and blocks
+ * entered natively, per CPU. */
+static u32 g_chain_why[2][9];
+/* Diagnostic: cross-slice proof lookups per CPU: hint hit, scan hit, no
+ * match, read-set words compared (sum), proof positions (sum). */
+static u32 g_spin_lookup[2][5];
+/* Diagnostic: per CPU, slices reaching the block loop, recordings started,
+ * recordings that forwarded, recordings that did not. */
+static u32 g_spin_rec[2][4];
+/* Diagnostic: valid idle proof at slice start: pc, wram epoch, native epoch, FTCSR, irq, skipped. */
+static u32 g_idle_miss[2][6];
+/* Diagnostic: idle-loop results by first failing record condition: not first block, memcycle, no block, may write, dirty, io, wram, ok. */
+static u32 g_idle_rec[2][8];
+static u32 LoopRange(int hi) {
+  static u32 r[2]; static int init;
+  if (!init) { init = 1; const char *a = getenv("VITA_LOOP_LO"), *b = getenv("VITA_LOOP_HI");
+               r[0] = a ? strtoul(a, NULL, 16) : 1; r[1] = b ? strtoul(b, NULL, 16) : 0; }
+  return r[hi];
+}
+#endif
+extern "C" void VitaSh2IdleReport(void) {
+  YuiMsg("sh2_idle_skip skips=%u records=%u", g_idle_skips, g_idle_records);
+  g_idle_skips = g_idle_records = 0;
+#ifdef VITA_SH2_SPIN_REASONS
+  for (int c = 0; c < 2; ++c)
+    YuiMsg("spin_xslice_miss cpu=%d pending=%u wram=%u native=%u ftcsr=%u nomatch=%u", c,
+           g_spin_reason[c][0], g_spin_reason[c][1], g_spin_reason[c][2], g_spin_reason[c][3], g_spin_reason[c][4]);
+  memset(g_spin_reason, 0, sizeof(g_spin_reason));
+  for (int c = 0; c < 2; ++c) YuiMsg("loop_slices cpu=%d in_range=%u all=%u", c, g_loop_slices[c][0], g_loop_slices[c][1]);
+  for (int c = 0; c < 2; ++c) {
+    const u32 *w = g_chain_why[c];
+    YuiMsg("chain_why cpu=%d budget=%u count=%u irq=%u memcycle=%u loop=%u nothigh=%u noblock=%u other=%u chained=%u",
+           c, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8]);
+  }
+  memset(g_chain_why, 0, sizeof(g_chain_why));
+  for (int c = 0; c < 2; ++c) {
+    const u32 *w = g_spin_lookup[c];
+    YuiMsg("spin_lookup cpu=%d hint=%u scan=%u none=%u readwords=%u positions=%u", c, w[0], w[1], w[2], w[3], w[4]);
+  }
+  memset(g_spin_lookup, 0, sizeof(g_spin_lookup));
+  for (int c = 0; c < 2; ++c)
+    YuiMsg("spin_rec cpu=%d loop_slices=%u started=%u forwarded=%u failed=%u", c, g_spin_rec[c][0], g_spin_rec[c][1], g_spin_rec[c][2], g_spin_rec[c][3]);
+  memset(g_spin_rec, 0, sizeof(g_spin_rec));
+  for (int c = 0; c < 2; ++c)
+    YuiMsg("idle_miss cpu=%d pc=%u wram=%u native=%u ftcsr=%u irq=%u skip=%u", c, g_idle_miss[c][0], g_idle_miss[c][1],
+           g_idle_miss[c][2], g_idle_miss[c][3], g_idle_miss[c][4], g_idle_miss[c][5]);
+  memset(g_idle_miss, 0, sizeof(g_idle_miss));
+  for (int c = 0; c < 2; ++c) { const u32 *w = g_idle_rec[c];
+    YuiMsg("idle_rec cpu=%d notfirst=%u memcycle=%u noblock=%u maywrite=%u dirty=%u io=%u wram=%u ok=%u", c, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]); }
+  memset(g_idle_rec, 0, sizeof(g_idle_rec));
+  YuiMsg("spin_totals forwards=%u skipped_cycles=%u aborts=%u overflows=%u", g_prof_spin[0], g_prof_spin[1], g_prof_spin[2], g_prof_spin[3]);
+  memset(g_prof_spin, 0, sizeof(g_prof_spin));
+  memset(g_loop_slices, 0, sizeof(g_loop_slices));
+#endif
+}
+#ifdef VITA_SH2_SPIN_READSET
+/* SH7604 instructions that can access memory other than the forms
+ * SpinReadSetBuild resolves (stores, MAC, TAS, GBR-relative, LDC.L/LDS.L,
+ * RTE, TRAPA; F-group opcodes are not SH-2 instructions). */
+static bool Sh2OtherMemoryAccess(u16 op) {
+  switch (op & 0xF00F) {
+    case 0x0004: case 0x0005: case 0x0006: case 0x000F:
+    case 0x2000: case 0x2001: case 0x2002: case 0x2004: case 0x2005: case 0x2006:
+    case 0x400F: return true;
+  }
+  switch (op & 0xF0FF) {
+    case 0x4002: case 0x4012: case 0x4022: case 0x4003: case 0x4013: case 0x4023:
+    case 0x4006: case 0x4016: case 0x4026: case 0x4007: case 0x4017: case 0x4027: case 0x401B: return true;
+  }
+  switch (op & 0xFF00) {
+    case 0x8000: case 0x8100: case 0xC000: case 0xC100: case 0xC200: case 0xC300:
+    case 0xC400: case 0xC500: case 0xC600: case 0xCC00: case 0xCD00: case 0xCE00: case 0xCF00: return true;
+  }
+  return op == 0x002B || (op & 0xF000) == 0x1000 || (op & 0xF000) == 0xF000;
+}
+static bool Sh2DelayedBranch(u16 op) {
+  switch (op & 0xF000) { case 0xA000: case 0xB000: return true; }
+  switch (op & 0xFF00) { case 0x8D00: case 0x8F00: return true; }
+  switch (op & 0xF0FF) { case 0x400B: case 0x402B: case 0x0003: case 0x0023: return true; }
+  return op == 0x000B || op == 0x002B;
+}
+#endif
+/* Read set of the proven cycle j..n (blocks start at the recorded states
+ * j..n-1): every instruction of those blocks executes (blocks are straight
+ * line). Register values start from the recorded entry state and are tracked
+ * through MOV #imm / MOV Rm,Rn / PC-relative loads; any other register write
+ * forgets Rn, Rm and R0. Each load must have a known address in work RAM, or
+ * be a byte read of this CPU's FTCSR (covered by the proof's FTCSR check).
+ * Code words, literals and loaded words are kept as aligned host words. */
+#if defined(VITA_SH2_SPIN_READSET) || defined(VITA_SH2_IDLE_AFFINE)
+/* Adds to the read set, through add(addr) (false: not trackable), every word
+ * the block starting at regs[22] can read when entered with registers regs:
+ * its code words, PC-relative literals, loads whose address is known from
+ * literals, immediates and moves in the block, and nothing else (other
+ * memory accesses fail; the FTCSR byte is left to the caller's check). */
+#ifdef VITA_SH2_READSET_CODE_EPOCH
+static bool CodeOwnedBy(CompileBlocks *compiler, u32 a, u32 pc0) {
+  const addrs &owners = compiler->LookupParentTable[adress_mask(a)];
+  return std::find(owners.begin(), owners.end(), adress_mask(pc0)) != owners.end();
+}
+#endif
+template <class Add>
+static bool ScanBlockReads(CompileBlocks *compiler, const u32 *regs, Add add, bool edsr = false) {
+  const u32 pc0 = regs[22];
+  if ((pc0 & 0xDFF00000u) != 0x06000000u) return false;
+  const Block *b = compiler->LookupTable[(pc0 & 0xFFFFFu) >> 1];
+  if (!b || b->b_addr != pc0 || b->e_addr < b->b_addr || b->e_addr - b->b_addr > 2 * 64 ||
+      ((b->e_addr ^ pc0) & 0xFFF00000u)) return false;
+  u32 val[16]; bool known[16];
+  for (int r = 0; r < 16; ++r) { val[r] = regs[r]; known[r] = true; }
+  u32 gbr = regs[17]; bool gbr_known = true;
+  bool delay = false;
+  for (u32 a = b->b_addr; a <= b->e_addr; a += 2) {
+#ifdef VITA_SH2_READSET_CODE_EPOCH
+    // A code word this block owns: any write to it removes the block and so
+    // moves g_code_epoch, which the caller keeps in the set instead.
+    if (!CodeOwnedBy(compiler, a, pc0) && !add(a)) return false;
+#else
+    if (!add(a)) return false;                                   // code word
+#endif
+    const u16 op = T2ReadWord(HighWram, a & 0xFFFFFu);
+    const unsigned rn = (op >> 8) & 15, rm = (op >> 4) & 15;
+    const bool in_delay = delay;
+    delay = Sh2DelayedBranch(op);
+    if ((op & 0xF000) == 0x9000 || (op & 0xF000) == 0xD000) {   // MOV.W/L @(disp,PC),Rn
+      if (in_delay) return false;
+      const bool word = (op & 0xF000) == 0x9000;
+      const u32 la = word ? a + 4 + (op & 0xFF) * 2 : ((a + 4) & ~3u) + (op & 0xFF) * 4;
+      if ((la & 0xDFF00000u) != 0x06000000u || !add(la)) return false;
+      val[rn] = word ? u32(s32(s16(T2ReadWord(HighWram, la & 0xFFFFFu)))) : T2ReadLong(HighWram, la & 0xFFFFFu);
+      known[rn] = true;
+      continue;
+    }
+    if ((op & 0xF000) == 0xE000) { val[rn] = u32(s32(s8(op & 0xFF))); known[rn] = true; continue; }
+    if ((op & 0xF00F) == 0x6003) { val[rn] = val[rm]; known[rn] = known[rm]; continue; }
+    unsigned size = 0; bool ok = false; u32 addr = 0; int dst = -1, post = -1;
+    switch (op & 0xF00F) {
+      case 0x6000: case 0x6001: case 0x6002:
+        size = 1u << (op & 3); ok = known[rm]; addr = val[rm]; dst = int(rn); break;
+      case 0x6004: case 0x6005: case 0x6006:
+        size = 1u << (op & 3); ok = known[rm]; addr = val[rm]; dst = int(rn); post = int(rm); break;
+      case 0x000C: case 0x000D: case 0x000E:
+        size = 1u << ((op & 15) - 0xC); ok = known[0] && known[rm]; addr = val[0] + val[rm]; dst = int(rn); break;
+    }
+    if (!size && (op & 0xF000) == 0x5000) { size = 4; ok = known[rm]; addr = val[rm] + (op & 15) * 4; dst = int(rn); }
+    if (!size && (op & 0xFF00) == 0x8400) { size = 1; ok = known[rm]; addr = val[rm] + (op & 15); dst = 0; }
+    if (!size && (op & 0xFF00) == 0x8500) { size = 2; ok = known[rm]; addr = val[rm] + (op & 15) * 2; dst = 0; }
+    if (!size && (op & 0xFF00) >= 0xC400 && (op & 0xFF00) <= 0xC600) { // MOV.x @(disp,GBR),R0
+      size = 1u << ((op >> 8) & 3); ok = gbr_known; addr = gbr + (op & 0xFF) * size; dst = 0;
+    }
+    if ((op & 0xF0FF) == 0x401E) { gbr = val[rn]; gbr_known = known[rn]; continue; } // LDC Rm,GBR
+    if (size) {
+      if (!ok) return false;
+      if (!(size == 1 && addr == 0xFFFFFE11u) &&                 // FTCSR: the proof's FTCSR check
+          !(edsr && size == 2 && (addr & 0xDFFFFFFFu) == 0x05D00010u)) { // EDSR: the idle skip's check
+        if ((addr & (size - 1)) || !add(addr)) return false;
+      }
+      if (post >= 0) val[post] += size;
+      known[dst] = false;
+      continue;
+    }
+    if (Sh2OtherMemoryAccess(op)) return false;
+    known[rn] = known[rm] = known[0] = false;
+  }
+  return true;
+}
+/* add() for a read set of host words in work RAM. */
+template <unsigned Max>
+static bool ReadSetAddHost(const u32 *p, const u32 **ptr, u32 *val, unsigned &n) {
+  for (unsigned i = 0; i < n; ++i) if (ptr[i] == p) return true;
+  if (n == Max) return false;
+  ptr[n] = p; val[n++] = *p;
+  return true;
+}
+template <unsigned Max>
+static bool ReadSetAdd(u32 addr, const u32 **ptr, u32 *val, unsigned &n) {
+  const u32 *p;
+  if ((addr & 0xDFF00000u) == 0x06000000u) p = reinterpret_cast<const u32 *>(HighWram + (addr & 0xFFFFCu));
+  else if ((addr & 0xDFF00000u) == 0x00200000u) p = reinterpret_cast<const u32 *>(LowWram + (addr & 0xFFFFCu));
+  else return false;
+  for (unsigned i = 0; i < n; ++i) if (ptr[i] == p) return true;
+  if (n == Max) return false;
+  ptr[n] = p; val[n++] = *p;
+  return true;
+}
+#endif
+bool DynarecSh2::SpinReadSetBuild(unsigned j, unsigned n) {
+  spin_read_self_ = false; spin_read_n_ = 0;
+#ifdef VITA_SH2_SPIN_READSET
+  if (!HighWram || !LowWram) return false;
+  auto add = [&](u32 addr) { return ReadSetAdd<kSpinReadMax>(addr, spin_read_ptr_, spin_read_val_, spin_read_n_); };
+#ifdef VITA_SH2_READSET_CODE_EPOCH
+  // First, so a failing compare finds a moved epoch before the other words.
+  if (!ReadSetAddHost<kSpinReadMax>(&g_code_epoch, spin_read_ptr_, spin_read_val_, spin_read_n_)) return false;
+#endif
+  for (unsigned k = j; k < n; ++k)
+    if (!ScanBlockReads(m_pCompiler, spin_regs_[k], add)) return false;
+  spin_read_self_ = true;
+#endif
+  (void)j; (void)n;
+  return spin_read_self_;
+}
+#ifdef VITA_SH2_IDLE_AFFINE
+void DynarecSh2::IdleReadSetBuild(const u32 *regs) {
+  idle_read_n_ = 0;
+  auto add = [&](u32 addr) { return ReadSetAdd<kIdleReadMax>(addr, idle_read_ptr_, idle_read_val_, idle_read_n_); };
+#ifdef VITA_SH2_READSET_CODE_EPOCH
+  (void)ReadSetAddHost<kIdleReadMax>(&g_code_epoch, idle_read_ptr_, idle_read_val_, idle_read_n_);
+#endif
+#ifdef VITA_SH2_IDLE_EDSR
+  idle_.readset = HighWram && LowWram && ScanBlockReads(m_pCompiler, regs, add, true);
+#else
+  idle_.readset = HighWram && LowWram && ScanBlockReads(m_pCompiler, regs, add);
+#endif
+}
+#endif
+/* Affine cycle at the end of a recording: the last two periods of length L
+ * (positions i..k..spin_n, k = spin_n - L, i = k - L) have identical per-block
+ * cycle counts and differ at every position by one delta vector that is zero
+ * outside r1..r14, with the lowest varying register moving by +-1 (so a
+ * later state's period offset follows from it). Returns k (the proof's j,
+ * spin_n its n) or -1; spin_delta_ is set on success. */
+int DynarecSh2::SpinAffineDetect(unsigned spin_n) {
+#ifdef VITA_SH2_SPIN_AFFINE
+  for (unsigned L = 1; 2 * L <= spin_n && L <= 16; ++L) {     // short periods only, as before recordings grew
+    const unsigned k = spin_n - L, i = k - L;
+    if (spin_hash_[k][1] != spin_hash_[spin_n][1] || spin_hash_[i][1] != spin_hash_[k][1]) continue; // R0, SR..PC: delta 0
+    u32 delta[23];
+    bool ok = true, any = false;
+    for (int w = 0; w < 23 && ok; ++w) {
+      delta[w] = spin_regs_[k][w] - spin_regs_[i][w];
+      if (delta[w] && (w == 0 || w >= 15)) ok = false;
+      if (delta[w]) any = true;
+    }
+    if (!ok || !any) continue;
+    int d0 = -1;
+    for (int w = 1; w < 15; ++w) if (delta[w]) { d0 = w; break; }
+    if (delta[d0] != 1u && delta[d0] != 0xFFFFFFFFu) continue;
+    for (unsigned t = 0; t < L && ok; ++t) {
+      for (int w = 0; w < 23; ++w)
+        if (spin_regs_[k + t + 1][w] - spin_regs_[i + t + 1][w] != delta[w]) { ok = false; break; }
+      if (spin_count_[k + t + 1] - spin_count_[k + t] != spin_count_[i + t + 1] - spin_count_[i + t]) ok = false;
+    }
+    if (!ok) continue;
+    for (int w = 0; w < 16; ++w) spin_delta_[w] = delta[w];
+    if (!SpinAffineIndependent(k, spin_n)) continue;
+    return int(k);
+  }
+#else
+  (void)spin_n;
+#endif
+  return -1;
+}
+#ifdef VITA_SH2_IDLE_AFFINE
+/* True when every instruction in [b, e] references a register with a nonzero
+ * delta only as ADD #imm,Rn to itself (register fields per format; branch
+ * displacements and immediates are not registers). High work RAM only. */
+static bool AffineOpsIndependent(u32 b, u32 e, const u32 *delta) {
+  if (!HighWram || (b & 0xDFF00000u) != 0x06000000u || e < b || e - b > 2 * 64 || ((e ^ b) & 0xFFF00000u)) return false;
+  for (u32 a = b; a <= e; a += 2) {
+    const u16 op = T2ReadWord(HighWram, a & 0xFFFFFu);
+    const unsigned rn = (op >> 8) & 15, rm = (op >> 4) & 15, g = op >> 12;
+    bool uses_n = false, uses_m = false;
+    switch (g) {
+      case 0x7: if (delta[rn]) continue;
+                break;
+      case 0x9: case 0xD: case 0xE: uses_n = true; break;
+      case 0xA: case 0xB: case 0xC: break;
+      case 0x8: uses_m = ((op >> 8) & 0xF) <= 0x5; break;
+      default: uses_n = uses_m = true; break;
+    }
+    if ((uses_n && delta[rn]) || (uses_m && delta[rm])) return false;
+  }
+  return true;
+}
+#endif
+/* Every instruction of the cycle's blocks references a varying register
+ * (delta != 0) only as ADD #imm,Rn to itself: register fields are checked
+ * per format (branch displacements and immediates are not registers; R0 and
+ * R15 never vary). */
+bool DynarecSh2::SpinAffineIndependent(unsigned j, unsigned n) const {
+#ifdef VITA_SH2_SPIN_AFFINE
+  if (!HighWram) return false;
+  for (unsigned k = j; k < n; ++k) {
+    const u32 pc0 = spin_regs_[k][22];
+    if ((pc0 & 0xDFF00000u) != 0x06000000u) return false;
+    const Block *b = m_pCompiler->LookupTable[(pc0 & 0xFFFFFu) >> 1];
+    if (!b || b->b_addr != pc0 || b->e_addr < b->b_addr || b->e_addr - b->b_addr > 2 * 64 ||
+        ((b->e_addr ^ pc0) & 0xFFF00000u)) return false;
+    for (u32 a = b->b_addr; a <= b->e_addr; a += 2) {
+      const u16 op = T2ReadWord(HighWram, a & 0xFFFFFu);
+      const unsigned rn = (op >> 8) & 15, rm = (op >> 4) & 15, g = op >> 12;
+      bool uses_n = false, uses_m = false;
+      switch (g) {
+        case 0x7: if (spin_delta_[rn]) continue;              // ADD #imm,Rn: the varying register's own update
+                  break;
+        case 0x9: case 0xD: case 0xE: uses_n = true; break;      // Rn written
+        case 0xA: case 0xB: case 0xC: break;                      // displacement / immediate / R0 only
+        case 0x8: uses_m = ((op >> 8) & 0xF) <= 0x5; break;      // 80/81/84/85: Rn/Rm in bits 4-7
+        default: uses_n = uses_m = true; break;
+      }
+      if ((uses_n && spin_delta_[rn]) || (uses_m && spin_delta_[rm])) return false;
+    }
+  }
+  return true;
+#else
+  (void)j; (void)n;
+  return false;
+#endif
+}
+// GenReg[16], SR/GBR/VBR, MACH/MACL/PR/PC: everything the SH-2 carries between
+// slices except the per-slice count and pending-interrupt level.
+static inline void IdleRegs(const tagSH2 *st, u32 *out) {
+  memcpy(out, st->GenReg, 16 * 4); memcpy(out + 16, st->CtrlReg, 3 * 4); memcpy(out + 19, st->SysReg, 4 * 4);
+}
+#endif
+#ifdef VITA_DIAG_TIMERS
+extern "C" { u32 vita_diag_slice[2][8]; uint64_t sceKernelGetProcessTimeWide(void); extern uint64_t vita_diag_exec_us[2], vita_diag_exec_n[2]; }
+#define DIAG_SLICE(k) (++vita_diag_slice[is_slave_ ? 1 : 0][k])
+#else
+#define DIAG_SLICE(k) ((void)0)
+#endif
+#if defined(VITA_STACK_PROFILE) || defined(A9_PMU_REGIONS)
+namespace { struct StackPhase { explicit StackPhase(unsigned p) { VitaStackPush(p); } ~StackPhase() { VitaStackPop(); } }; }
+#endif
+// The lazy forward lives in the fast entry: without it, never lazy.
+#if defined(VITA_SH2_SPIN_LAZY) && !(defined(VITA_SH2_SPIN_FAST_ENTRY) && defined(VITA_SH2_SPIN_FORWARD) && \
+    defined(VITA_SH2_SPIN_READSET) && !defined(VITA_SH2_SPIN_VERIFY) && !defined(VITA_SH2_SPIN_REASONS) && \
+    !defined(VITA_STACK_PROFILE) && !defined(VITA_DIAG_TIMERS))
+#undef VITA_SH2_SPIN_LAZY
+#endif
+#ifndef VITA_SH2_SPIN_LAZY
+void DynarecSh2::LazySync() { lazy_ = false; }
+#endif
+#if defined(VITA_SH2_SPIN_FAST_ENTRY) && defined(VITA_SH2_SPIN_FORWARD) && defined(VITA_SH2_SPIN_READSET) && \
+    !defined(VITA_SH2_SPIN_VERIFY) && !defined(VITA_SH2_SPIN_REASONS) && !defined(VITA_STACK_PROFILE) && !defined(VITA_DIAG_TIMERS)
+/* The common cross-slice forward of ExecuteCountLeanFull without entering its
+ * large frame: a valid non-affine proof, no idle-skip candidate, and the live
+ * state equal to the recorded position of the previous forward (hint). Every
+ * side effect below is the full path's, in its order; any other case runs the
+ * full path, which re-checks everything. */
+#ifdef VITA_SH2_SPIN_LAZY
+/* The state after the deferred slices: each ran exactly as a forward would
+ * (blocks while count < target, the overshoot carried), so position and
+ * carry follow slice by slice from the recorded counts; only the last
+ * slice's count is kept (SysReg[4], cycles). */
+void DynarecSh2::LazySync() {
+  lazy_ = false;
+  tagSH2 *const st = m_pDynaSh2;
+  const unsigned j = spin_proof_.j, n = spin_proof_.n;
+  const u32 cycle = spin_count_[n] - spin_count_[j];
+  unsigned q = lazy_q_;
+  u32 c = lazy_c_, ran = 0, periods = lazy_m_;
+  auto advance = [&](u32 d, u32 *slice) {
+    if (d <= c) { c -= d; return false; }      // Count <= carry: no block runs
+    const u32 need = d - c;
+    u32 count = 0, m = 0;
+    if (need - 1 >= cycle) { m = (need - 1) / cycle; count = m * cycle; }  // whole periods (same position)
+    SpinStepTo(spin_count_, j, n, &q, &count, &m, need);
+    c = count - need; ran += count; *slice = count; periods += m;
+    return true;
+  };
+  u32 last = 0;
+  advance(lazy_debt_ - lazy_last_, &last);
+  const bool last_ran = advance(lazy_last_, &last);
+  const u32 *r = spin_regs_[q];
+  u32 *out = reinterpret_cast<u32 *>(st);
+  // As the full forward: an affine proof's registers move by delta per period.
+  int d0 = -1;
+  if (spin_affine_) for (int w = 1; w < 15; ++w) if (spin_delta_[w]) { d0 = w; break; }
+  if (d0 >= 0) {
+    for (int w = 0; w < 16; ++w) out[w] = r[w] + periods * spin_delta_[w];
+    for (int w = 16; w < 23; ++w) out[w] = r[w];
+  } else {
+    for (int w = 0; w < 23; ++w) out[w] = r[w];
+  }
+  st->SysReg[4] = last_ran ? last : 0;
+  if (last_ran) ctx_->cycles = last;
+  pre_exe_count_ = c;
+  spin_proof_.hint = q;
+  memcycle_ = 0;
+  counted_slice_active_ = false;
+  native_cycles += ran;
+  g_prof_spin[1] += ran;
+}
+#endif
+void DynarecSh2::ExecuteCountLean(u32 Count) {
+  tagSH2 *const st = m_pDynaSh2;
+#ifdef VITA_SH2_SPIN_LAZY
+  if (lazy_) {
+    if (spin_proof_.valid && lazy_debt_ < 0x40000000u &&
+#ifdef VITA_SH2_SPIN_PENDING_MASK
+        st->SysReg[5] <= spin_proof_.pending &&
+#else
+        st->SysReg[5] == spin_proof_.pending &&
+#endif
+        SpinReadSetSame() &&
+        (!spin_proof_.ftcsr_dep || CurrentSH2->onchip.FTCSR == spin_proof_.ftcsr_val)) {
+      lazy_debt_ += Count; lazy_last_ = Count;
+      if (spin_cooldown_) --spin_cooldown_;
+      ++g_prof_spin[0];
+      return;
+    }
+    LazySync();
+  }
+#endif
+  if (Count > pre_exe_count_ && spin_proof_.valid && spin_read_self_ && !idle_.valid &&
+#ifndef VITA_SH2_SPIN_LAZY
+      !spin_affine_ &&
+#endif
+#ifdef VITA_SH2_SPIN_PENDING_MASK
+      st->SysReg[5] <= spin_proof_.pending &&
+#else
+      st->SysReg[5] == spin_proof_.pending &&
+#endif
+      SpinReadSetSame() &&
+      (!spin_proof_.ftcsr_dep || CurrentSH2->onchip.FTCSR == spin_proof_.ftcsr_val)) {
+    const unsigned p = spin_proof_.hint, j = spin_proof_.j, n = spin_proof_.n;
+    if (p >= j && p < n) {
+      const u32 *live = reinterpret_cast<const u32 *>(st), *r = spin_regs_[p];
+      u32 diff = 0, mm = 0;
+#ifdef VITA_SH2_SPIN_LAZY
+      /* The full path's same_state at the hint: an affine proof matches the
+       * position shifted by mm periods, mm read from the lowest varying
+       * register (delta +-1). */
+      int d0 = -1;
+      if (spin_affine_) for (int w = 1; w < 15; ++w) if (spin_delta_[w]) { d0 = w; break; }
+      if (d0 >= 0) {
+        mm = spin_delta_[d0] == 1u ? live[d0] - r[d0] : r[d0] - live[d0];
+        for (int w = 0; w < 16; ++w) diff |= live[w] ^ (r[w] + mm * spin_delta_[w]);
+        for (int w = 16; w < 23; ++w) diff |= live[w] ^ r[w];
+      } else
+#endif
+      for (int w = 0; w < 23; ++w) diff |= live[w] ^ r[w];
+      if (diff == 0) {
+#ifdef VITA_SH2_SPIN_LAZY
+        lazy_ = true; lazy_q_ = p; lazy_m_ = mm; lazy_c_ = pre_exe_count_; lazy_debt_ = lazy_last_ = Count;
+        if (spin_cooldown_) --spin_cooldown_;
+        ++g_prof_spin[0];
+        InvalidateIdle();
+        memcycle_ = 0;
+        counted_slice_active_ = false;
+        return;
+#endif
+        const u32 targetcnt = Count - pre_exe_count_;
+        st->SysReg[4] = 0;
+        st->exitcount = targetcnt;
+        memcycle_ = 0;
+        if (spin_cooldown_) --spin_cooldown_;
+        u32 count = 0;
+        unsigned q = p;
+        const u32 cycle = spin_count_[n] - spin_count_[j];
+        const u32 rem = targetcnt - 1;
+        if (rem != spin_proof_.div_rem) {
+          spin_proof_.div_rem = rem; spin_div_periods_ = rem / cycle; spin_proof_.div_whole = spin_div_periods_ * cycle;
+        }
+        count += spin_proof_.div_whole;
+        if (count < targetcnt) {                   // at most one period left
+          u32 m = 0;
+          SpinStepTo(spin_count_, j, n, &q, &count, &m, targetcnt);
+        }
+        g_prof_spin[1] += count; ++g_prof_spin[0];
+        if (q != p) {
+          const u32 *rq = spin_regs_[q];
+          u32 *out = reinterpret_cast<u32 *>(st);
+          for (int w = 0; w < 23; ++w) out[w] = rq[w];
+        }
+        st->SysReg[4] = count;
+        spin_proof_.hint = q;
+        InvalidateIdle();
+        CurrentSH2->cycles = count;
+        counted_slice_active_ = false;
+        pre_exe_count_ = count - targetcnt;
+        native_cycles += count;
+        return;
+      }
+    }
+  }
+  ExecuteCountLeanFull(Count);
+}
+void __attribute__((noinline)) DynarecSh2::ExecuteCountLeanFull(u32 Count) {
+#else
+void DynarecSh2::ExecuteCountLean(u32 Count) { ExecuteCountLeanFull(Count); }
+void DynarecSh2::ExecuteCountLeanFull(u32 Count) {
+#endif
+  tagSH2 *const st = m_pDynaSh2;
+  st->SysReg[4] = 0;
+  if (Count <= pre_exe_count_) {
+    DIAG_SLICE(0);
+    pre_exe_count_ = (pre_exe_count_ + st->SysReg[4]) - Count;
+    return;
+  }
+  const u32 targetcnt = Count - pre_exe_count_;
+#ifdef VITA_SH2_SPIN_REASONS
+  const u32 loop_pc0 = st->SysReg[3];
+#endif
+  st->exitcount = targetcnt;
+  counted_slice_active_ = true;
+  memcycle_ = 0;
+  Block *const *const rom = m_pCompiler->LookupTableRom;
+  Block *const *const low = m_pCompiler->LookupTableLow;
+  Block *const *const high = m_pCompiler->LookupTable;
+  u32 slice_memory = 0, slice_skip = 0;
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+  /* Exact idle-slice skip. The previous slice ran only the idle block B (a
+   * BLOCK_LOOP self loop, no stores) from this PC and it returned to the same
+   * complete register state with no memory cycles and no non-work-RAM read.
+   * B then reads only work RAM (region fast paths) and PC literals; if no
+   * work-RAM write happened since (epoch: every handler, helper and SCU DSP
+   * write; native region stores come only from an executing SH-2, excluded
+   * here because the slave is stopped and any other master block clears
+   * valid), no interrupt is acceptable, and the state is unchanged, running B
+   * again reproduces that run exactly: same state, IN_INFINITY_LOOP, and the
+   * idle path sets the count to the slice target with no carry. */
+#ifdef VITA_SH2_IDLE_ANY_CPU
+  /* Generalized: the other SH-2's native stores are covered by
+   * g_native_write_epoch instead of requiring the slave to be stopped, and
+   * the idle run may have read its own FTCSR (a pure on-chip read) provided
+   * the register still holds the value that run saw. */
+#ifdef VITA_SH2_SPIN_REASONS
+  if (idle_.valid) {
+    u32 *w = g_idle_miss[is_slave_ ? 1 : 0];
+    ++w[st->SysReg[3] != idle_.pc ? 0 : (idle_.readset ? !IdleReadSetSame() : g_wram_epoch != idle_.epoch) ? 1 :
+        (!idle_.readset && g_native_write_epoch != idle_.native_epoch) ? 2 :
+        (idle_.io_addr && IdleIoValue(idle_.io_addr) != idle_.io_val) ? 3 : ((st->CtrlReg[0] & 0xF0) < st->SysReg[5]) ? 4 : 5];
+  }
+#endif
+  if (idle_.valid && st->SysReg[3] == idle_.pc &&
+#ifdef VITA_SH2_IDLE_AFFINE
+      (idle_.readset ? IdleReadSetSame() : g_wram_epoch == idle_.epoch && g_native_write_epoch == idle_.native_epoch) &&
+#else
+      g_wram_epoch == idle_.epoch && g_native_write_epoch == idle_.native_epoch &&
+#endif
+      (!idle_.io_addr || IdleIoValue(idle_.io_addr) == idle_.io_val) &&
+      !((st->CtrlReg[0] & 0xF0) < st->SysReg[5])) {
+#else
+  if (idle_.valid && st->SysReg[3] == idle_.pc && g_wram_epoch == idle_.epoch &&
+      !yabsys.IsSSH2Running && !((st->CtrlReg[0] & 0xF0) < st->SysReg[5])) {
+#endif
+#ifdef VITA_SH2_IDLE_AFFINE
+    if (idle_.affine)
+      for (int w = 1; w < 15; ++w) { st->GenReg[w] += idle_.delta[w]; idle_.regs[w] += idle_.delta[w]; }
+#endif
+#ifdef VITA_SH2_IDLE_AFFINE
+    // As the run: IN_INFINITY_LOOP sets the count to the target, then the
+    // block's memory cycles are added (carried into the next slice).
+    st->SysReg[4] = targetcnt + idle_.mc;
+    DIAG_SLICE(1);
+    ++loopskip_cnt_; ++g_idle_skips;
+    CurrentSH2->cycles = targetcnt + idle_.mc;
+    counted_slice_active_ = false;
+    pre_exe_count_ = idle_.mc;
+    return;
+#else
+    st->SysReg[4] = targetcnt;
+    DIAG_SLICE(1);
+    ++loopskip_cnt_; ++g_idle_skips;
+    CurrentSH2->cycles = targetcnt;
+    counted_slice_active_ = false;
+    pre_exe_count_ = 0;
+    return;
+#endif
+  }
+  const u32 idle_io0 = g_mem_io_reads, idle_epoch0 = g_wram_epoch, idle_edsr0 = g_mem_io_edsr;
+  unsigned idle_blocks = 0;
+  bool idle_cleared = false;
+#endif
+#ifdef VITA_STACK_PROFILE
+  const unsigned prof_cpu = is_slave_ ? 1 : 0;
+  unsigned prof_blocks = 0;
+  ++g_prof_slices[prof_cpu];
+#endif
+  auto returns = native_returns;               // local copy; written back around ExecuteBlock
+#ifdef VITA_SH2_SPIN_FORWARD
+  /* Exact spin fast-forward. Within one slice nothing but this SH-2 runs, so
+   * once the complete architectural state at a block boundary repeats, with
+   * no memory writes possible (BLOCK_MAY_WRITE), no non-work-RAM reads
+   * (g_mem_io_reads), no work-RAM writes (g_wram_epoch), no interrupt check
+   * and no loop inference in between, every later block of the slice repeats
+   * the recorded cycle: the slice's final state and count (including the
+   * overshoot past the target) follow from the recorded per-block counts.
+   * Recording runs blocks one at a time (no native chaining). */
+  bool spin_rec = spin_candidate_ && !spin_cooldown_, spin_forwarded = false, slice_dirty = false;
+  bool spin_rec_started = spin_rec;
+  if (spin_cooldown_) --spin_cooldown_;
+  unsigned spin_n = 0;
+  u32 spin_off = 0;                            // spin_count_[k] = slice count + spin_off
+  bool spin_restarted = false;
+#ifdef VITA_SH2_SPIN_FTCSR
+  /* Byte reads of this CPU's FTCSR are allowed in a recording: a pure on-chip
+   * read whose value nothing can change during this CPU's own slice (its own
+   * writes are stores, which abort; FRTExec and the other CPU's SINIT/MINIT
+   * run outside the slice). Other I/O restarts the recording. */
+  u32 spin_epoch = g_wram_epoch, spin_io = g_mem_io_reads - g_mem_io_ftcsr, spin_ftcsr_reads = g_mem_io_ftcsr;
+  const u32 spin_ftcsr_val = CurrentSH2->onchip.FTCSR;
+#define SPIN_IO_NOW() (g_mem_io_reads - g_mem_io_ftcsr)
+#else
+  u32 spin_epoch = g_wram_epoch, spin_io = g_mem_io_reads;
+#define SPIN_IO_NOW() (g_mem_io_reads)
+#endif
+#ifdef VITA_SH2_SPIN_VERIFY
+  bool spin_pred = false; u32 spin_pred_regs[23], spin_pred_count = 0;
+#endif
+  {
+#if defined(VITA_STACK_PROFILE) || defined(A9_PMU_REGIONS)
+  StackPhase sp_forward(VT_SH2_FORWARD);
+#endif
+  /* A cycle proven in an earlier slice still holds when this slice starts in
+   * one of its recorded states, the pending interrupt level is the recorded
+   * one (so no interrupt is taken after any block, as in the recording), and
+   * no memory write happened anywhere since: no work-RAM handler/DMA write
+   * (g_wram_epoch) and no possibly-storing native execution by either SH-2
+   * (g_native_write_epoch). The cycle itself reads no I/O. */
+#ifdef VITA_SH2_SPIN_REASONS
+  if (spin_proof_.valid) {
+    u32 *r = g_spin_reason[is_slave_ ? 1 : 0];
+#ifdef VITA_SH2_SPIN_PENDING_MASK
+    if (st->SysReg[5] > spin_proof_.pending) ++r[0];
+#else
+    if (st->SysReg[5] != spin_proof_.pending) ++r[0];
+#endif
+    else if (spin_read_self_ ? !SpinReadSetSame() : g_wram_epoch != spin_proof_.epoch) ++r[1];
+    else if (!spin_read_self_ && g_native_write_epoch != spin_proof_.native_epoch) ++r[2];
+    else if (spin_proof_.ftcsr_dep && CurrentSH2->onchip.FTCSR != spin_proof_.ftcsr_val) ++r[3];
+  }
+#endif
+#ifdef VITA_SH2_SPIN_PENDING_MASK
+  /* pending holds the lowest SR interrupt mask of the recorded cycle: any
+   * pending level at or below it is not acceptable in any recorded state, so
+   * no interrupt is taken after any block, exactly as in the recording (the
+   * level cannot change within this slice). */
+  if (spin_proof_.valid && st->SysReg[5] <= spin_proof_.pending &&
+#else
+  if (spin_proof_.valid && st->SysReg[5] == spin_proof_.pending &&
+#endif
+      st->SysReg[3] - spin_proof_.pc_lo <= spin_proof_.pc_hi - spin_proof_.pc_lo &&
+      (spin_read_self_ ? SpinReadSetSame()
+                       : g_wram_epoch == spin_proof_.epoch && g_native_write_epoch == spin_proof_.native_epoch) &&
+      (!spin_proof_.ftcsr_dep || CurrentSH2->onchip.FTCSR == spin_proof_.ftcsr_val)) {
+    /* State equality against recorded position p, in IdleRegs order, without
+     * copying the live state first. */
+    /* IdleRegs order is the first 23 words of tagSH2 (GenReg, CtrlReg,
+     * SysReg[0..3]; offsets asserted below): compare them inline. */
+    const u32 *live = reinterpret_cast<const u32 *>(st);
+    /* Affine proofs: the live state is recorded position p shifted by m
+     * periods, m taken from the lowest varying register (delta +-1). */
+    int d0 = -1;
+    if (spin_affine_) for (int w = 1; w < 15; ++w) if (spin_delta_[w]) { d0 = w; break; }
+    auto same_state = [&](unsigned p, u32 *m) {
+      const u32 *r = spin_regs_[p];
+      u32 diff = 0;
+      if (d0 < 0) {
+        for (int w = 0; w < 23; ++w) diff |= live[w] ^ r[w];
+        *m = 0;
+        return diff == 0;
+      }
+      const u32 mm = spin_delta_[d0] == 1u ? live[d0] - r[d0] : r[d0] - live[d0];
+      for (int w = 0; w < 16; ++w) diff |= live[w] ^ (r[w] + mm * spin_delta_[w]);
+      for (int w = 16; w < 23; ++w) diff |= live[w] ^ r[w];
+      *m = mm;
+      return diff == 0;
+    };
+    const unsigned pj = spin_proof_.j, pn = spin_proof_.n;
+    unsigned hit = pn;
+    u32 hit_m = 0;
+    /* The previous forward ended at spin_proof_.hint: try it first. */
+    if (spin_proof_.hint >= pj && spin_proof_.hint < pn && same_state(spin_proof_.hint, &hit_m)) hit = spin_proof_.hint;
+    else for (unsigned p = pj; p < pn; ++p) if (same_state(p, &hit_m)) { hit = p; break; }
+#ifdef VITA_SH2_SPIN_REASONS
+    { u32 *w = g_spin_lookup[is_slave_ ? 1 : 0];
+      ++w[hit == spin_proof_.hint ? 0 : hit < pn ? 1 : 2]; w[3] += spin_read_n_; w[4] += pn - pj; }
+#endif
+    for (unsigned p = hit; p < pn; p = pn) {
+      const unsigned j = pj, n = pn;
+      u32 count = st->SysReg[4];
+      unsigned q = p;
+      u32 m = hit_m;
+      const u32 cycle = spin_count_[n] - spin_count_[j];
+      const u32 rem = targetcnt - count - 1;                  // count < targetcnt here
+      if (rem >= cycle) {                                     // whole periods first
+        if (rem != spin_proof_.div_rem) {                     // A9: no hardware divide
+          spin_proof_.div_rem = rem; spin_div_periods_ = rem / cycle; spin_proof_.div_whole = spin_div_periods_ * cycle;
+        }
+        count += spin_proof_.div_whole;
+        m += spin_div_periods_;
+      }
+      SpinStepTo(spin_count_, j, n, &q, &count, &m, targetcnt);  // at most one period left
+#ifdef VITA_SH2_SPIN_VERIFY
+      spin_pred = true; spin_pred_count = count; spin_rec = false;
+      memcpy(spin_pred_regs, spin_regs_[q], sizeof(spin_pred_regs));
+      if (d0 >= 0) for (int w = 0; w < 16; ++w) spin_pred_regs[w] += m * spin_delta_[w];
+      break;
+#else
+      g_prof_spin[1] += count - st->SysReg[4]; ++g_prof_spin[0];
+      if (d0 >= 0) {
+        const u32 *r = spin_regs_[q];
+        u32 *out = reinterpret_cast<u32 *>(st);
+        for (int w = 0; w < 16; ++w) out[w] = r[w] + m * spin_delta_[w];
+        for (int w = 16; w < 23; ++w) out[w] = r[w];
+      } else if (q != p) {                                  // else already that state
+        const u32 *r = spin_regs_[q];
+        u32 *out = reinterpret_cast<u32 *>(st);
+        for (int w = 0; w < 23; ++w) out[w] = r[w];
+      }
+      st->SysReg[4] = count;
+      spin_proof_.hint = q;
+      InvalidateIdle();
+      DIAG_SLICE(2);
+      CurrentSH2->cycles = count;
+      counted_slice_active_ = false;
+      pre_exe_count_ = count - targetcnt;
+      native_cycles += count;
+      return;
+#endif
+    }
+  }
+  }
+  /* A proof that missed only because this slice takes an interrupt (a
+   * pending level above the SR mask, e.g. each line's hblank) still holds
+   * once the handler returns to the loop: keep it rather than record over
+   * it. Recording resumes if the loop does not come back. */
+  if (spin_rec && spin_proof_.valid && st->SysReg[5] != spin_proof_.pending &&
+      st->SysReg[5] > (st->CtrlReg[0] & 0xF0u))
+    spin_rec = spin_rec_started = false;
+#ifdef VITA_SH2_SPIN_CARRY
+  /* Slices can be shorter than one period of the loop. A recording left open
+   * by the previous slice continues here when this slice starts in exactly
+   * its last recorded state (so no interrupt was taken), at the same pending
+   * level, and every word the recorded blocks can read still holds the value
+   * they read (their read set, taken at the last slice end; recordings stop
+   * at any possibly-storing block, so those are the values seen) -- or, when
+   * that set is not trackable, no work-RAM write happened anywhere since
+   * (both epochs). Every recorded block then ran under the memory and
+   * interrupt conditions a proof over them assumes, as if in one slice.
+   * Counts continue through spin_off (only differences of spin_count_ are
+   * used). */
+  if (spin_carry_) {
+    spin_carry_ = false;
+    if (spin_rec && spin_carry_n_ &&
+        (spin_carry_rs_ ? SpinReadSetSame()
+                        : g_wram_epoch == spin_carry_wram_ && g_native_write_epoch == spin_carry_native_) &&
+        st->SysReg[5] == spin_carry_pending_ &&
+        !memcmp(st, spin_regs_[spin_carry_n_], sizeof(spin_regs_[0]))) {
+      spin_proof_.valid = false;
+      spin_n = spin_carry_n_;
+      spin_off = spin_count_[spin_n] - st->SysReg[4];
+    }
+  }
+  if (spin_rec && !spin_n)
+#else
+  if (spin_rec)
+#endif
+  { spin_proof_.valid = false; IdleRegs(st, spin_regs_[0]); spin_count_[0] = st->SysReg[4]; SpinHash(0); }
+  if (spin_rec) DIAG_SLICE(3); else DIAG_SLICE(5);
+#ifdef VITA_SH2_SPIN_AFFINE
+  last_selfloop_ = false;
+#endif
+#ifdef VITA_DIAG_TIMERS
+  const uint64_t diag_exec0 = sceKernelGetProcessTimeWide();
+#endif
+#endif
+  while (st->SysReg[4] < targetcnt) {
+    const u32 pc = st->SysReg[3];
+    // Cached high work RAM first (CachedBlock's 0x06000000 case exactly).
+    Block *block = LIKELY((pc & 0xfff00000u) == 0x06000000u) ? high[(pc & 0xfffffu) >> 1] :
+                   sh2a9::CachedBlock(pc, yabsys.emulatebios || yabsys.extend_backup, rom, low, high);
+#ifdef VITA_SH2_PC_LOADS
+    if (block && block->b_addr != pc) block = nullptr;
+#endif
+    int result;
+    if (block && (returns & 1023u)) {
+#ifdef VITA_SH2_NATIVE_DISPATCH
+#ifdef VITA_SH2_SPIN_FORWARD
+      // BLOCK_LOOP blocks are fine: an actual loop inference aborts below.
+      if (block->flags & BLOCK_MAY_WRITE) {
+        slice_dirty = true;
+        if (spin_rec) { spin_rec = false; spin_candidate_ = false; ++g_prof_spin[2]; }
+      }
+      // Chain at most up to the next sampled (ExecuteBlock) call; recording
+      // observes every block boundary.
+#ifdef VITA_SH2_SPIN_VERIFY
+      const u32 budget = (spin_rec || spin_pred) ? 0u : 1023u - (u32(returns) & 1023u);
+#else
+      const u32 budget = spin_rec ? 0u : 1023u - (u32(returns) & 1023u);
+#endif
+#else
+      // Chain at most up to the next sampled (ExecuteBlock) call.
+      const u32 budget = 1023u - (u32(returns) & 1023u);
+#endif
+      st->chain_budget = budget;
+      st->chain_cur = reinterpret_cast<uintptr_t>(block);
+#endif
+#ifdef VITA_STACK_PROFILE
+      VitaStackPush(is_slave_ ? VT_SH2_DISPATCH : VT_SH2_NATIVE);  // profile: slave native code shows as sh2_dispatch
+      if (!is_slave_) { vt_pc_off = offsetof(Block, b_addr); vt_pc_src = &st->chain_cur; }
+      ((dynaFunc)((void*)(block->code)))(st);
+      VitaStackPop();
+#elif defined(A9_PMU_REGIONS)
+      VitaStackPush(VT_SH2_NATIVE);
+      ((dynaFunc)((void*)(block->code)))(st);
+      VitaStackPop();
+#elif defined(VITA_SH2_RESIDENT_LOOPS) && defined(VITA_SH2_SPIN_FORWARD)
+      /* A recording needs each block's effect to depend only on its entry
+       * state: a resident loop runs one iteration (its first back edge exits),
+       * exactly as the plain block would, instead of up to the deadline. */
+      if (UNLIKELY(spin_rec && (block->flags & BLOCK_RESIDENT_LOOP))) {
+        const u32 deadline = st->exitcount;
+        st->exitcount = 0;
+        ((dynaFunc)((void*)(block->code)))(st);
+        st->exitcount = deadline;
+      } else {
+        ((dynaFunc)((void*)(block->code)))(st);
+      }
+#else
+      ((dynaFunc)((void*)(block->code)))(st);
+#endif
+      ++returns;
+      result = 0;
+#ifdef VITA_SH2_NATIVE_DISPATCH
+#ifdef VITA_STACK_PROFILE
+      {
+        const Block *last = reinterpret_cast<const Block *>(st->chain_cur);
+        const u32 npc = st->SysReg[3];
+        const Block *next = (npc & 0xfff00000u) == 0x06000000u && !(npc & 1) ? high[(npc & 0xfffffu) >> 1] : nullptr;
+        const unsigned why = st->chain_budget == 0 ? 0 : st->SysReg[4] >= st->exitcount ? 1 :
+          (st->CtrlReg[0] & 0xF0) < st->SysReg[5] ? 2 : memcycle_ ? 3 : (last->flags & BLOCK_LOOP) ? 4 :
+          (npc & 0xfff00000u) != 0x06000000u ? 5 : !next ? 6 : 7;
+        ++g_prof_dispatch[why]; g_prof_dispatch[8] += budget - st->chain_budget;
+      }
+#endif
+#ifdef VITA_SH2_SPIN_REASONS
+      {
+        const Block *last = reinterpret_cast<const Block *>(st->chain_cur);
+        const u32 npc = st->SysReg[3];
+        const Block *next = (npc & 0xfff00000u) == 0x06000000u && !(npc & 1) ? high[(npc & 0xfffffu) >> 1] : nullptr;
+        const unsigned why = st->chain_budget == 0 ? 0 : st->SysReg[4] >= st->exitcount ? 1 :
+          (st->CtrlReg[0] & 0xF0) < st->SysReg[5] ? 2 : memcycle_ ? 3 : (last->flags & BLOCK_LOOP) ? 4 :
+          (npc & 0xfff00000u) != 0x06000000u ? 5 : !next ? 6 : 7;
+        u32 *w = g_chain_why[is_slave_ ? 1 : 0]; ++w[why]; w[8] += budget - st->chain_budget;
+      }
+#endif
+      if (const u32 chained = budget - st->chain_budget) {
+        // sh2_dispatch entered `chained` further blocks; the checks below
+        // concern the last one, exactly as if C had dispatched each.
+        returns += chained;
+        block = reinterpret_cast<Block *>(st->chain_cur);
+#ifdef VITA_SH2_SPIN_FORWARD
+        slice_dirty = true;                      // chained blocks are not inspected
+#endif
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+        idle_blocks += chained;
+#endif
+      }
+#endif
+#ifdef VITA_SH2_STACK_SPEC
+      if (UNLIKELY(st->spec_bail)) {
+        // Entry validation failed: nothing executed. Recompile without stack
+        // speculation and dispatch again, with no interrupt or loop inference.
+#ifdef VITA_STACK_PROFILE
+        { static unsigned logged; if ((logged++ & 15) == 0) { const u8 *cp = m_pCompiler->code_pages; const u32 pg = (st->GenReg[15] >> 10) & 1023;
+          YuiMsg("jit_spec_bail pc=%08x r15=%08x pages=%u%u%u op=%04x", st->spec_bail, st->GenReg[15], pg ? cp[pg - 1] : 9, cp[pg], pg < 1023 ? cp[pg + 1] : 9,
+                 MappedMemoryReadWord(st->spec_bail, NULL)); } }
+#endif
+        m_pCompiler->SpecDeny(st->spec_bail);
+        st->spec_bail = 0;
+        continue;
+      }
+#endif
+      if ((st->CtrlReg[0] & 0xF0) < st->SysReg[5]) {
+        this->CheckInterupt();
+#ifdef VITA_SH2_SPIN_FORWARD
+        slice_dirty = true;
+        if (spin_rec) { spin_rec = false; spin_candidate_ = false; ++g_prof_spin[2]; }
+#endif
+      }
+      if (block->flags & BLOCK_LOOP) {
+        const u32 now = st->SysReg[3];
+        if (now < block->e_addr && now >= block->b_addr) result = IN_INFINITY_LOOP;
+      }
+    } else if (block) {
+      native_returns = returns;                  // ExecuteBlock samples and counts
+#ifdef VITA_SH2_SPIN_FORWARD
+      spin_rec = false; slice_dirty = true;
+#endif
+#ifdef VITA_SH2_NATIVE_DISPATCH
+      st->chain_budget = 0;
+#endif
+      result = ExecuteBlock(block);
+      returns = native_returns;
+    } else {
+#ifdef VITA_SH2_SPIN_FORWARD
+      spin_rec = false; slice_dirty = true;
+#endif
+#ifdef VITA_SH2_NATIVE_DISPATCH
+      st->chain_budget = 0;
+#endif
+      result = Execute();
+    }
+#ifdef VITA_SH2_SPIN_AFFINE
+    last_selfloop_ = block && result != IN_INFINITY_LOOP && !(block->flags & BLOCK_MAY_WRITE) &&
+                     st->SysReg[3] == block->b_addr;
+#endif
+#if defined(VITA_SH2_RESIDENT_LOOPS) && defined(VITA_SH2_SPIN_FORWARD)
+    last_resident_ = block && (block->flags & BLOCK_RESIDENT_LOOP) && st->SysReg[3] == block->b_addr;
+#endif
+#ifdef VITA_STACK_PROFILE
+    if (block && result != IN_INFINITY_LOOP && st->SysReg[3] == block->b_addr) ++g_prof_selfloop[prof_cpu];
+    ++prof_blocks; ++g_prof_blocks[prof_cpu];
+    if (result == IN_INFINITY_LOOP) {
+      ++g_prof_idle_skips[prof_cpu];
+      if (prof_blocks == 1) ++g_prof_idle_first[prof_cpu];
+    }
+#endif
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+    // Two consecutive slices, each exactly one idle run with no memory cycles,
+    // no non-work-RAM read and no work-RAM write, ending in identical state:
+    // a fixed point. Anything else executed invalidates.
+#ifdef VITA_SH2_IDLE_ANY_CPU
+    // One store-free block (so this slice is clean and g_native_write_epoch
+    // stays), no I/O read or exactly one read of this CPU's FTCSR.
+    const u32 idle_io = g_mem_io_reads - idle_io0;
+#ifdef VITA_SH2_IDLE_EDSR
+#define IDLE_IO_OK() (idle_io == 0 || (idle_io == 1 && (g_mem_io_last == 0xFFFFFE11u || g_mem_io_edsr - idle_edsr0 == 1)))
+#else
+#define IDLE_IO_OK() (idle_io == 0 || (idle_io == 1 && g_mem_io_last == 0xFFFFFE11u))
+    (void)idle_edsr0;
+#endif
+#ifdef VITA_SH2_SPIN_REASONS
+    if (result == IN_INFINITY_LOOP) {
+      u32 *w = g_idle_rec[is_slave_ ? 1 : 0];
+      ++w[idle_blocks != 0 ? 0 : memcycle_ ? 1 : !block ? 2 : (block->flags & BLOCK_MAY_WRITE) ? 3 : slice_dirty ? 4 :
+          !IDLE_IO_OK() ? 5 : g_wram_epoch != idle_epoch0 ? 6 : 7];
+    }
+#endif
+#ifdef VITA_SH2_IDLE_AFFINE
+    // Memory cycles allowed: a run adds the same mc after the count jumps to
+    // the target (recorded and required equal across the two runs).
+    if (++idle_blocks == 1 && result == IN_INFINITY_LOOP && block &&
+#else
+    if (++idle_blocks == 1 && result == IN_INFINITY_LOOP && memcycle_ == 0 && block &&
+#endif
+        !(block->flags & BLOCK_MAY_WRITE) && !slice_dirty &&
+        IDLE_IO_OK() && g_wram_epoch == idle_epoch0) {
+#else
+    if (++idle_blocks == 1 && result == IN_INFINITY_LOOP && memcycle_ == 0 &&
+        g_mem_io_reads == idle_io0 && g_wram_epoch == idle_epoch0 && !yabsys.IsSSH2Running) {
+#endif
+      u32 after[23];
+      IdleRegs(st, after);
+#ifdef VITA_SH2_IDLE_ANY_CPU
+      const u32 io_addr = idle_io ? g_mem_io_last : 0, io_val = idle_io ? IdleIoValue(io_addr) : 0;
+#ifdef VITA_SH2_IDLE_AFFINE
+      const u32 idle_mc = memcycle_;
+      /* Affine: the previous run ended at idle_.regs, this one (from there,
+       * the same block at the same PC) at after; the difference is delta. */
+      bool affine = false;
+      if (idle_.cand && idle_.pc == st->SysReg[3] && idle_.io_addr == io_addr && idle_.io_val == io_val &&
+          idle_.mc == idle_mc && block->b_addr == st->SysReg[3] && memcmp(after, idle_.regs, sizeof(after))) {
+        u32 delta[16] = {};
+        bool ok = true, any = false;
+        for (int w = 0; w < 23 && ok; ++w) {
+          const u32 d = after[w] - idle_.regs[w];
+          if (d && (w == 0 || w >= 15)) ok = false;
+          if (d && w < 16) { delta[w] = d; any = true; }
+        }
+        if (ok && any && AffineOpsIndependent(block->b_addr, block->e_addr, delta)) {
+          affine = true;
+          memcpy(idle_.delta, delta, sizeof(delta));
+          memcpy(idle_.regs, after, sizeof(after));
+        }
+      }
+      if (affine) {
+        idle_.affine = true; idle_.valid = true; idle_.epoch = g_wram_epoch; idle_.native_epoch = g_native_write_epoch; ++g_idle_records;
+        IdleReadSetBuild(after);
+      } else
+#endif
+      if (idle_.cand && idle_.pc == st->SysReg[3] && !memcmp(after, idle_.regs, sizeof(after)) &&
+#ifdef VITA_SH2_IDLE_AFFINE
+          idle_.mc == idle_mc &&
+#endif
+          idle_.io_addr == io_addr && idle_.io_val == io_val) {
+        idle_.valid = true; idle_.epoch = g_wram_epoch; idle_.native_epoch = g_native_write_epoch; ++g_idle_records;
+#ifdef VITA_SH2_IDLE_AFFINE
+        idle_.affine = false;
+        IdleReadSetBuild(after);
+#endif
+      } else {
+        idle_.io_addr = io_addr; idle_.io_val = io_val;
+#ifdef VITA_SH2_IDLE_AFFINE
+        idle_.mc = idle_mc;
+#endif
+#else
+      if (idle_.cand && idle_.pc == st->SysReg[3] && !memcmp(after, idle_.regs, sizeof(after))) {
+        idle_.valid = true; idle_.epoch = g_wram_epoch; ++g_idle_records;
+      } else {
+#endif
+        idle_.valid = false; idle_.cand = true; idle_.pc = st->SysReg[3];
+        memcpy(idle_.regs, after, sizeof(after));
+      }
+    } else if (!idle_cleared) { InvalidateIdle(); idle_cleared = true; } // once per slice suffices
+#endif
+    if (result == IN_INFINITY_LOOP) {
+      slice_skip += targetcnt - st->SysReg[4];
+      st->SysReg[4] = targetcnt;
+      loopskip_cnt_++;
+    }
+    if (const u32 mc = memcycle_) {
+      slice_memory += mc;
+      st->SysReg[4] += mc;
+      memcycle_ = 0;
+    }
+#ifdef VITA_SH2_SPIN_FORWARD
+    if (spin_rec) {
+      if (result == IN_INFINITY_LOOP) {
+        spin_rec = false; spin_candidate_ = false; ++g_prof_spin[2];
+      } else if (g_wram_epoch != spin_epoch || SPIN_IO_NOW() != spin_io) {
+        spin_epoch = g_wram_epoch; spin_io = SPIN_IO_NOW();   // restart here
+        spin_n = 0; spin_off = 0; spin_restarted = true; IdleRegs(st, spin_regs_[0]); spin_count_[0] = st->SysReg[4]; SpinHash(0);
+      } else {
+        ++spin_n;
+        IdleRegs(st, spin_regs_[spin_n]); spin_count_[spin_n] = st->SysReg[4] + spin_off; SpinHash(spin_n);
+        int j = -1;
+        const u32 h_n = spin_hash_[spin_n][0];      // cheap reject first: recordings grow to kSpinRecMax
+        for (unsigned i = 0; i < spin_n; ++i)
+          if (spin_hash_[i][0] == h_n && !memcmp(spin_regs_[i], spin_regs_[spin_n], sizeof(spin_regs_[0]))) { j = int(i); break; }
+        bool affine = false;
+#ifdef VITA_SH2_SPIN_AFFINE
+        if (j < 0 && spin_n >= 2) { j = SpinAffineDetect(spin_n); affine = j >= 0; }
+#endif
+        if (j >= 0) {
+          // Blocks j+1..spin_n repeat forever; state after block q is
+          // spin_regs_[q]; spin_n is equivalent to j. Step exactly as the
+          // loop would: run a block while count < target.
+          spin_rec = false;
+          spin_affine_ = affine;
+          if (!affine) memset(spin_delta_, 0, sizeof(spin_delta_));
+          u32 count = st->SysReg[4];
+          unsigned q = unsigned(j);
+          u32 m = affine ? 1u : 0u;                                    // state spin_n = state j + delta
+          if (count < targetcnt) {
+            const u32 cycle = spin_count_[spin_n] - spin_count_[j];     // > 0
+            const u32 periods = (targetcnt - count - 1) / cycle;
+            count += periods * cycle;
+            m += periods;
+            while (count < targetcnt) {
+              count += spin_count_[q + 1] - spin_count_[q];
+              if (++q == spin_n) { q = unsigned(j); ++m; }
+            }
+#ifdef VITA_SH2_SPIN_VERIFY
+            spin_pred = true; spin_pred_count = count;
+            memcpy(spin_pred_regs, spin_regs_[q], sizeof(spin_pred_regs));
+            for (int w = 0; w < 16; ++w) spin_pred_regs[w] += m * spin_delta_[w];
+            spin_proof_ = {true, unsigned(j), spin_n, st->SysReg[5], g_wram_epoch, g_native_write_epoch, q, ~0u, 0,
+#ifdef VITA_SH2_SPIN_FTCSR
+                           g_mem_io_ftcsr != spin_ftcsr_reads, spin_ftcsr_val};
+#else
+                           false, 0};
+#endif
+            SpinReadSetBuild(unsigned(j), spin_n);
+            SpinProofRange();
+#ifdef VITA_SH2_SPIN_PENDING_MASK
+            { u32 lo = 0xF0; for (unsigned w = unsigned(j); w <= spin_n; ++w) { const u32 m = spin_regs_[w][16] & 0xF0; if (m < lo) lo = m; }
+              spin_proof_.pending = lo; }
+#endif
+#else
+            g_prof_spin[1] += count - st->SysReg[4];
+            ++g_prof_spin[0];
+            const u32 *r = spin_regs_[q];
+            memcpy(st->GenReg, r, 16 * 4); memcpy(st->CtrlReg, r + 16, 3 * 4); memcpy(st->SysReg, r + 19, 4 * 4);
+            for (int w = 0; w < 16; ++w) st->GenReg[w] += m * spin_delta_[w];
+            st->SysReg[4] = count;
+            spin_forwarded = true;
+            spin_proof_ = {true, unsigned(j), spin_n, st->SysReg[5], g_wram_epoch, g_native_write_epoch, q, ~0u, 0,
+#ifdef VITA_SH2_SPIN_FTCSR
+                           g_mem_io_ftcsr != spin_ftcsr_reads, spin_ftcsr_val};
+#else
+                           false, 0};
+#endif
+            SpinReadSetBuild(unsigned(j), spin_n);
+            SpinProofRange();
+#ifdef VITA_SH2_SPIN_PENDING_MASK
+            { u32 lo = 0xF0; for (unsigned w = unsigned(j); w <= spin_n; ++w) { const u32 m = spin_regs_[w][16] & 0xF0; if (m < lo) lo = m; }
+              spin_proof_.pending = lo; }
+#endif
+            DIAG_SLICE(4);
+#endif
+          }
+        } else if (spin_n == kSpinRecMax) {
+          spin_rec = false; spin_candidate_ = false; spin_cooldown_ = 64; ++g_prof_spin[3];
+        }
+      }
+    }
+#endif
+  }
+#ifdef VITA_STACK_PROFILE
+  StackPhase sp_tail(VT_SH2_SLICE_TAIL);
+#endif
+#ifdef VITA_SH2_SPIN_FORWARD
+#ifdef VITA_SH2_SPIN_VERIFY
+  if (spin_pred) {
+    u32 now[23]; IdleRegs(st, now);
+    ++g_spin_verify[(!memcmp(now, spin_pred_regs, sizeof(now)) && st->SysReg[4] == spin_pred_count) ? 0 : 1];
+    spin_forwarded = true;
+  }
+#endif
+  if (slice_dirty) ++g_native_write_epoch;
+  /* A recording that did not end in a forward (aborted, or the slice ended
+   * first): back off exponentially so loops that can never be proven (e.g.
+   * polling on-chip I/O) do not run unchained every slice. Detection only. */
+#ifdef VITA_SH2_SPIN_REASONS
+  { u32 *w = g_spin_rec[is_slave_ ? 1 : 0]; ++w[0];
+    if (spin_rec_started) ++w[spin_forwarded ? 2 : 3], ++w[1]; }
+#endif
+#ifdef VITA_SH2_SPIN_CARRY
+  /* Still recording at the slice end (no proof, abort or overflow yet), with
+   * no FTCSR read (its value is only held within one slice) and no restart
+   * in this slice (I/O polls restart on every read): leave the recording
+   * open for the next slice, a few slices at most -- a recording that proves
+   * nothing costs unchained execution, so it then fails and backs off. */
+  if (spin_rec && !spin_forwarded && spin_n && !spin_restarted && spin_carry_slices_ < 4 &&
+      g_mem_io_ftcsr == spin_ftcsr_reads && SPIN_IO_NOW() == spin_io && g_wram_epoch == spin_epoch) {
+    ++spin_carry_slices_;
+    spin_carry_ = true; spin_carry_n_ = spin_n;
+    spin_carry_wram_ = g_wram_epoch; spin_carry_native_ = g_native_write_epoch; spin_carry_pending_ = st->SysReg[5];
+    spin_carry_rs_ = SpinReadSetBuild(0, spin_n);  // blocks run from recorded states 0..spin_n-1
+    spin_rec_started = false;                  // not a failure yet
+  } else spin_carry_slices_ = 0;
+#endif
+  if (spin_rec_started && !spin_forwarded) {
+    spin_candidate_ = false;
+    spin_cooldown_ = 4u << (spin_fails_ < 7 ? spin_fails_ : 7);
+    if (spin_fails_ < 7) ++spin_fails_;
+  } else if (spin_forwarded) spin_fails_ = 0;
+  if (spin_forwarded) spin_candidate_ = true;           // likely still spinning
+  else {
+    // Candidate: this slice ended in a complete state seen at a recent
+    // slice end (same PC) -- the signature of a spin loop.
+    // Detection only (a match starts a recording; forwarding needs its own
+    // proof), so the hash just has to be cheap: four independent rotate-xor
+    // lanes over the IdleRegs words, which are the first 23 words of tagSH2
+    // (no multiplies; any single differing word changes the hash).
+    const u32 *r = reinterpret_cast<const u32 *>(st);
+    u32 h0 = r[0], h1 = r[1], h2 = r[2], h3 = r[3];
+    for (unsigned i = 4; i < 20; i += 4) {
+      h0 = (h0 << 5 | h0 >> 27) ^ r[i]; h1 = (h1 << 5 | h1 >> 27) ^ r[i + 1];
+      h2 = (h2 << 5 | h2 >> 27) ^ r[i + 2]; h3 = (h3 << 5 | h3 >> 27) ^ r[i + 3];
+    }
+    h0 = (h0 << 5 | h0 >> 27) ^ r[20]; h1 = (h1 << 5 | h1 >> 27) ^ r[21]; h2 = (h2 << 5 | h2 >> 27) ^ r[22];
+    const u32 h = h0 ^ (h1 << 8 | h1 >> 24) ^ (h2 << 16 | h2 >> 16) ^ (h3 << 24 | h3 >> 8);
+    const u32 pc = st->SysReg[3];
+    for (unsigned i = 0; i < 4; ++i)
+      if (spin_end_pc_[i] == pc && spin_end_hash_[i] == h) spin_candidate_ = true;
+    spin_end_pc_[spin_end_next_] = pc; spin_end_hash_[spin_end_next_] = h;
+    spin_end_next_ = (spin_end_next_ + 1) & 3;
+#ifdef VITA_SH2_RESIDENT_LOOPS
+    // A slice that ended inside a resident (register-only) loop: typically a
+    // delay loop inside a longer wait; record it (the proof decides).
+    if (last_resident_) spin_candidate_ = true;
+#endif
+#ifdef VITA_SH2_SPIN_AFFINE
+    // A store-free block looping to itself (not an exact repeat when it
+    // counts): record it; the affine detector decides. Only loops that read
+    // this CPU's FTCSR, which natively take the I/O read path each pass: a
+    // counting loop over work RAM chains natively and forwarding one slice
+    // of it costs more than running it (Daytona's load meter).
+#ifdef VITA_SH2_SPIN_FTCSR
+#ifdef VITA_SH2_SPIN_SELFLOOP
+    if (last_selfloop_) spin_candidate_ = true;
+#else
+    if (last_selfloop_ && g_mem_io_ftcsr != spin_ftcsr_reads) spin_candidate_ = true;
+#endif
+#else
+    if (last_selfloop_) spin_candidate_ = true;
+#endif
+#endif
+  }
+#endif
+  native_returns = returns;
+#ifdef VITA_SH2_SPIN_REASONS
+  { const u32 lo = LoopRange(0), hi = LoopRange(1), pc1 = st->SysReg[3];
+    u32 *c = g_loop_slices[is_slave_ ? 1 : 0]; ++c[1];
+    if (loop_pc0 >= lo && loop_pc0 < hi && pc1 >= lo && pc1 < hi) ++c[0]; }
+#endif
+#ifdef VITA_DIAG_TIMERS
+  { vita_diag_exec_us[is_slave_ ? 1 : 0] += sceKernelGetProcessTimeWide() - diag_exec0;
+    ++vita_diag_exec_n[is_slave_ ? 1 : 0]; }
+#endif
+#ifdef VITA_SH2_NATIVE_DISPATCH
+  st->chain_budget = 0;  // other entry paths return plainly
+#endif
+  CurrentSH2->cycles = st->SysReg[4];
+  counted_slice_active_ = false;
+  pre_exe_count_ = st->SysReg[4] - targetcnt;
+  native_cycles += st->SysReg[4] - slice_memory - slice_skip;
+}
+#endif
 void DynarecSh2::ExecuteCount( u32 Count ) {
 #ifdef VITA_SH2_LEAN_DISPATCH
   // The debug body stays out of line: its frame is not paid on every slice.
@@ -3144,8 +4414,21 @@ bool operator == (const dIntcTbl & data1 , const dIntcTbl & data2 )
   return ( data1.Vector == data2.Vector );
 }
 
+#ifdef VITA_SH2_INTC_SPINLOCK
+#include <atomic>
+/* The pending-interrupt tables are touched by the emulation thread and, for
+ * sound requests, the sound thread; holds are a few list operations, so a
+ * spinlock gives the same exclusion without a kernel mutex call per add,
+ * remove and acceptance. */
+static std::atomic_flag g_intc_lock = ATOMIC_FLAG_INIT;
+static inline void IntcLock(YabMutex *) { while (g_intc_lock.test_and_set(std::memory_order_acquire)) {} }
+static inline void IntcUnlock(YabMutex *) { g_intc_lock.clear(std::memory_order_release); }
+#else
+static inline void IntcLock(YabMutex *m) { YabThreadLock(m); }
+static inline void IntcUnlock(YabMutex *m) { YabThreadUnLock(m); }
+#endif
 void DynarecSh2::RemoveInterrupt(u8 Vector, u8 level) {
-  YabThreadLock(mtx_);
+  IntcLock(mtx_);
   m_IntruptTbl.remove_if([&](const dIntcTbl & n) { 
     return n.Vector == Vector; 
   });
@@ -3156,7 +4439,7 @@ void DynarecSh2::RemoveInterrupt(u8 Vector, u8 level) {
   else {
     m_pDynaSh2->SysReg[5] = 0x0000;
   }
-  YabThreadUnLock(mtx_);
+  IntcUnlock(mtx_);
 }
 
 void DynarecSh2::AddInterrupt( u8 Vector, u8 level )
@@ -3171,7 +4454,7 @@ void DynarecSh2::AddInterrupt( u8 Vector, u8 level )
   tmp.Vector = Vector;
   tmp.level  = level;
 
-  YabThreadLock(mtx_);
+  IntcLock(mtx_);
   m_bIntruptSort = false;
   m_IntruptTbl.push_back(tmp);
   if( m_IntruptTbl.size() > 1 ) {
@@ -3180,7 +4463,7 @@ void DynarecSh2::AddInterrupt( u8 Vector, u8 level )
   }
   m_bIntruptSort = true;
   m_pDynaSh2->SysReg[5] = m_IntruptTbl.begin()->level<<4;
-  YabThreadUnLock(mtx_);
+  IntcUnlock(mtx_);
 }
 
 
@@ -3194,7 +4477,7 @@ int DynarecSh2::CheckInterupt(){
 
   
     
-  YabThreadLock(mtx_);  
+  IntcLock(mtx_);  
   dlstIntct::iterator pos = m_IntruptTbl.begin();
   if( InterruptRutine((*pos).Vector, (*pos).level ) != 0 ) {
     m_IntruptTbl.pop_front();
@@ -3203,10 +4486,10 @@ int DynarecSh2::CheckInterupt(){
     }else{
       m_pDynaSh2->SysReg[5] = 0x0000;
     }
-    YabThreadUnLock(mtx_);
+    IntcUnlock(mtx_);
     return 1;
   }
-  YabThreadUnLock(mtx_);
+  IntcUnlock(mtx_);
   return 0;
 }
 

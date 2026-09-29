@@ -795,6 +795,10 @@ u16 memGetWord(u32 addr)
     return val;
     break;
   }
+  VITA_IO_READ(addr);
+#ifdef VITA_SH2_IDLE_EDSR
+  if ((addr & 0xDFFFFFFFu) == 0x05D00010u) ++g_mem_io_edsr;  // VDP1 EDSR word: pure register read (idle skip)
+#endif
 #ifdef VITA_SH2_DATA_ARRAY_DIRECT
   if ((addr >> 29) == 6) return T2ReadWord(CurrentSH2->DataArray, addr & 0xFFF);
 #endif

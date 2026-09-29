@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <random>
 #include <sys/mman.h>
 
@@ -30,6 +31,19 @@ static void Reference(uint16_t op, uint32_t *r, uint32_t pc = 0) {
   if ((op & 0xf00f) == 0x0007) { r[20] = uint32_t(uint64_t(r[n]) * r[m]); return; }
   if ((op & 0xf0ff) == 0x000a) { r[n] = r[19]; return; }
   if ((op & 0xf0ff) == 0x001a) { r[n] = r[20]; return; }
+  // Other MACH/MACL operations, as their baseline templates compute them.
+  if (op == 0x0028) { r[19] = r[20] = 0; return; }
+  if ((op & 0xf0ff) == 0x400a) { r[19] = r[n]; return; }
+  if ((op & 0xf0ff) == 0x401a) { r[20] = r[n]; return; }
+  if ((op & 0xf00f) == 0x200d) { r[n] = (r[m] << 16) | (r[n] >> 16); return; }
+  if ((op & 0xf00f) == 0x300d || (op & 0xf00f) == 0x3005) {
+    const uint64_t p = (op & 8) ? uint64_t(int64_t(int32_t(r[n])) * int32_t(r[m]))
+                                : uint64_t(r[n]) * r[m];
+    r[19] = uint32_t(p >> 32); r[20] = uint32_t(p);
+    return;
+  }
+  if ((op & 0xf00f) == 0x200f) { r[20] = uint32_t(int32_t(int16_t(r[n])) * int16_t(r[m])); return; }
+  if ((op & 0xf00f) == 0x200e) { r[20] = (r[n] & 0xffff) * (r[m] & 0xffff); return; }
   if ((op & 0xf00f) == 0x300e || (op & 0xf00f) == 0x300a) {
     const auto pc = r[22], cycles = r[23];
     sh2_carry_oracle(r, op);
@@ -74,6 +88,9 @@ static void Reference(uint16_t op, uint32_t *r, uint32_t pc = 0) {
   if (op == 9) return;
   if ((op >> 12) == 0xe) { r[n] = int8_t(op); return; }
   if ((op >> 12) == 7) { r[n] += int8_t(op); return; }
+  if ((op & 0xf0ff) == 0x4000 || (op & 0xf0ff) == 0x4020) { t(r[n] >> 31); r[n] <<= 1; return; }
+  if ((op & 0xf0ff) == 0x4001) { t(r[n] & 1); r[n] >>= 1; return; }
+  if ((op & 0xf0ff) == 0x4021) { t(r[n] & 1); r[n] = uint32_t(int32_t(r[n]) >> 1); return; }
   if ((op & 0xf000) == 0x4000) {
     unsigned shift = (op & 0x30) == 0 ? 2 : (op & 0x30) == 0x10 ? 8 : 16;
     r[n] = (op & 1) ? r[n] >> shift : r[n] << shift;
@@ -109,7 +126,8 @@ int main() {
   for (unsigned op = 0; op < 65536; ++op)
     if (sh2a9::RegisterRegion::Supports(op)) supported.push_back(op);
   unsigned cases = 0;
-  auto test = [&](const std::vector<uint16_t>& ops, bool boundaries, unsigned edge = 0, uint32_t pc = 0) {
+  auto test = [&](const std::vector<uint16_t>& ops, bool boundaries, unsigned edge = 0, uint32_t pc = 0,
+                  const std::function<void(uint32_t *)> &setup = {}) {
     // Extra words include SR: predicates/ROTCL change T, DIV1 changes Q/T.
     uint32_t actual[32], expected[32];
     for (auto &r : actual) r = random();
@@ -118,6 +136,7 @@ int main() {
       for (unsigned i = 0; i < 16; ++i) actual[i] = values[(i + edge) & 3];
     }
     if (pc) actual[22]=pc;
+    if (setup) setup(actual);
     std::memcpy(expected, actual, sizeof(actual));
     sh2a9::RegisterRegion region(reinterpret_cast<uint32_t>(low_ram.data()),
                                reinterpret_cast<uint32_t>(high_ram.data()));
@@ -137,13 +156,13 @@ int main() {
     region.Finish();
     expected[22] += unsigned(ops.size()) * 2;
     expected[23] += unsigned(ops.size());
-    for (auto op : ops) if ((op & 0xf00f) == 0x0007) expected[23] += 3;
-    std::vector<uint32_t> function = {0xe92d47f0u, 0xe1a07000u,
+    for (auto op : ops) expected[23] += sh2a9::RegisterRegion::Cycles(op) - 1;
+    std::vector<uint32_t> function = {0xe92d4ff8u, 0xe1a07000u,
       0xe5978058u, 0xe597905cu}; // save r4-r10/lr; r7=state; load PC/cycles
     function.insert(function.end(), region.code.begin(), region.code.end());
     function.push_back(0xe5878058u);
     function.push_back(0xe587905cu);
-    function.push_back(0xe8bd87f0u); // restore r4-r10/pc, ARM/Thumb interworking
+    function.push_back(0xe8bd8ff8u); // restore r4-r10/pc, ARM/Thumb interworking
     assert(function.size() * 4 <= capacity);
     std::memcpy(memory, function.data(), function.size() * 4);
     __builtin___clear_cache(reinterpret_cast<char *>(memory),
@@ -176,7 +195,7 @@ int main() {
       for (auto op : ops) { Reference(op, expected, guest_pc); if(pc) guest_pc+=2; }
       expected[22] += unsigned(ops.size()) * 2;
       expected[23] += unsigned(ops.size());
-      for (auto op : ops) if ((op & 0xf00f) == 0x0007) expected[23] += 3;
+      for (auto op : ops) expected[23] += sh2a9::RegisterRegion::Cycles(op) - 1;
       reinterpret_cast<void (*)(uint32_t *)>(memory)(actual);
       assert(std::memcmp(actual, expected, sizeof(actual)) == 0);
     }
@@ -230,6 +249,24 @@ int main() {
       ops.push_back(uint16_t(0x0007 | m << 8 | n << 4));
       ops.push_back(uint16_t(0x001a | m << 8));
       ops.push_back(uint16_t(0x000a | n << 8));
+      for (unsigned edge = 0; edge < 5; ++edge) {
+        test(ops, false, edge);
+        test(ops, true, edge);
+      }
+    }
+  // MACH/MACL chains as in matrix code: CLRMAC constants, 64-bit products,
+  // LDS/STS copies and XTRCT readback, under 16-GPR pressure and flushes.
+  for (unsigned m = 0; m < 16; ++m)
+    for (unsigned n = 0; n < 16; ++n) {
+      const unsigned k = (n + 3) & 15;
+      std::vector<uint16_t> ops{0x0028, uint16_t(0x000a | k << 8), uint16_t(0x300d | n << 8 | m << 4)};
+      for (unsigned r = 0; r < 16; ++r) ops.push_back(uint16_t(0x7001 | r << 8));
+      ops.insert(ops.end(), {uint16_t(0x000a | n << 8), uint16_t(0x001a | m << 8),
+                             uint16_t(0x200d | m << 8 | n << 4), uint16_t(0x3005 | m << 8 | n << 4),
+                             uint16_t(0x200f | n << 8 | m << 4), uint16_t(0x001a | k << 8),
+                             uint16_t(0x200e | m << 8 | k << 4), uint16_t(0x400a | n << 8),
+                             uint16_t(0x401a | m << 8), 0x0028, uint16_t(0x001a | n << 8),
+                             uint16_t(0x200d | n << 8 | n << 4), uint16_t(0x000a | m << 8)});
       for (unsigned edge = 0; edge < 5; ++edge) {
         test(ops, false, edge);
         test(ops, true, edge);
@@ -346,7 +383,9 @@ int main() {
     sr_loads += word == 0xe597a040u;
     sr_stores += word == 0xe587a040u;
   }
+  // A DIV1 chain's fast path keeps SR; only its cold generic path reloads it.
   assert(sr_loads == 1 && sr_stores == 1);
+  std::printf("A9 DIV1 x32: %zu words including flush\n", division_flags.code.size());
   for (uint16_t op : {uint16_t(0x310e), uint16_t(0x310a)}) {
     sh2a9::RegisterRegion carry;
     for (unsigned i = 0; i < 32; ++i) assert(carry.Emit(op));
@@ -382,6 +421,52 @@ int main() {
         for (unsigned edge = 0; edge < 5; ++edge) test(wide_division, false, edge);
       }
     }
+  // DIV1 chains: random ROTCL/DIV1 mixes (any M/Q/T, aliased operands),
+  // interrupted by other T writers, including the udivsi3 shape (after DIV0U).
+  for (unsigned run = 0; run < 4000; ++run) {
+    std::vector<uint16_t> ops;
+    const unsigned q = random() & 15, n = random() & 15, m = random() & 15;
+    if (run & 1) {
+      for (unsigned i = 0, k = random() % 40; i < k; ++i) {
+        ops.push_back(0x4024 | (q << 8));
+        ops.push_back(0x3004 | (n << 8) | (m << 4));
+      }
+      if (random() & 1) ops.push_back(0x4024 | (q << 8));
+    } else {
+      for (unsigned i = 0, k = 1 + random() % 70; i < k; ++i) {
+        const unsigned c = random() % 16;
+        const unsigned a = random() & 15, b = random() & 15;
+        ops.push_back(c < 7 ? uint16_t(0x3004 | (n << 8) | (m << 4)) :
+                      c < 11 ? uint16_t(0x4024 | (q << 8)) :
+                      c == 11 ? uint16_t(0x3004 | (a << 8) | (b << 4)) :
+                      c == 12 ? uint16_t(0x300e | (a << 8) | (b << 4)) :  // ADDC
+                      c == 13 ? uint16_t(0x0008 | ((random() & 1) << 4)) : // CLRT/SETT
+                      c == 14 ? uint16_t(0x4000 | (a << 8) | ((random() & 1) << 5)) : // SHLL/SHLR
+                      supported[random() % supported.size()]);
+      }
+    }
+    for (unsigned edge = 0; edge < 5; edge += 2) test(ops, run & 2, edge);
+  }
+  // DIV1 chains whose operands take the M=0 in-range path (1 <= Rm <= 2^31,
+  // -Rm <= Rn < Rm), including the bounds, over more than 32 ROTCLs.
+  for (unsigned run = 0; run < 4000; ++run) {
+    std::vector<uint16_t> ops;
+    unsigned q = random() & 15, n = random() & 15, m = random() & 15;
+    while (m == n) m = random() & 15;
+    while (q == n || q == m) q = random() & 15;
+    if (random() & 1) ops.push_back(0x4024 | (q << 8));
+    for (unsigned i = 0, k = 1 + random() % 40; i < k; ++i) {
+      ops.push_back(0x3004 | (n << 8) | (m << 4));
+      if (random() % 8) ops.push_back(0x4024 | (q << 8));
+    }
+    const uint32_t d = run % 5 == 0 ? 0x80000000u : run % 5 == 1 ? 1 : 1 + random() % 0x80000000u;
+    const uint32_t kind = random() % 4;
+    const uint32_t p = kind == 0 ? -d : kind == 1 ? d - 1 : uint32_t(-int64_t(d) + int64_t(random() % (2ull * d)));
+    test(ops, run & 2, 0, 0, [&](uint32_t *state) {
+      state[m] = d; state[n] = p;
+      state[16] &= ~0x200u;                      // M = 0; Q/T random
+    });
+  }
   unsigned loop_cases = 0;
   unsigned interpreter_cases = 0;
   auto loop_test = [&](const std::vector<uint16_t>& body, bool bt) {
@@ -432,10 +517,10 @@ int main() {
       assert(std::memcmp(oracle, expected, sizeof(oracle)) == 0);
       ++interpreter_cases;
     }
-    std::vector<uint32_t> function = {0xe92d47f0u, 0xe1a07000u,
+    std::vector<uint32_t> function = {0xe92d4ff8u, 0xe1a07000u,
       0xe5978058u, 0xe597905cu};
     function.insert(function.end(), code.begin(), code.end());
-    function.insert(function.end(), {0xe5878058u, 0xe587905cu, 0xe8bd87f0u});
+    function.insert(function.end(), {0xe5878058u, 0xe587905cu, 0xe8bd8ff8u});
     assert(function.size() * 4 <= capacity);
     std::memcpy(memory, function.data(), function.size() * 4);
     __builtin___clear_cache(reinterpret_cast<char *>(memory),
@@ -447,8 +532,7 @@ int main() {
   std::vector<uint16_t> loop_supported;
   for (auto op : supported) {
     if (sh2a9::RegisterRegion::IsDivisionStep(op) ||
-        (op & 0xf00f) == 0x0007 || (op & 0xf0ff) == 0x000a ||
-        (op & 0xf0ff) == 0x001a) {
+        sh2a9::RegisterRegion::IsMacOperation(op)) {
       assert(sh2a9::RegisterRegion::ResidentLoop({op}, 0x8bfd).empty());
       continue;
     }

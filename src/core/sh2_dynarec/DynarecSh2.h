@@ -348,7 +348,14 @@ public:
   // LookupParentTable in that KiB, cleared only with the whole table. A zero
   // entry proves every setDirty in the KiB is a no-op (guarded region stores).
   u8 code_pages[1024] = {};
+#ifdef VITA_SH2_CODE_LINES
+  // The same, one byte per 16 bytes: guarded region stores test this, so a
+  // data table beside code does not send every store to the helper.
+  u8 code_lines[0x100000 >> 4] = {};
+  void MarkCode(u32 keep) { code_pages[keep >> 9] = 1; code_lines[keep >> 3] = 1; }
+#else
   void MarkCode(u32 keep) { code_pages[keep >> 9] = 1; }
+#endif
   // Dispatch indexes the full 1 MiB ROM address window, including mirrors.
   // Do not collapse aliases: block metadata contains the original guest PC.
   Block* LookupTableRom[0x100000>>1];
