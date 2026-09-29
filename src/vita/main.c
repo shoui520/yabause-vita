@@ -170,9 +170,9 @@ extern int VitaGxmProbe(void);
 #ifdef VITA_SH2_DYNAREC
 extern int VitaSh2CodeSmokeTest(void);
 extern int VitaSh2CompilerTest(void);
-extern int VitaC68kReadTest(void);
 extern void VitaSh2ReportExecution(void);
 #endif
+extern int VitaC68kReadTest(void);
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 void YuiMsg(const char *fmt, ...) {

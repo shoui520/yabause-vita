@@ -40,6 +40,17 @@ extern "C" {
 #include "a9_register_region.h"
 #include "a9_ram_load.h"
 #include "cached_dispatch.h"
+static_assert(offsetof(tagSH2, GenReg) == 0 && offsetof(tagSH2, CtrlReg) == 64 && offsetof(tagSH2, SysReg) == 76,
+              "IdleRegs order = first 23 words of tagSH2");
+static_assert(offsetof(tagSH2, exitcount) == 128 && offsetof(tagSH2, spec_bail) == 132 &&
+              offsetof(tagSH2, spec_high) == 136 && offsetof(tagSH2, spec_pages) == 140 &&
+              offsetof(tagSH2, dispatch) == 144 && offsetof(tagSH2, chain_budget) == 148 &&
+              offsetof(tagSH2, chain_table) == 152 && offsetof(tagSH2, chain_cur) == 156 &&
+              offsetof(tagSH2, memcycle) == 160 && offsetof(tagSH2, macw_saturate) == 164 &&
+              offsetof(tagSH2, macl_saturate) == 168,
+              "offsets used by generated code and dynalib_arm.s");
+static_assert(offsetof(Block, code) == 0 && offsetof(Block, b_addr) == 4 && offsetof(Block, flags) == 16 &&
+              offsetof(Block, link_pc) == 28 && BLOCK_LOOP == 1, "Block layout used by sh2_dispatch and link stubs");
 #ifdef VITA_SH2_NATIVE_CHAIN
 #include "chain_runner.h"
 static_assert(offsetof(Block, code) == 0 && offsetof(Block, flags) == 16,
@@ -65,7 +76,14 @@ CompileBlocks * CompileBlocks::instance_ = NULL;
 DynarecSh2 * DynarecSh2::CurrentContext = NULL;
 // Single emulation-thread counters: count actual native returns, not selection
 // of this backend. Time only one in 1024 calls to limit instrumentation cost.
+#ifdef VITA_SH2_LEAN_STATS
+// Reports reset both every window (~1.2M returns, ~15M cycles), so 32 bits
+// are exact. native_cycles is accumulated once per ExecuteCount slice.
+static u32 native_returns, native_cycles;
+static u64 native_sample_us, native_samples;
+#else
 static u64 native_returns, native_cycles, native_sample_us, native_samples;
+#endif
 // The internal totals retain a common sampling cadence. Reports subtract the
 // semantic steps so they are never misrepresented as generated-code execution.
 static u64 poll_step_calls, poll_step_cycles, poll_step_samples, poll_step_us;
@@ -869,6 +887,8 @@ x86op_desc asm_list[] =
 void CompileBlocks::Init()
 {
   self_modify_block.clear();
+  smc_slot_.assign(NUMOFBLOCKS, SmcVariant());
+  smc_pcs_.clear();
   if (LookupParentTable) {
     for (unsigned i = 0; i < (0x100000 >> 1); ++i) LookupParentTable[i].clear();
   }
@@ -879,7 +899,67 @@ void CompileBlocks::Init()
   memset((void*)dCode, 0, sizeof(Block)*NUMOFBLOCKS);
   unsigned char *code_base = VitaSh2CodeArena();
   for (unsigned i = 0; i < NUMOFBLOCKS; ++i)
-    dCode[i].code = code_base + i * MAXBLOCKSIZE;
+    dCode[i].code = code_base + i * vitacode::Layout::Stride;
+  code_off_.assign(NUMOFBLOCKS, 0);
+  code_bytes_.assign(NUMOFBLOCKS, 0);
+  code_page_slots_.assign(vitacode::Layout::Sh2 >> 12, {});
+  code_cursor_ = 0;
+  if (!link_out) {
+    link_out = static_cast<LinkExit (*)[2]>(calloc(NUMOFBLOCKS, sizeof(*link_out)));
+    if (!link_out) throw std::bad_alloc();
+  }
+  memset((void*)link_out, 0, sizeof(*link_out) * NUMOFBLOCKS);
+  link_in.clear();
+#if defined(VITA_SH2_ARENA_DISPATCH)
+  if (!arena_dispatch) {
+    // Blocks reach this copy with a direct B (predicted) instead of
+    // ldr pc,[r7,#144]; tagSH2::dispatch is then unused by compiled code.
+    const size_t bytes = reinterpret_cast<uintptr_t>(&sh2_dispatch_end) - reinterpret_cast<uintptr_t>(&sh2_dispatch);
+    if (bytes > vitacode::Layout::Stubs) throw std::bad_alloc();
+    arena_dispatch = code_base + vitacode::Layout::StubOffset;
+    VitaSh2CodeWrite write(arena_dispatch, bytes);
+    memcpy(arena_dispatch, reinterpret_cast<const void *>(&sh2_dispatch), bytes);
+  }
+#endif
+#ifdef VITA_SH2_LINK
+  if (!link_check) {
+    // Called by linked exits (BL): the checks of sh2_dispatch before its
+    // lookup, in the same order, leaving r0 and ip untouched, except the
+    // BLOCK_LOOP test: only non-loop blocks link their exits, and with a
+    // nonzero budget chain_cur is always the block running. Returns with
+    // r1 = the decremented chain budget when the next block may be entered,
+    // otherwise continues into the dispatcher (which then returns to C)
+    // through BX LR: that consumes the return-stack entry of the BL, so the
+    // dispatcher's return to C and the C returns after it stay predicted.
+    static const u32 check[] = {
+      0xe5971094u,  // ldr   r1,[r7,#148]  chain_budget
+      0xe5972080u,  // ldr   r2,[r7,#128]  exitcount
+      0xe2511001u,  // subs  r1,r1,#1
+      0x3a000009u,  // blo   exit          budget was 0
+      0xe1590002u,  // cmp   r9,r2
+      0x2a000007u,  // bhs   exit          count reached
+      0xe5972040u,  // ldr   r2,[r7,#64]   SR
+      0xe5973060u,  // ldr   r3,[r7,#96]   pending interrupt level
+      0xe20220f0u,  // and   r2,r2,#0xF0
+      0xe1520003u,  // cmp   r2,r3
+      0x3a000002u,  // blo   exit          interrupt acceptable
+      0xe59720a0u,  // ldr   r2,[r7,#160]  memcycle_
+      0xe3520000u,  // cmp   r2,#0
+      0x012fff1eu,  // bxeq  lr            no memory cycles to account
+      0xe597e090u,  // exit: ldr lr,[r7,#144]
+      0xe12fff1eu,  // bx    lr
+    };
+    static_assert(sizeof(check) <= vitacode::Layout::Stubs, "link check fits the stub area");
+    size_t at = 0;
+#if defined(VITA_SH2_ARENA_DISPATCH)
+    at = (size_t(reinterpret_cast<uintptr_t>(&sh2_dispatch_end) - reinterpret_cast<uintptr_t>(&sh2_dispatch)) + 31) & ~size_t(31);
+#endif
+    if (at + sizeof(check) > vitacode::Layout::Stubs) throw std::bad_alloc();
+    link_check = code_base + vitacode::Layout::StubOffset + at;
+    VitaSh2CodeWrite write(link_check, sizeof(check));
+    memcpy(link_check, check, sizeof(check));
+  }
+#endif
 
   memset(LookupTable, 0, sizeof(LookupTable));
   memset(LookupTableRom, 0, sizeof(LookupTableRom));
@@ -938,6 +1018,98 @@ void CompileBlocks::InvalidateLow(u32 address, u32 length) {
   }
 }
 
+/* Retire the block in a slot: remove it from every table that can return it. */
+void CompileBlocks::EvictSlot(int slot) {
+  if (g_CompleBlock[slot].b_addr != 0x00) {
+    Block *old = &g_CompleBlock[slot];
+    if ((old->b_addr & 0x0ff00000) == 0x00200000) {
+      for (auto &page : low_code_pages) {
+        for (auto it = page.begin(); it != page.end(); ) {
+          if (*it == old) it = page.erase(it); else ++it;
+        }
+      }
+    }
+    
+    if ((g_CompleBlock[slot].b_addr & 0xFF000000) == 0xC0000000) {
+      // A recycled code slot may have entries for either CPU or an alias.
+      for (auto it = LookupTableC.begin(); it != LookupTableC.end(); ) {
+        if (it->second == &g_CompleBlock[slot]) it = LookupTableC.erase(it);
+        else ++it;
+      }
+    }
+    else {
+      switch (g_CompleBlock[slot].b_addr & 0x0FF00000) {
+      case 0x00000000:
+        if (yabsys.emulatebios) {
+          //return NULL; do nothing
+        }
+        else {
+          LookupTableRom[(g_CompleBlock[slot].b_addr & 0x000FFFFF) >> 1] = NULL;
+        }
+        break;
+      case 0x00200000:
+        LookupTableLow[(g_CompleBlock[slot].b_addr & 0x000FFFFF) >> 1] = NULL;
+        break;
+      case 0x06000000:
+        /*case 0x06100000:*/
+#ifdef VITA_SH2_SMC_VARIANTS
+        // An unpublished variant slot may share its PC with the published one.
+        if (LookupTable[(g_CompleBlock[slot].b_addr & 0x000FFFFF) >> 1] != &g_CompleBlock[slot])
+          break;
+#endif
+        SetHigh((g_CompleBlock[slot].b_addr & 0x000FFFFF) >> 1, NULL);
+        //LOG("%d, %08X is removed due to overflow", blockCount, g_CompleBlock[slot].b_addr);
+        break;
+      default:
+        break;
+      }
+    }
+  }
+  UnlinkSlot(slot);
+  g_CompleBlock[slot].link_pc = 0;
+}
+
+#ifdef VITA_SH2_PACKED_CODE
+void CompileBlocks::CodeRelease(int slot) {
+  if (!code_bytes_[slot]) return;
+  std::vector<int> &page = code_page_slots_[code_off_[slot] >> 12];
+  page.erase(std::find(page.begin(), page.end(), slot));
+  code_bytes_[slot] = 0;
+}
+
+/* Code room for a compile into slot: MAXBLOCKSIZE bytes at the cursor, after
+ * evicting every other live block with code there (blocks start at most
+ * MAXBLOCKSIZE before the room). */
+void CompileBlocks::PlaceCode(int slot) {
+  CodeRelease(slot);
+  if (code_cursor_ + MAXBLOCKSIZE > vitacode::Layout::StubOffset) code_cursor_ = 0;
+  const size_t lo = code_cursor_, hi = lo + MAXBLOCKSIZE;
+  for (size_t p = lo >= 4096 ? (lo >> 12) - 1 : 0; p <= (hi - 1) >> 12; ++p) {
+    const std::vector<int> page = code_page_slots_[p];
+    for (int other : page) {
+      if (code_off_[other] >= hi || code_off_[other] + code_bytes_[other] <= lo) continue;
+      if (g_CompleBlock[other].b_addr) {
+        EvictSlot(other);
+        g_CompleBlock[other].b_addr = 0;
+        smc_slot_[other].pc = 0;
+      }
+      CodeRelease(other);
+    }
+  }
+  code_off_[slot] = u32(lo);
+  code_bytes_[slot] = MAXBLOCKSIZE;
+  code_page_slots_[lo >> 12].push_back(slot);
+  g_CompleBlock[slot].code = VitaSh2CodeArena() + lo;
+  code_cursor_ = hi;
+}
+
+/* The compile into slot succeeded: keep only its code (cache-line aligned). */
+void CompileBlocks::PlacedCode(int slot) {
+  code_bytes_[slot] = last_code_bytes_;
+  code_cursor_ = code_off_[slot] + ((last_code_bytes_ + 31) & ~31u);
+}
+#endif
+
 #include "../../vita/telemetry.h"
 static bool Sh2MayWrite(u16 op);
 Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
@@ -951,6 +1123,30 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
 #endif
 
   auto block_index = self_modify_block.find(pc);
+#ifdef VITA_SH2_SMC_VARIANTS
+  const bool smc = (pc & 0x0FF00000) == 0x06000000 && ParentT && !debug_mode_ &&
+                   (block_index != self_modify_block.end() || smc_pcs_.count(pc));
+  if (smc) {
+    if (block_index != self_modify_block.end()) {
+      // The invalidated slot becomes a variant unless it was compiled before
+      // the PC was tracked (no recorded source words).
+      std::vector<int> &slots = smc_pcs_[pc];
+      const int old = block_index->second;
+      if (std::find(slots.begin(), slots.end(), old) == slots.end() && slots.size() < kSmcVariants)
+        slots.push_back(old);
+      self_modify_block.erase(block_index);
+    }
+#ifdef VITA_STACK_PROFILE
+    { extern u32 g_prof_smc_pc[64], g_prof_smc_n[64], g_prof_smc_hit, g_prof_smc_miss;
+      unsigned k = (pc >> 1) & 63; if (g_prof_smc_pc[k] != pc) { g_prof_smc_pc[k] = pc; g_prof_smc_n[k] = 0; } ++g_prof_smc_n[k];
+      if (Block *reused = SmcReuse(pc, ParentT)) { ++g_prof_smc_hit; return reused; }
+      ++g_prof_smc_miss; }
+#else
+    if (Block *reused = SmcReuse(pc, ParentT)) return reused;
+#endif
+    blockCount = SmcSlot(pc);
+  } else
+#endif
   if( block_index != self_modify_block.end()  ){
       blockCount = block_index->second ;
       self_modify_block.erase(pc);
@@ -959,57 +1155,65 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
     blockCount = LastMakeBlock;
     LastMakeBlock = vitacode::Layout::NextSh2Block(LastMakeBlock);
   }
+#ifdef VITA_SH2_SMC_VARIANTS
+  smc_slot_[blockCount].pc = 0;  // overwritten below: no longer a variant
+#endif
   
-  if (g_CompleBlock[blockCount].b_addr != 0x00) {
-    Block *old = &g_CompleBlock[blockCount];
-    if ((old->b_addr & 0x0ff00000) == 0x00200000) {
-      for (auto &page : low_code_pages) {
-        for (auto it = page.begin(); it != page.end(); ) {
-          if (*it == old) it = page.erase(it); else ++it;
-        }
-      }
-    }
-    
-    if ((g_CompleBlock[blockCount].b_addr & 0xFF000000) == 0xC0000000) {
-      // A recycled code slot may have entries for either CPU or an alias.
-      for (auto it = LookupTableC.begin(); it != LookupTableC.end(); ) {
-        if (it->second == &g_CompleBlock[blockCount]) it = LookupTableC.erase(it);
-        else ++it;
-      }
-    }
-    else {
-      switch (g_CompleBlock[blockCount].b_addr & 0x0FF00000) {
-      case 0x00000000:
-        if (yabsys.emulatebios) {
-          //return NULL; do nothing
-        }
-        else {
-          LookupTableRom[(g_CompleBlock[blockCount].b_addr & 0x000FFFFF) >> 1] = NULL;
-        }
-        break;
-      case 0x00200000:
-        LookupTableLow[(g_CompleBlock[blockCount].b_addr & 0x000FFFFF) >> 1] = NULL;
-        break;
-      case 0x06000000:
-        /*case 0x06100000:*/
-        LookupTable[(g_CompleBlock[blockCount].b_addr & 0x000FFFFF) >> 1] = NULL;
-        //LOG("%d, %08X is removed due to overflow", blockCount, g_CompleBlock[blockCount].b_addr);
-        break;
-      default:
-        break;
-      }
-    }
-  }
-
+  EvictSlot(blockCount);
   g_CompleBlock[blockCount].b_addr = pc;
+#ifdef VITA_SH2_PACKED_CODE
+  PlaceCode(blockCount);
+#endif
 
 
   //LOG("%d,%08X is compiled",blockCount,pc );
+#ifdef VITA_SH2_MAC_REGIONS
+  // MAC regions change native code size, and the baseline ends some blocks
+  // on native size (max(native, template bytes) reaching MAXBLOCKSIZE). The
+  // baseline pass fixes the extent; a block holding a MAC operation is then
+  // recompiled with MAC regions to exactly that end, keeping the baseline
+  // code whenever the second pass cannot reach it.
+  mac_regions_ = false;
+  forced_end_ = 0;
   if (EmmitCode(&g_CompleBlock[blockCount], ParentT) != 0) {
     return NULL;
   }
+  if (!debug_mode_) {
+    Block *page = &g_CompleBlock[blockCount];
+    bool mac = false;
+    for (u32 a = page->b_addr; a <= page->e_addr && !mac; a += 2)
+      mac = sh2a9::RegisterRegion::IsMacOperation(MappedMemoryReadWord(a, NULL));
+    if (mac) {
+      const u32 end = page->e_addr;
+      mac_regions_ = true;
+      forced_end_ = end;
+      const int result = EmmitCode(page, ParentT);
+      mac_regions_ = false;
+      forced_end_ = 0;
+      if ((result != 0 || page->e_addr != end) && EmmitCode(page, ParentT) != 0)
+        return NULL;
+    }
+  }
+#else
+  if (EmmitCode(&g_CompleBlock[blockCount], ParentT) != 0) {
+    return NULL;
+  }
+#endif
 
+#ifdef VITA_SH2_PACKED_CODE
+  PlacedCode(blockCount);
+#endif
   Block *created = &g_CompleBlock[blockCount];
+  for (u32 a = created->b_addr; a <= created->e_addr; a += 2)   // e_addr: last (delay-slot) instruction
+    if (Sh2MayWrite(MappedMemoryReadWord(a, NULL))) { created->flags |= BLOCK_MAY_WRITE; break; }
+#ifdef VITA_SH2_SMC_VARIANTS
+  if (smc) {
+    SmcVariant &v = smc_slot_[blockCount];
+    v.pc = pc;
+    v.denied = spec_deny.count(pc) != 0;
+    v.words = SmcSourceWords(pc, created->e_addr);
+  }
+#endif
   if ((created->b_addr & 0x0ff00000) == 0x00200000) {
     const u32 first = (created->b_addr & 0xfffff) >> 12;
     const u32 last = (created->e_addr & 0xfffff) >> 12;
@@ -1023,7 +1227,135 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
   return &g_CompleBlock[blockCount];
 }
 
+#ifdef VITA_SH2_SMC_VARIANTS
+/* Every source word a compile at pc reads, given the block's end e_addr:
+ * resident-loop scan (pc..pc+128), infinite-loop check (pc+2..pc+5), the
+ * size check of the instructions after the end (e_addr+2..e_addr+5) and the
+ * stack plan (to the first branch and its delay slot, at most 256 words). */
+std::vector<u16> CompileBlocks::SmcSourceWords(u32 pc, u32 e_addr) {
+  u32 end = std::max(pc + 130, e_addr + 6);  // exclusive
+  for (u32 a = pc, k = 0; k < 256; ++k, a += 2) {
+    const u16 o = MappedMemoryReadWord(a, NULL);
+    const u8 dl = asm_list[dsh2_instructions[o]].delay;
+    if ((dl != 0 && dl != 0xFF) || (o & 0xF0FF) == 0x400e || (o & 0xF0FF) == 0x4007 || k == 255) {
+      end = std::max(end, a + 4);
+      break;
+    }
+  }
+  std::vector<u16> words;
+  words.reserve((end - pc) / 2);
+  for (u32 a = pc; a != end; a += 2) words.push_back(MappedMemoryReadWord(a, NULL));
+  return words;
+}
 
+/* A recorded variant of pc whose source is current: registered as the owner
+ * of its words exactly as its compile registered it, and returned for
+ * publication. */
+Block *CompileBlocks::SmcReuse(u32 pc, addrs *ParentT) {
+  auto found = smc_pcs_.find(pc);
+  if (found == smc_pcs_.end()) return nullptr;
+  const bool denied = spec_deny.count(pc) != 0;
+  std::vector<u16> &current = smc_words_;
+  current.clear();
+  for (int slot : found->second) {
+    const SmcVariant &v = smc_slot_[slot];
+    Block *b = &g_CompleBlock[slot];
+    if (v.pc != pc || b->b_addr != pc || v.denied != denied) continue;
+    if (current.size() < v.words.size()) {
+      // Grow lazily; spans differ only by their tails. Cached and
+      // cache-through high work RAM (pages 0x600-0x610) read as HighWram.
+      for (u32 a = pc + 2 * u32(current.size()); current.size() < v.words.size(); a += 2)
+        current.push_back((a >> 29) <= 1 && ((a >> 16) & 0xFFF) >= 0x600 && ((a >> 16) & 0xFFF) <= 0x610
+                              ? T2ReadWord(HighWram, a & 0xFFFFF) : MappedMemoryReadWord(a, NULL));
+    }
+    if (!std::equal(v.words.begin(), v.words.end(), current.begin())) continue;
+    for (u32 a = b->b_addr; a <= b->e_addr; a += 2) {
+      const u32 keep = adress_mask(a);
+      MarkCode(keep);
+      ParentT[keep].push_back(adress_mask(pc));
+      ParentT[keep].unique();
+    }
+    return b;
+  }
+  return nullptr;
+}
+
+/* The slot for a new compile of self-modified pc: a fresh one while pc has
+ * fewer than kSmcVariants, else its variants in turn. */
+int CompileBlocks::SmcSlot(u32 pc) {
+  std::vector<int> &slots = smc_pcs_[pc];
+  slots.erase(std::remove_if(slots.begin(), slots.end(),
+                             [&](int s) { return smc_slot_[s].pc != pc && g_CompleBlock[s].b_addr != pc; }),
+              slots.end());
+  if (slots.size() < kSmcVariants) {
+    const int slot = LastMakeBlock;
+    LastMakeBlock = vitacode::Layout::NextSh2Block(LastMakeBlock);
+    slots.push_back(slot);
+    return slot;
+  }
+  const int slot = slots.front();
+  slots.erase(slots.begin());
+  slots.push_back(slot);
+  return slot;
+}
+#endif
+
+#ifdef VITA_SH2_LINK
+/* Exit into a statically known high-RAM PC, in place of BLOCK_RETURN once the
+ * exit has stored the PC (held in pc_reg) and the count. Unlinked, word 0 is
+ * BLOCK_RETURN. PatchLink makes word 0 BL link_check (sh2_dispatch's checks;
+ * r1 = decremented budget), words 1-2 the target Block and word 9 a branch to
+ * its body past the reload of r8/r9. The target is entered only while its
+ * link_pc equals the PC, i.e. while sh2_dispatch's lookup would return it;
+ * otherwise word 10 continues into sh2_dispatch.
+ *   0 ldr pc,[r7,#144] | bl link_check    6 str r1,[r7,#148]  chain_budget
+ *   1 movw r2,#block                      7 str r2,[r7,#156]  chain_cur
+ *   2 movt r2,#block                      8 mov r8,pc_reg
+ *   3 ldr r3,[r2,#28]  link_pc            9 b 10 | b target body
+ *   4 cmp r3,pc_reg                      10 ldr pc,[r7,#144]
+ *   5 bne 10                                                               */
+static_assert(PROLOGSIZE == 16, "linked exits enter blocks past push, mov r7 and the r8/r9 loads");
+static constexpr size_t kLinkStubBytes = 11 * 4;
+static constexpr u32 kBlockReturn = 0xe597f090u;  // ldr pc,[r7,#144]
+static void EmitLinkStub(u8 *p, unsigned pc_reg) {
+  const u32 words[] = {kBlockReturn, 0xe3002000u, 0xe3402000u, 0xe592301cu, 0xe1530000u | pc_reg,
+                       0x1a000003u, 0xe5871094u, 0xe587209cu, 0xe1a08000u | pc_reg, 0xeaffffffu, kBlockReturn};
+  static_assert(sizeof(words) == kLinkStubBytes, "stub layout");
+  memcpy(p, words, sizeof(words));
+}
+static u32 ArmBranch(u32 opcode, const void *from, const void *to) {
+  return opcode | ((u32(reinterpret_cast<const u8 *>(to) - reinterpret_cast<const u8 *>(from) - 8) >> 2) & 0xffffffu);
+}
+void CompileBlocks::PatchLink(int slot, int exit, const Block *target) {
+  u32 *w = reinterpret_cast<u32 *>(dCode[slot].code + link_out[slot][exit].offset);
+  const u32 b = u32(reinterpret_cast<uintptr_t>(target));
+  w[1] = 0xe3002000u | ((b & 0xf000u) << 4) | (b & 0xfffu);
+  w[2] = 0xe3402000u | ((b >> 12) & 0xf0000u) | ((b >> 16) & 0xfffu);
+  w[9] = ArmBranch(0xea000000u, &w[9], target->code + PROLOGSIZE);
+  w[0] = ArmBranch(0xeb000000u, &w[0], link_check);
+}
+void CompileBlocks::Relink(Block *b) {
+  const auto range = link_in.equal_range(b->b_addr);
+  for (auto it = range.first; it != range.second; ++it) {
+    const int slot = int(it->second >> 1), exit = int(it->second & 1);
+    VitaSh2CodeWrite write(dCode[slot].code + link_out[slot][exit].offset, kLinkStubBytes);
+    PatchLink(slot, exit, b);
+  }
+}
+#else
+void CompileBlocks::Relink(Block *) {}
+void CompileBlocks::PatchLink(int, int, const Block *) {}
+#endif
+void CompileBlocks::UnlinkSlot(int slot) {
+  for (u32 k = 0; k < 2; ++k) {
+    LinkExit &e = link_out[slot][k];
+    if (!e.offset) continue;
+    const auto range = link_in.equal_range(e.target);
+    for (auto it = range.first; it != range.second; ++it)
+      if (it->second == u32(slot) * 2 + k) { link_in.erase(it); break; }
+    e = {0, 0};
+  }
+}
 
 void CompileBlocks::ShowStatics() {
   //LOG("Compile\t%d\t%d\t%d\n", compile_count_, exec_count_, remove_count_);
@@ -1093,6 +1425,75 @@ void CompileBlocks::opcodePass(x86op_desc *op, u16 opcode, u8 *ptr)
 #define Y_MAX(a, b) ((a) > (b) ? (a) : (b))
 #define Y_MIN(a, b) ((a) < (b) ? (a) : (b))
 
+#ifdef VITA_SH2_RAM_STORES
+// Compile-time switch; the startup differential test compiles both forms.
+bool g_sh2_region_stores = true;
+#endif
+#ifdef VITA_SH2_DEFER_SEPARATORS
+// Templates that read the live PC (r8) or cycle (r9) register mid-block:
+// PC-relative MOV.W/MOV.L/MOVA, TRAPA and SLEEP (dynalib_arm.s). Branches
+// and delay-slot forms (delay != 0) are handled by the caller.
+static inline bool Sh2TemplateReadsPcOrCount(u16 op) {
+  return (op & 0xF000) == 0x9000 || (op & 0xF000) == 0xD000 ||
+         (op & 0xFF00) == 0xC700 || (op & 0xFF00) == 0xC300 || op == 0x001B;
+}
+// Compile-time switch; the startup differential test compiles both forms.
+bool g_sh2_defer_separators = true;
+// ARMv7-A A8.8.5 ADD (immediate, ARM) encoding A1, 8-bit immediate chunks.
+static inline size_t Sh2EmitAddImm(u8 *ptr, unsigned reg, u32 value) {
+  size_t bytes = 0;
+  while (value) {
+    const u32 chunk = value > 255 ? 255 : value;
+    const u32 word = 0xE2800000u | (reg << 16) | (reg << 12) | chunk;
+    memcpy(ptr + bytes, &word, 4);
+    bytes += 4; value -= chunk;
+  }
+  return bytes;
+}
+#endif
+#ifdef VITA_SH2_STACK_SPEC
+// Per-instruction R15 offset from its value at block entry (see
+// RegisterRegion stack speculation). Valid only while every instruction so far
+// has a tracked or no effect on R15.
+struct Sh2StackPlan { u32 start = 0; bool active = false; std::vector<int> off; std::vector<u8> valid; };
+static bool Sh2StackPlanLookup(void *ctx, uint32_t pc, int *off) {
+  const auto *plan = static_cast<const Sh2StackPlan *>(ctx);
+  if (!plan->active || pc < plan->start) return false;
+  const u32 index = (pc - plan->start) >> 1;
+  if (index >= plan->valid.size() || !plan->valid[index]) return false;
+  *off = plan->off[index];
+  return true;
+}
+#endif
+// Conservative: true for every SH-2 instruction that can write memory
+// (SH-1/SH-2 Programming Manual instruction tables) and for anything not
+// decoded as a known instruction (exceptions push SR/PC).
+static bool Sh2MayWrite(u16 op) {
+  const unsigned hi = op >> 12, lo = op & 15;
+  switch (hi) {
+    case 0x0: return (lo >= 4 && lo <= 6) ||                    // MOV.x Rm,@(R0,Rn)
+                     !(lo == 2 || lo == 3 || lo == 7 || lo == 8 || lo == 9 || lo == 0xA ||
+                       lo == 0xB || lo == 0xC || lo == 0xD || lo == 0xE || lo == 0xF); // others: STC/STS/branch/MOV.x @(R0,Rm)/MAC.L/...
+    case 0x1: return true;                                      // MOV.L Rm,@(disp,Rn)
+    case 0x2: return lo <= 2 || (lo >= 4 && lo <= 6) || lo == 3; // MOV.x Rm,@Rn / @-Rn; 3 undefined
+    case 0x3: return lo == 1 || lo == 9;                        // undefined
+    case 0x4: {                                                 // everything but these writes or is undefined
+      if (lo == 0xF) return false;                              // MAC.W @Rm+,@Rn+
+      switch (op & 0xFF) {
+        case 0x00: case 0x01: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09:
+        case 0x0A: case 0x0B: case 0x0E: case 0x10: case 0x11: case 0x15: case 0x16: case 0x17:
+        case 0x18: case 0x19: case 0x1A: case 0x1E: case 0x20: case 0x21: case 0x24: case 0x25:
+        case 0x26: case 0x27: case 0x28: case 0x29: case 0x2A: case 0x2B: case 0x2E:
+          return false;
+        default: return true;                                   // STS.L/STC.L @-Rn, TAS.B, undefined
+      }
+    }
+    case 0x8: { const unsigned s = (op >> 8) & 15; return s == 0 || s == 1 || !(s == 4 || s == 5 || s == 8 || s == 9 || s == 0xB || s == 0xD || s == 0xF); }
+    case 0xC: { const unsigned s = (op >> 8) & 15; return s <= 3 || s == 0xD || s == 0xE || s == 0xF; } // MOV.x R0,@(d,GBR), TRAPA, AND/XOR/OR.B
+    case 0xF: return true;                                      // undefined on SH-2
+    default: return false;                                      // 5,6,7,9,A,B,D,E: no memory writes
+  }
+}
 int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 {
   VitaSh2CodeWrite code_write(page->code, MAXBLOCKSIZE);
@@ -1107,6 +1508,17 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
   std::unordered_map<u32, uintptr_t> addr_map;
 
   startptr = ptr = page->code;
+#ifdef VITA_SH2_LINK
+  // Static exits into high RAM (link stubs), registered once the block is final.
+  LinkExit links[2];
+  unsigned link_count = 0;
+  bool branch_exit = false;  // the block ends in a branch: the epilogue is unreachable
+  auto link_stub = [&](u8 *p, unsigned pc_reg, u32 target) {
+    EmitLinkStub(p, pc_reg);
+    if ((target & 0xFFF00001u) == 0x06000000u && link_count < 2)
+      links[link_count++] = {target, u32(p - startptr)};
+  };
+#endif
 
   i = 0;
   j = 0;
@@ -1114,8 +1526,126 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
   memset((void*)ptr,0,sizeof(char)*MAXBLOCKSIZE);
   memcpy((void*)ptr, (void*)prologue, PROLOGSIZE);
   ptr += PROLOGSIZE;
+#ifdef VITA_SH2_STACK_SPEC
+  // Plan R15 over the block's straight-line instructions (to the branch and
+  // its delay slot) and validate R15 once here, before anything executes.
+  Sh2StackPlan stack_plan;
+  if (sh2a9::RegisterRegion::stack_spec_enabled && !debug_mode_ && ParentT && g_sh2_region_stores && LowWram && HighWram &&
+      (start_addr & 0x0FF00000) == 0x06000000 && !spec_deny.count(start_addr)) {
+    stack_plan.start = start_addr;
+    int off = 0; bool valid = true; unsigned loads = 0, stores = 0;
+    // Byte extents [lo,hi) of every speculative access (and [slo,shi) of the
+    // stores) relative to R15 at entry; validated below exactly as planned.
+    int lo = 0, hi = 4, slo = 1 << 20, shi = -(1 << 20);
+    auto count = [&](u16 op) {
+      const auto acc = sh2a9::RegisterRegion::SpecDecode(op);
+      if (!valid || !acc.ok || !sh2a9::RegisterRegion::SpecOffsetOk(acc, off + acc.disp)) return;
+      const int o = off + acc.disp, e = o + int(acc.width);
+      lo = std::min(lo, o & ~3); hi = std::max(hi, (e + 3) & ~3);
+      if (acc.store) { ++stores; slo = std::min(slo, o & ~3); shi = std::max(shi, (e + 3) & ~3); }
+      else ++loads;
+    };
+    for (u32 a = start_addr, k = 0; k < 256; ++k, a += 2) {
+      const u16 o = MappedMemoryReadWord(a, NULL);
+      stack_plan.valid.push_back(valid); stack_plan.off.push_back(off);
+      count(o);
+      int delta;
+      const int effect = sh2a9::RegisterRegion::R15Effect(o, &delta);
+      if (effect == 1) { off += delta; if (off <= -512 || off >= 512) valid = false; }
+      else if (effect == 2) valid = false;
+      const u8 dl = asm_list[dsh2_instructions[o]].delay;
+      if (dl != 0 && dl != 0xFF) {                // branch: include its delay slot, then stop
+        if (dl != 1 && dl != 5) {
+          const u16 slot = MappedMemoryReadWord(a + 2, NULL);
+          stack_plan.valid.push_back(valid); stack_plan.off.push_back(off);
+          count(slot);
+        }
+        break;
+      }
+      if ((o & 0xF0FF) == 0x400e || (o & 0xF0FF) == 0x4007) break; // LDC SR ends the block
+    }
+    // Entry check ~8 words (+7 with stores); each speculative access saves
+    // the ~6-word load guard or ~13-word store guard.
+    stack_plan.active = loads + 2 * stores >= 2 && (!stores || (shi - slo <= 1020 && slo - lo <= 1020));
+#ifdef VITA_STACK_PROFILE
+    ++g_prof_spec[0]; if (stack_plan.active) { ++g_prof_spec[1]; g_prof_spec[2] += loads + stores; }
+#endif
+    if (stack_plan.active) {
+      std::vector<u32> w;
+      std::vector<size_t> bail;
+      // ADD/SUB rd,rn,#v for a multiple of 4 below 1024 (imm8 ROR 30).
+      auto add = [&](unsigned rd, unsigned rn, int v) {
+        if (!v && rd == rn) return;
+        const u32 m = u32(v < 0 ? -v : v) >> 2;
+        w.push_back((v < 0 ? 0xe2400f00u : 0xe2800f00u) | (rn << 16) | (rd << 12) | m);
+      };
+      w.push_back(0xe597003cu);                    // LDR r0,[r7,#60]      R15
+      w.push_back(0xe220a406u);                    // EOR r10,r0,#0x06000000
+      add(10, 10, lo);                             // r10 = offset of R15+lo
+      // R15+lo in [0x06000000,0x060FF000) and R15 4-aligned (lo is): every
+      // planned access lies inside high work RAM (hi-lo <= 2044).
+      w.push_back(0xe1a0c16au);                    // MOV ip,r10,ROR #2
+      w.push_back(0xe35c0bffu);                    // CMP ip,#0x3FC00
+      bail.push_back(w.size()); w.push_back(0x20000000u); // BHS bail
+      if (stores) {                                // KiBs of [R15+slo,R15+shi) own no code
+        add(14, 10, slo - lo);                     // lr = offset of first store byte
+        w.push_back(0xe597c08cu);                  // LDR ip,[r7,#140]     code_pages
+        w.push_back(0xe7dc052eu);                  // LDRB r0,[ip,lr,LSR #10]
+        add(14, 14, shi - slo - 4);                // lr = offset of the last store word
+        w.push_back(0xe7dce52eu);                  // LDRB lr,[ip,lr,LSR #10]
+        w.push_back(0xe190e00eu);                  // ORRS lr,r0,lr
+        bail.push_back(w.size()); w.push_back(0x10000000u); // BNE bail
+      }
+      w.push_back(0xe597c088u);                    // LDR ip,[r7,#136]     HighWram
+      w.push_back(0xe08cb00au);                    // ADD r11,ip,r10
+      add(11, 11, -lo);                            // host address of R15
+      const size_t skip = w.size(); w.push_back(0);
+      const size_t target = w.size();
+      for (size_t at : bail)
+        w[at] = w[at] | 0x0a000000u | (u32(int32_t(target) - int32_t(at) - 2) & 0xffffffu);
+      w.push_back(0xe5878084u);                    // STR r8,[r7,#132]     spec_bail = block PC
+      w.push_back(0xe5878058u);                    // STR r8,[r7,#88]      PC unchanged
+      w.push_back(0xe587905cu);                    // STR r9,[r7,#92]      count unchanged
+      w.push_back(0xe8bd8ff8u);                    // POP {r3-r11,pc}
+      w[skip] = 0xea000000u | (u32(int32_t(w.size()) - int32_t(skip) - 2) & 0xffffffu); // B body
+      memcpy(ptr, w.data(), w.size() * 4);
+      ptr += w.size() * 4;
+    }
+  }
+#endif
   size_t scheduling_size = PROLOGSIZE;
   u8 *scheduling_cursor = ptr;
+  // Bytes the r12-base region emission would have added (RegisterRegion::
+  // legacy_words); every size decision below uses used(), so block and
+  // region boundaries are those of that emission.
+  size_t legacy_extra = 0;
+#ifdef VITA_SH2_BLOCK_COLD
+  // Regions' slow edges, placed after the block's exits (see FinishHot).
+  struct ColdPart { unsigned hot_base; std::vector<uint32_t> words;
+                    std::vector<sh2a9::RegisterRegion::Fixup> to_cold, to_hot; };
+  std::vector<ColdPart> cold_parts;
+  size_t cold_bytes = 0;
+  auto used = [&]() { return size_t(ptr - startptr) + cold_bytes + legacy_extra; };
+#else
+  auto used = [&]() { return size_t(ptr - startptr) + legacy_extra; };
+#endif
+#ifdef VITA_SH2_DEFER_SEPARATORS
+  // Per-instruction "add r8,#2; add r9,#cycles" separators of plain templates
+  // are accumulated and applied once, immediately before any code that can
+  // observe r8/r9 (listed templates, branches, regions, epilogue). Blocks are
+  // straight-line on ARM32 (internal jumps are AArch64-only), so every exit
+  // and observer is preceded by a flush. scheduling_size keeps the baseline
+  // byte accounting, so block boundaries are unchanged.
+  u32 defer_pc = 0, defer_cycles = 0;
+  auto flush_deferred = [&]() {
+    size_t bytes = Sh2EmitAddImm(ptr, 8, defer_pc);
+    bytes += Sh2EmitAddImm(ptr + bytes, 9, defer_cycles);
+    ptr += bytes;
+    scheduling_size -= bytes; /* not baseline bytes; next loop top adds them */
+    defer_pc = defer_cycles = 0;
+  };
+  const bool defer_enabled = !debug_mode_ && g_sh2_defer_separators;
+#endif
   int MaxSize = 0;
 
   void * nomal_seperator;
@@ -1170,6 +1700,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #ifdef SET_DIRTY
           if (ParentT) {
             auto &owners = ParentT[adress_mask(start_addr + owner * 2)];
+            MarkCode(adress_mask(start_addr + owner * 2));
             owners.push_back(adress_mask(start_addr));
             owners.unique();
           }
@@ -1200,12 +1731,70 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
   //LOG("Compile %08X\n", addr );
   //MaxSize = MAXBLOCKSIZE - MAXINSTRSIZE- delay_seperator_size - SEPERATORSIZE_DELAY_AFTER - nomal_seperator_size - EPILOGSIZE;
   //while (ptr - startptr < MaxSize) {
+#if defined(VITA_SH2_A9_REGIONS) && !defined(AARCH64)
+  auto make_region = [&]() {
+    sh2a9::RegisterRegion region(reinterpret_cast<uintptr_t>(LowWram),
+                                reinterpret_cast<uintptr_t>(HighWram)
+#ifdef VITA_SH2_RAM_LOADS
+                                , true
+#endif
+                                );
+#if defined(VITA_SH2_GBR_LOADS) && defined(VITA_SH2_MAC_REGIONS)
+    // Not in the MAC-region recompile (measured: Sonic Jam's MAC blocks ran
+    // about 3% slower overall with GBR loads admitted there).
+    region.gbr_loads = !mac_regions_;
+#endif
+#ifdef VITA_SH2_RAM_STORES
+    // Only high-RAM compiles maintain LookupParentTable, hence code_pages.
+    if (ParentT && g_sh2_region_stores)
+      region.code_pages = reinterpret_cast<uintptr_t>(code_pages);
+#endif
+#ifdef VITA_SH2_STACK_SPEC
+    if (stack_plan.active) { region.spec_plan = Sh2StackPlanLookup; region.spec_ctx = &stack_plan; }
+#endif
+#ifdef VITA_SH2_ONCHIP_DIRECT
+    region.onchip_write[0] = reinterpret_cast<uintptr_t>(&OnchipWriteByte);
+    region.onchip_write[1] = reinterpret_cast<uintptr_t>(&OnchipWriteWord);
+    region.onchip_write[2] = reinterpret_cast<uintptr_t>(&OnchipWriteLong);
+#endif
+#if defined(VITA_SH2_MAC_REGIONS) && defined(VITA_SH2_MACL_WRAM)
+    region.macl_helper = reinterpret_cast<uintptr_t>(&sh2_macl_region);
+#endif
+#if defined(VITA_SH2_MAC_REGIONS) && defined(VITA_SH2_MACW_WRAM)
+    region.macw_helper = reinterpret_cast<uintptr_t>(&sh2_macw_region);
+#endif
+    return region;
+  };
+  auto region_admits = [&](const sh2a9::RegisterRegion &region, u16 candidate, u32 at, u32 literal_pc) {
+    const int decoded = dsh2_instructions[candidate];
+    (void)at;
+    return !(!region.CanEmit(candidate, literal_pc) ||
+#ifndef VITA_SH2_IMMEDIATE_LOGIC
+            sh2a9::RegisterRegion::IsImmediateLogic(candidate) ||
+#endif
+#ifdef VITA_SH2_MAC_REGIONS
+            (!mac_regions_ && sh2a9::RegisterRegion::IsMacOperation(candidate)) ||
+            (forced_end_ && at > forced_end_) ||
+#else
+            sh2a9::RegisterRegion::IsMacOperation(candidate) ||
+#endif
+            // Only non-branch templates. The old separator charges the table
+            // cost, except after delay-0xFF (no interrupt) templates, whose
+            // separator keeps its default single state.
+            (asm_list[decoded].delay != 0 && asm_list[decoded].delay != 0xFF) ||
+            (asm_list[decoded].delay ? 1u : unsigned(asm_list[decoded].cycle)) !=
+              sh2a9::RegisterRegion::Cycles(candidate));
+  };
+#endif
   while (!resident_emitted) {
     scheduling_size += ptr - scheduling_cursor;
     scheduling_cursor = ptr;
     // Compact regions can fit far more guest instructions than old templates;
     // retain room in the per-instruction metadata, including a delay slot.
     if (count + 2 >= MAXINSTRCNT) break;
+#ifdef VITA_SH2_MAC_REGIONS
+    if (forced_end_ && addr > forced_end_) break; // the baseline pass ended here
+#endif
     // translate the opcode and insert code
     op = MappedMemoryReadWord(addr, NULL);
 #ifdef SET_DIRTY
@@ -1239,17 +1828,43 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #ifndef VITA_SH2_IMMEDIATE_LOGIC
         && !sh2a9::RegisterRegion::IsImmediateLogic(op)
 #endif
-#ifndef VITA_SH2_MAC_REGIONS
+#ifdef VITA_SH2_MAC_REGIONS
+        && (mac_regions_ || !sh2a9::RegisterRegion::IsMacOperation(op))
+#else
         && !sh2a9::RegisterRegion::IsMacOperation(op)
 #endif
 #ifdef VITA_SH2_RAM_LOADS
         || (LowWram && HighWram && sh2a9::RegisterRegion::IsIndirectLoad(op))
+        || (LowWram && HighWram && sh2a9::RegisterRegion::disp_loads_enabled &&
+            (sh2a9::RegisterRegion::IsDisplacementLoad(op) ||
+             sh2a9::RegisterRegion::IsIndexedLoad(op)))
+#ifdef VITA_SH2_GBR_LOADS
+        || (LowWram && HighWram && sh2a9::RegisterRegion::IsGbrLoad(op)
+#ifdef VITA_SH2_MAC_REGIONS
+            && !mac_regions_
+#endif
+           )
+#endif
+#endif
+#ifdef VITA_SH2_RAM_STORES
+        || (LowWram && HighWram && ParentT && g_sh2_region_stores &&
+            sh2a9::RegisterRegion::IsStore(op))
 #endif
 #ifdef VITA_SH2_PC_LOADS
         || (LowWram && HighWram && sh2a9::RegisterRegion::IsPcLoad(op))
 #endif
+#if defined(VITA_SH2_MAC_REGIONS) && defined(VITA_SH2_RAM_LOADS)
+        || (mac_regions_ && LowWram && HighWram && sh2a9::RegisterRegion::IsMacLong(op))
+        || (mac_regions_ && LowWram && HighWram && sh2a9::RegisterRegion::IsMacWord(op))
+#endif
+#ifdef VITA_SH2_STACK_SPEC
+        || (stack_plan.active && sh2a9::RegisterRegion::IsStackPr(op))
+#endif
         )) {
-      const size_t remaining = MAXBLOCKSIZE - (ptr - startptr);
+#ifdef VITA_SH2_DEFER_SEPARATORS
+      if (defer_pc) flush_deferred();
+#endif
+      const size_t remaining = MAXBLOCKSIZE - used();
       // At most 64 MAC operations: their extra cycles fit in one immediate.
 #ifdef VITA_SH2_MAC_REGIONS
       constexpr size_t reserve = 59 * sizeof(u32) + EPILOGSIZE + 1;
@@ -1260,12 +1875,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
         Y_MIN(size_t(MAXINSTRCNT - count - 2),
           Y_MIN(size_t(64), (remaining - reserve) / (7 * sizeof(u32)))) : 0;
       if (limit == 0) break;
-      sh2a9::RegisterRegion region(reinterpret_cast<uintptr_t>(LowWram),
-                                  reinterpret_cast<uintptr_t>(HighWram)
-#ifdef VITA_SH2_RAM_LOADS
-                                  , true
-#endif
-                                  );
+      sh2a9::RegisterRegion region = make_region();
       const int first = count;
       while (region.instructions < limit) {
         const u16 candidate = MappedMemoryReadWord(addr, NULL);
@@ -1275,17 +1885,9 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #else
         const u32 literal_pc = 0;
 #endif
-        if (!region.CanEmit(candidate, literal_pc) ||
-#ifndef VITA_SH2_IMMEDIATE_LOGIC
-            sh2a9::RegisterRegion::IsImmediateLogic(candidate) ||
-#endif
-#ifndef VITA_SH2_MAC_REGIONS
-            sh2a9::RegisterRegion::IsMacOperation(candidate) ||
-#endif
-            asm_list[decoded].delay != 0 ||
-            asm_list[decoded].cycle != ((candidate & 0xf00f) == 0x0007 ? 4 : 1))
+        if (!region_admits(region, candidate, addr, literal_pc))
           break;
-        if ((region.code.size() + region.MaxEmissionWords(candidate)) * sizeof(u32)
+        if ((region.PendingWords() + region.legacy_words + region.MaxEmissionWords(candidate)) * sizeof(u32)
               + reserve > remaining)
           break;
         const size_t old_bytes = *asm_list[decoded].size + nomal_seperator_size;
@@ -1295,6 +1897,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #ifdef SET_DIRTY
         if (ParentT) {
           auto &owners = ParentT[adress_mask(addr)];
+          MarkCode(adress_mask(addr));
           owners.push_back(adress_mask(start_addr));
           owners.unique();
         }
@@ -1308,8 +1911,19 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
         addr += 2;
       }
       if (region.instructions) {
+#ifdef VITA_SH2_BLOCK_COLD
+        region.FinishHot(); // Canonical state/PC/cycles before ANY old template.
+        if (!region.cold.empty()) {
+          cold_parts.push_back({unsigned((ptr - startptr) / 4), std::move(region.cold),
+                                std::move(region.to_cold), std::move(region.to_hot)});
+          cold_bytes += cold_parts.back().words.size() * sizeof(u32);
+          legacy_extra += sizeof(u32);  // the in-line layout's branch over its cold code
+        }
+#else
         region.Finish(); // Canonical state/PC/cycles before ANY old template.
+#endif
         const size_t bytes = region.code.size() * sizeof(u32);
+        legacy_extra += size_t(region.legacy_words) * sizeof(u32);
         memcpy(ptr, region.code.data(), bytes);
         ptr += bytes;
         scheduling_cursor = ptr;
@@ -1340,30 +1954,30 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
     u8 delay = asm_list[i].delay;
 #if defined(AARCH64)
     if ( delay == 0 || delay == 0xFF) {
-      calsize  = (ptr - startptr) + regular_size + nomal_seperator_size + EPILOGSIZE;
+      calsize  = used() + regular_size + nomal_seperator_size + EPILOGSIZE;
     }else if(delay == 1 || delay == 5) {
-      calsize = (ptr - startptr) + *asm_list[i].size + nomal_seperator_size + Y_MAX(internal_jmp_size,DELAYJUMPSIZE) + EPILOGSIZE;
+      calsize = used() + *asm_list[i].size + nomal_seperator_size + Y_MAX(internal_jmp_size,DELAYJUMPSIZE) + EPILOGSIZE;
     } else {
       u32 op2 = memGetWord(addr+2);
       u32 delayop = dsh2_instructions[op2];
-      calsize = (ptr - startptr) + *asm_list[i].size + *asm_list[delayop].size + 
+      calsize = used() + *asm_list[i].size + *asm_list[delayop].size + 
       delay_seperator_size + Y_MAX(internal_delay_jmp_size,SEPERATORSIZE_DELAY_AFTER) + EPILOGSIZE;
     }
 #else    
     if ( delay == 0 || delay == 0xFF) {
-      calsize  = (ptr - startptr) + regular_size + nomal_seperator_size + EPILOGSIZE;
+      calsize  = used() + regular_size + nomal_seperator_size + EPILOGSIZE;
     }else if(delay == 1 || delay == 5) {
-      calsize = (ptr - startptr) + *asm_list[i].size + nomal_seperator_size + DELAYJUMPSIZE + EPILOGSIZE;
+      calsize = used() + *asm_list[i].size + nomal_seperator_size + DELAYJUMPSIZE + EPILOGSIZE;
     } else {
       u32 op2 = MappedMemoryReadWord(addr+2,NULL);
       u32 delayop = dsh2_instructions[op2];
-      calsize = (ptr - startptr) + *asm_list[i].size + *asm_list[delayop].size + delay_seperator_size + SEPERATORSIZE_DELAY_AFTER + EPILOGSIZE;
+      calsize = used() + *asm_list[i].size + *asm_list[delayop].size + delay_seperator_size + SEPERATORSIZE_DELAY_AFTER + EPILOGSIZE;
     }
 #endif
     // Keep the baseline's code-size-derived execution boundaries. Smaller
     // native code must not postpone scheduler/interrupt observations.
-    if (scheduling_size > size_t(ptr - startptr))
-      calsize += scheduling_size - size_t(ptr - startptr);
+    if (scheduling_size > used())
+      calsize += scheduling_size - used();
     if (calsize >= MAXBLOCKSIZE) {
       break; // no space is available
     }
@@ -1421,6 +2035,20 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
     }
 
 
+#ifdef VITA_SH2_DEFER_SEPARATORS
+    if (defer_enabled && asm_list[i].delay == 0 && !lowered_load && !Sh2TemplateReadsPcOrCount(op)) {
+      memcpy(ptr, regular_code, regular_size);
+      instrSize[blockCount][count++] = regular_size;
+      opcodePass(&asm_list[i], op, ptr);
+      ptr += regular_size;
+      defer_pc += 2;
+      defer_cycles += asm_list[i].cycle;
+      scheduling_size += nomal_seperator_size; /* baseline would have emitted it */
+      if ( (op & 0xF0FF) == 0x400e || (op & 0xF0FF) == 0x4007) break; // sh2_LDC_SR
+      continue;
+    }
+    if (defer_pc) flush_deferred();
+#endif
     // Regular Opcode ( No Delay Branch )
     if (asm_list[i].delay == 0) { 
       memcpy(ptr, regular_code, regular_size);
@@ -1447,6 +2075,69 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       ptr += *(asm_list[i].size) + nomal_seperator_size;
     }
 
+#if defined(VITA_SH2_FUSED_BRANCH) && !defined(AARCH64) && !defined(VITA_SH2_CHAIN_ABI)
+    // Block-ending non-delayed BT/BF (SH7604 table 2.16: 3 states taken, 1
+    // not taken). Same result as the BT/BF template + normal separator +
+    // PageFlip exit: PC = r8 + 2 or r8 + 4 + 2*disp, cycles += 1 or 3. A32
+    // modified immediates only; otherwise the template path below is used.
+    else if (!debug_mode_ && asm_list[i].delay == 1 && jumpptr == 0xFFFFFFFF &&
+             ((op >> 8) == 0x89 || (op >> 8) == 0x8B) &&
+             [&]() { const int off = 4 + 2 * int(int8_t(op & 0xff));
+                     const unsigned mag = unsigned(off < 0 ? -off : off);
+                     return mag <= 255 || (mag & 3) == 0; }()) {
+      const int off = 4 + 2 * int(int8_t(op & 0xff));
+      const unsigned mag = unsigned(off < 0 ? -off : off);
+      // mag <= 255: plain imm8; else (<= 260, multiple of 4): imm8 = mag/4 ror 30.
+      const u32 imm = mag <= 255 ? mag : (0xF00u | (mag >> 2));
+      const u32 taken = (op >> 8) == 0x89 ? 0x10000000u : 0x00000000u; // BT: NE (T=1), BF: EQ
+      const u32 words[] = {
+        0xe5971040u,                                           // ldr r1,[r7,#64]  SR
+        0xe2880002u,                                           // add r0,r8,#2     fall-through
+        0xe3110001u,                                           // tst r1,#1        T
+        taken | (off < 0 ? 0x02480000u : 0x02880000u) | imm,   // add/sub<cc> r0,r8,#|off|
+        0xe2899001u,                                           // add r9,r9,#1
+        taken | 0x02899002u,                                   // add<cc> r9,r9,#2
+        0xe5870058u,                                           // str r0,[r7,#88]  PC
+        0xe587905cu,                                           // str r9,[r7,#92]  count
+#if defined(VITA_SH2_NATIVE_DISPATCH)
+        0xe597f090u,                                           // ldr pc,[r7,#144] BLOCK_RETURN
+#elif defined(VITA_SH2_BASE_REG)
+        0xe8bd8ff8u,                                           // pop {r3-r11,pc}  BLOCK_RETURN
+#else
+        0xe8bd87f0u,                                           // pop {r4-r10,pc}  BLOCK_RETURN
+#endif
+      };
+#ifdef VITA_SH2_LINK
+      if (!debug_mode_ && used() + 4 * 11 + 2 * kLinkStubBytes + EPILOGSIZE <= MAXBLOCKSIZE) {
+        // The same PC and count, with one exit per outcome so both can link.
+        const u32 at = addr - 2;  // this BT/BF; r8 holds it
+        u32 *w = reinterpret_cast<u32 *>(ptr);
+        w[0] = 0xe5971040u;                                   // ldr r1,[r7,#64]  SR
+        w[1] = 0xe2899001u;                                   // add r9,r9,#1
+        w[2] = 0xe3110001u;                                   // tst r1,#1        T
+        w[3] = taken | 0x0a00000du;                           // b<cc> taken (word 18)
+        w[4] = 0xe2880002u;                                   // add r0,r8,#2     fall-through
+        w[5] = 0xe5870058u;                                   // str r0,[r7,#88]  PC
+        w[6] = 0xe587905cu;                                   // str r9,[r7,#92]  count
+        link_stub(ptr + 7 * 4, 0, at + 2);
+        u32 *t = w + 7 + kLinkStubBytes / 4;
+        t[0] = 0xe2899002u;                                   // add r9,r9,#2
+        t[1] = (off < 0 ? 0xe2480000u : 0xe2880000u) | imm;   // add/sub r0,r8,#|off|
+        t[2] = 0xe5870058u;                                   // str r0,[r7,#88]  PC
+        t[3] = 0xe587905cu;                                   // str r9,[r7,#92]  count
+        link_stub(reinterpret_cast<u8 *>(t + 4), 0, at + off);
+        const size_t bytes = 11 * 4 + 2 * kLinkStubBytes;
+        instrSize[blockCount][count++] = bytes;
+        ptr += bytes;
+      } else
+#endif
+      {
+      memcpy(ptr, words, sizeof(words));
+      instrSize[blockCount][count++] = sizeof(words);
+      ptr += sizeof(words);
+      }
+    }
+#endif
     // Normal Jump
     else if (asm_list[i].delay == 1 || asm_list[i].delay == 5 ) { 
       memcpy((void*)ptr, (void*)(asm_list[i].func), *(asm_list[i].size));
@@ -1492,12 +2183,133 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 
     // Jmp With Delay Operation
     else { 
+#if defined(VITA_SH2_FUSED_DELAY) && defined(VITA_SH2_A9_REGIONS) && !defined(AARCH64)
+      // BRA/BSR, BT/S, BF/S, RTS, JSR/JMP @Rn with a region-admissible delay
+      // slot: the slot as a one-instruction region, then one exit with the
+      // templates' PC and count (cycle(branch) + cycle(slot), one less for
+      // an untaken BT/S or BF/S). The branch reads its inputs after the slot,
+      // so slots that write them are excluded (T, Rn, PR). BSR/JSR store PR
+      // before the slot, as their templates do. PC-relative slots are
+      // excluded: the templates run them with r8 = target - 2.
+      const u32 branch_pc = addr - 2;
+      const u16 slot_op = MappedMemoryReadWord(addr, NULL);
+      const unsigned rn = (op >> 8) & 15;
+      const bool bt_bf = (op & 0xFD00) == 0x8D00, relative = (op & 0xE000) == 0xA000;
+      const bool call = (op & 0xF000) == 0xB000 || (op & 0xF0FF) == 0x400B;
+      const bool indirect = (op & 0xF0FF) == 0x400B || (op & 0xF0FF) == 0x402B;
+      const bool slot_writes_t = sh2a9::RegisterRegion::WritesT(slot_op);
+      const bool slot_touches_rn = ((slot_op >> 8) & 15) == rn || ((slot_op >> 4) & 15) == rn ||
+        (rn == 0 && ((slot_op >> 12) == 8 || (slot_op >> 12) == 0xC));
+      sh2a9::RegisterRegion slot_region = make_region();
+      if (!debug_mode_ && (relative || bt_bf || indirect || op == 0x000B) &&
+          asm_list[dsh2_instructions[slot_op]].delay == 0 && region_admits(slot_region, slot_op, addr, addr) &&
+          !sh2a9::RegisterRegion::IsPcLoad(slot_op) &&
+          !(bt_bf && slot_writes_t) && !(indirect && slot_touches_rn) &&
+          !(op == 0x000B && slot_op == 0x4F26) &&
+          used() + (slot_region.MaxEmissionWords(slot_op) + 80) * sizeof(u32) + EPILOGSIZE
+#ifdef VITA_SH2_LINK
+            + 2 * kLinkStubBytes + 4
+#endif
+            < MAXBLOCKSIZE) {
+        instrSize[blockCount][count++] = 0;
+        if (call) {
+          slot_region.LoadConstant(12, branch_pc + 4);
+          slot_region.code.push_back(0xe587c054u);              // str ip,[r7,#84]  PR
+        }
+#ifdef SET_DIRTY
+        if (ParentT) {
+          auto &owners = ParentT[adress_mask(addr)];
+          MarkCode(adress_mask(addr));
+          owners.push_back(adress_mask(start_addr));
+          owners.unique();
+        }
+#endif
+        slot_region.Emit(slot_op, addr);
+        const int slot_i = dsh2_instructions[slot_op];
+        ++asm_list[slot_i].build_count;
+        write_memory_counter += 2 * asm_list[slot_i].write_count;  // as the template path counts it
+        addr += 2;
+#ifdef VITA_SH2_BLOCK_COLD
+        slot_region.FinishHot();
+        if (!slot_region.cold.empty()) {
+          cold_parts.push_back({unsigned((ptr - startptr) / 4), std::move(slot_region.cold),
+                                std::move(slot_region.to_cold), std::move(slot_region.to_hot)});
+          cold_bytes += cold_parts.back().words.size() * sizeof(u32);
+          legacy_extra += sizeof(u32);
+        }
+#else
+        slot_region.Finish();
+#endif
+        legacy_extra += size_t(slot_region.legacy_words) * sizeof(u32);
+        std::vector<u32> &w = slot_region.code;
+        const u32 fall = branch_pc + 4;
+        u32 taken_cc = 0xe0000000u, skip_cc = 0;
+        if (relative) {
+          slot_region.LoadConstant(0, fall + 2 * u32(s32(u32(op) << 20) >> 20));
+        } else if (bt_bf) {
+          const int off = 2 * int(int8_t(op & 0xff));
+          const unsigned mag = unsigned(off < 0 ? -off : off);
+          taken_cc = (op >> 8) == 0x8D ? 0x10000000u : 0x00000000u;  // BT/S: NE (T=1), BF/S: EQ
+          skip_cc = taken_cc ^ 0x10000000u;
+          w.push_back(0xe5971040u);                               // ldr r1,[r7,#64]  SR
+          slot_region.LoadConstant(0, fall);
+          w.push_back(0xe3110001u);                               // tst r1,#1        T
+          if (mag)
+            w.push_back(taken_cc | (off < 0 ? 0x02400000u : 0x02800000u) |
+                        (mag <= 255 ? mag : 0xC01u));             // add/sub<cc> r0,r0,#|off|
+        } else if (op == 0x000B) {
+          w.push_back(0xe5970054u);                               // ldr r0,[r7,#84]  PR
+        } else {
+          w.push_back(0xe5970000u | (rn * 4));                    // ldr r0,[r7,#Rn]
+        }
+        w.push_back(0xe2899000u | asm_list[i].cycle);             // add r9,r9,#cycle(branch)
+        if (bt_bf) w.push_back(skip_cc | 0x02499001u);            // sub<!cc> r9,r9,#1
+        w.push_back(0xe5870058u);                                 // str r0,[r7,#88]  PC
+        w.push_back(0xe587905cu);                                 // str r9,[r7,#92]  count
+#ifdef VITA_SH2_LINK
+        if (relative || bt_bf) {
+          // Static targets link (PC in r0). BT/S, BF/S: the flags of the T
+          // test still hold, the not-taken exit is the second stub.
+          const u32 target = relative ? fall + 2 * u32(s32(u32(op) << 20) >> 20)
+                                      : fall + u32(2 * int(int8_t(op & 0xff)));
+          if (bt_bf) w.push_back(skip_cc | 0x0a000000u | (kLinkStubBytes / 4 - 1));  // b<!cc> not-taken stub
+          memcpy(ptr, w.data(), w.size() * sizeof(u32));
+          u8 *stub = ptr + w.size() * sizeof(u32);
+          link_stub(stub, 0, target);
+          stub += kLinkStubBytes;
+          if (bt_bf) { link_stub(stub, 0, fall); stub += kLinkStubBytes; }
+          instrSize[blockCount][count - 1] = u32(stub - ptr);
+          instrSize[blockCount][count++] = 0;
+          ptr = stub;
+        } else {
+#endif
+#if defined(VITA_SH2_NATIVE_DISPATCH)
+        w.push_back(0xe597f090u);                                 // ldr pc,[r7,#144] BLOCK_RETURN
+#elif defined(VITA_SH2_BASE_REG)
+        w.push_back(0xe8bd8ff8u);                                 // pop {r3-r11,pc}  BLOCK_RETURN
+#else
+        w.push_back(0xe8bd87f0u);                                 // pop {r4-r10,pc}  BLOCK_RETURN
+#endif
+        memcpy(ptr, w.data(), w.size() * sizeof(u32));
+        instrSize[blockCount][count - 1] = w.size() * sizeof(u32);
+        instrSize[blockCount][count++] = 0;
+        ptr += w.size() * sizeof(u32);
+#ifdef VITA_SH2_LINK
+        }
+#endif
+      } else
+#endif
+      {
 
       u32 cycle = asm_list[i].cycle;
       memcpy((void*)ptr, (void*)(asm_list[i].func), *(asm_list[i].size));
       memcpy((void*)(ptr + *(asm_list[i].size)), (void*)delay_seperator, delay_seperator_size);
       instrSize[blockCount][count++] = *(asm_list[i].size) + delay_seperator_size;
       opcodePass(&asm_list[i], op, ptr);
+#ifdef VITA_SH2_LINK
+      u8 *const slot_separator = ptr + *(asm_list[i].size);  // its not-taken exit is word 6
+      const u32 branch_pc = addr - 2;
+#endif
       ptr += *(asm_list[i].size) + delay_seperator_size;
 
       // Get NExt instruction
@@ -1571,6 +2383,30 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
         *counterpos = cycle;
 #endif
         ptr += *(asm_list[j].size) + SEPERATORSIZE_DELAY_AFTER;
+#ifdef VITA_SH2_LINK
+        // PC-relative BRA/BSR, BT/S, BF/S: the taken exit (after the delay
+        // slot, PC in r8) and for BT/S, BF/S the not-taken exit before it
+        // (PC = the delay slot, in r8) have static targets.
+        const bool relative = (op & 0xE000) == 0xA000;
+        const bool conditional = (op & 0xFD00) == 0x8D00;
+        u32 *const taken_return = reinterpret_cast<u32 *>(ptr) - 1;
+        u32 *const skip_return = reinterpret_cast<u32 *>(slot_separator) + 6;
+        if (!debug_mode_ && (relative || conditional) && *taken_return == kBlockReturn &&
+            (!conditional || *skip_return == kBlockReturn) &&
+            used() + 2 * kLinkStubBytes + EPILOGSIZE <= MAXBLOCKSIZE) {
+          const u32 target = relative ? branch_pc + 4 + 2 * u32(s32(u32(op) << 20) >> 20)
+                                      : branch_pc + 4 + 2 * u32(s32(s8(op & 0xff)));
+          ptr -= 4;
+          link_stub(ptr, 8, target);
+          ptr += kLinkStubBytes;
+          if (conditional) {
+            *skip_return = ArmBranch(0xea000000u, skip_return, ptr);
+            link_stub(ptr, 8, branch_pc + 2);
+            ptr += kLinkStubBytes;
+          }
+        }
+#endif
+      }
       }
     }
 
@@ -1604,6 +2440,9 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       write_memory_counter = 0;
       //if( (op&0xFF00) == 0x8900) continue;  // BT
       //if( (op&0xFF00) == 0x8B00) continue;  // BF
+#ifdef VITA_SH2_LINK
+      branch_exit = true;
+#endif
       break;
     }
 
@@ -1667,9 +2506,57 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
     }
   }
 #endif
+#ifdef VITA_SH2_DEFER_SEPARATORS
+  if (defer_pc) flush_deferred();
+#endif
   memcpy((void*)ptr, (void*)epilogue, EPILOGSIZE);
   ptr += EPILOGSIZE;
+#ifdef VITA_SH2_LINK
+  // Falling off the end continues at the next instruction (PC in r8).
+  if (!debug_mode_ && !branch_exit && !resident_emitted && !(page->flags & BLOCK_POLL_FUSED) &&
+      reinterpret_cast<u32 *>(ptr)[-1] == kBlockReturn &&
+      used() - 4 + kLinkStubBytes <= MAXBLOCKSIZE) {
+    ptr -= 4;
+    link_stub(ptr, 8, addr);
+    ptr += kLinkStubBytes;
+  }
+  // A slot can be compiled more than once before eviction (MAC regions
+  // recompile it): drop what an earlier pass registered first.
+  UnlinkSlot(int(page - dCode));
+  // BLOCK_LOOP blocks never chain (sh2_dispatch returns to C after them);
+  // poll fusion replaced the code the exits were recorded in.
+  if (!debug_mode_ && !(page->flags & (BLOCK_LOOP | BLOCK_POLL_FUSED))) {
+    const int slot = int(page - dCode);
+    for (unsigned k = 0; k < link_count; ++k) {
+      link_out[slot][k] = links[k];
+      link_in.emplace(links[k].target, u32(slot) * 2 + k);
+      const Block *t = LookupTable[(links[k].target & 0x000FFFFF) >> 1];
+      if (t && t->link_pc == links[k].target) PatchLink(slot, int(k), t);  // published with this block
+    }
+  }
+#endif
 
+#ifdef VITA_SH2_BLOCK_COLD
+  for (auto &part : cold_parts) {
+    u32 *const words = reinterpret_cast<u32 *>(startptr);
+    const unsigned cold_base = unsigned((ptr - startptr) / 4);
+    for (const auto &f : part.to_cold)
+      words[part.hot_base + f.at] = sh2a9::RegisterRegion::Branch(f.cond, part.hot_base + f.at, cold_base + f.target);
+    for (const auto &f : part.to_hot)
+      part.words[f.at] = sh2a9::RegisterRegion::Branch(f.cond, cold_base + f.at, part.hot_base + f.target);
+    memcpy(ptr, part.words.data(), part.words.size() * sizeof(u32));
+    ptr += part.words.size() * sizeof(u32);
+  }
+#endif
+
+#if defined(VITA_SH2_ARENA_DISPATCH)
+  // Every BLOCK_RETURN (templates, regions, exits) becomes B arena_dispatch.
+  // No emitted data word equals this instruction (constants are MOVW/MOVT).
+  for (u32 *w = reinterpret_cast<u32 *>(startptr); w < reinterpret_cast<u32 *>(ptr); ++w)
+    if (*w == 0xe597f090u)                         // ldr pc,[r7,#144]
+      *w = 0xea000000u | ((u32(arena_dispatch - reinterpret_cast<u8 *>(w) - 8) >> 2) & 0xffffffu);
+#endif
+  last_code_bytes_ = u32(ptr - startptr);
   if (write_memory_counter > 0) {
     page->flags |= BLOCK_WRITE;
   }
@@ -1703,8 +2590,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
   return 0;
 }
 
-DynarecSh2::DynarecSh2() {
-  m_pDynaSh2     = new tagSH2;
+DynarecSh2::DynarecSh2() : m_pDynaSh2(new tagSH2()), memcycle_(m_pDynaSh2->memcycle) {
   m_pDynaSh2->getmembyte = (uintptr_t)memGetByte;
   m_pDynaSh2->getmemword = (uintptr_t)memGetWord;
   m_pDynaSh2->getmemlong = (uintptr_t)memGetLong;
@@ -1712,6 +2598,18 @@ DynarecSh2::DynarecSh2() {
   m_pDynaSh2->setmemword = (uintptr_t)memSetWord;
   m_pDynaSh2->setmemlong = (uintptr_t)memSetLong;
   m_pDynaSh2->eachclock = (uintptr_t)DebugEachClock;
+  m_pDynaSh2->spec_high = (uintptr_t)HighWram;
+  m_pDynaSh2->spec_pages = (uintptr_t)CompileBlocks::getInstance()->code_pages;
+  m_pDynaSh2->chain_table = (uintptr_t)CompileBlocks::getInstance()->LookupTable;
+#ifdef VITA_SH2_MACW_WRAM
+  m_pDynaSh2->macw_saturate = (uintptr_t)&sh2_macw_saturate;
+#endif
+#ifdef VITA_SH2_MACL_WRAM
+  m_pDynaSh2->macl_saturate = (uintptr_t)&sh2_macl_saturate;
+#endif
+#ifdef VITA_SH2_NATIVE_DISPATCH
+  m_pDynaSh2->dispatch = (uintptr_t)&sh2_dispatch;  // chain_budget 0 = plain return
+#endif
 
   m_pCompiler = CompileBlocks::getInstance();
   m_ClockCounter = 0;
@@ -1744,6 +2642,8 @@ void DynarecSh2::ResetCPU(){
   m_pDynaSh2->GenReg[15] = MappedMemoryReadLong(m_pDynaSh2->CtrlReg[2] + 4,NULL);
   m_pDynaSh2->SysReg[4] = 0;
   m_pDynaSh2->SysReg[5] = 0;
+  m_pDynaSh2->spec_high = (uintptr_t)HighWram;   // allocated by now
+  m_pDynaSh2->spec_pages = (uintptr_t)m_pCompiler->code_pages;
   pre_cnt_ = 0;
   pre_exe_count_ = 0;
   interruput_chk_cnt_ = 0;
@@ -1753,6 +2653,13 @@ void DynarecSh2::ResetCPU(){
 }
 
 void DynarecSh2::ExecuteCount( u32 Count ) {
+#ifdef VITA_SH2_LEAN_DISPATCH
+  // The debug body stays out of line: its frame is not paid on every slice.
+  if (!m_pCompiler->debug_mode_) { ExecuteCountLean(Count); return; }
+#endif
+  ExecuteCountDebug(Count);
+}
+void __attribute__((noinline)) DynarecSh2::ExecuteCountDebug( u32 Count ) {
   u32 targetcnt = 0;
   
   m_pDynaSh2->SysReg[4] = 0;
@@ -1781,6 +2688,11 @@ void DynarecSh2::ExecuteCount( u32 Count ) {
   //  this->CheckInterupt();
   //}
   memcycle_ = 0;
+#ifdef VITA_SH2_LEAN_STATS
+  // Native cycles = slice count minus memory-cycle and loop-skip additions,
+  // the same total the per-block GET_COUNT deltas used to sum.
+  u32 slice_memory = 0, slice_skip = 0;
+#endif
   while (m_pDynaSh2->SysReg[4] < targetcnt) {
 #if defined(VITA_SH2_NATIVE_CHAIN) && !defined(DEBUG_CPU) && !defined(EXECUTE_STAT)
     // Keep every 1024th native call on ExecuteBlock's timed path. A chain
@@ -1824,20 +2736,31 @@ void DynarecSh2::ExecuteCount( u32 Count ) {
     if (cached && cached->b_addr != GET_PC()) cached = nullptr;
 #endif
     if (cached) {
+#ifndef VITA_SH2_LEAN_STATS
       ++m_pCompiler->exec_count_;
+#endif
       result = ExecuteBlock(cached);
     } else result = Execute();
 #else
     result = Execute();
 #endif
     if (result == IN_INFINITY_LOOP ) {
+#ifdef VITA_SH2_LEAN_STATS
+        slice_skip += targetcnt - GET_COUNT();
+#endif
         SET_COUNT(targetcnt);
         loopskip_cnt_++;
     }
+#ifdef VITA_SH2_LEAN_STATS
+    slice_memory += memcycle_;
+#endif
     m_pDynaSh2->SysReg[4] += memcycle_;
     memcycle_ = 0;
     //printf("%d/%d\n",GET_COUNT(),targetcnt);
   }
+#ifdef VITA_SH2_LEAN_STATS
+  native_cycles += m_pDynaSh2->SysReg[4] - slice_memory - slice_skip;
+#endif
 
   CurrentSH2->cycles = m_pDynaSh2->SysReg[4];
   counted_slice_active_ = false;
@@ -1897,7 +2820,9 @@ int DynarecSh2::Execute(){
 
   Block * pBlock = NULL;
 
+#ifndef VITA_SH2_LEAN_STATS
   m_pCompiler->exec_count_++;
+#endif
 #if defined(EXECUTE_STAT)
   m_pCompiler->setShowCode( is_slave_ );
 #endif
@@ -1993,7 +2918,7 @@ int DynarecSh2::Execute(){
           Undecoded();
           return IN_INFINITY_LOOP;
         }
-        m_pCompiler->LookupTable[(GET_PC() & 0x000FFFFF) >> 1] = pBlock;
+        m_pCompiler->SetHigh((GET_PC() & 0x000FFFFF) >> 1, pBlock);
       }
       break;
 
@@ -2051,6 +2976,38 @@ __attribute__((always_inline)) inline int DynarecSh2::ExecuteBlock(Block *pBlock
       const u16 kind = instruction & 0xf00f;
       starts_with_load = kind >= 0x6000 && kind <= 0x6002;
       if (starts_with_load) load_address = m_pDynaSh2->GenReg[(instruction >> 4) & 15];
+#ifdef VITA_STACK_PROFILE
+      for (u32 a = pBlock->b_addr, k = 0; a <= pBlock->e_addr && k < 256; a += 2, ++k) {
+        const u16 op = T2ReadWord(ram, a & 0xfffff);
+        const bool admitted = (sh2a9::RegisterRegion::Supports(op)
+#ifndef VITA_SH2_IMMEDIATE_LOGIC
+            && !sh2a9::RegisterRegion::IsImmediateLogic(op)
+#endif
+#ifndef VITA_SH2_MAC_REGIONS
+            && !sh2a9::RegisterRegion::IsMacOperation(op)
+#endif
+            ) || sh2a9::RegisterRegion::IsIndirectLoad(op) || sh2a9::RegisterRegion::IsPcLoad(op)
+#ifdef VITA_SH2_DISP_LOADS
+            || sh2a9::RegisterRegion::IsDisplacementLoad(op) || sh2a9::RegisterRegion::IsIndexedLoad(op)
+#endif
+#ifdef VITA_SH2_RAM_STORES
+            || sh2a9::RegisterRegion::IsStore(op)
+#endif
+            ;
+        if (admitted) ++region_ops;
+        else { ++outside_ops; ++outside_hist[m_pCompiler->dsh2_instructions[op]]; }
+        { /* memory access base register (loads/stores with a register base) */
+          int base = -1;
+          if (sh2a9::RegisterRegion::IsIndirectLoad(op) || sh2a9::RegisterRegion::IsDisplacementLoad(op) ||
+              sh2a9::RegisterRegion::IsIndexedLoad(op))
+            base = ((op >> 12) == 8) ? ((op >> 4) & 15) : ((op >> 4) & 15);
+          else if (sh2a9::RegisterRegion::IsStore(op))
+            base = ((op >> 12) == 8) ? ((op >> 4) & 15) : ((op >> 8) & 15);
+          else if ((op & 0xf0ff) == 0x4022 || (op & 0xf0ff) == 0x4026) base = (op >> 8) & 15; // STS.L PR,@-Rn / LDS.L @Rm+,PR
+          if (base >= 0) { ++mem_ops_total; mem_ops_r15 += base == 15; }
+        }
+      }
+#endif
     }
   }
   const u64 native_start_time = sample_native ? YabauseGetTicks() : 0;
@@ -2082,13 +3039,27 @@ __attribute__((always_inline)) inline int DynarecSh2::ExecuteBlock(Block *pBlock
     poll_step_cycles += static_cast<u32>(GET_COUNT() - native_start_cycle);
   } else
 #endif
-  ((dynaFunc)((void*)(pBlock->code)))(m_pDynaSh2);
+  {
+#ifdef VITA_STACK_PROFILE
+    if (!is_slave_) { vt_pc_off = offsetof(Block, b_addr); vt_pc_src = &m_pDynaSh2->chain_cur; }
+    m_pDynaSh2->chain_cur = reinterpret_cast<uintptr_t>(pBlock);
+    VitaStackPush(VT_SH2_NATIVE);
+#elif defined(A9_PMU_REGIONS)
+    VitaStackPush(VT_SH2_NATIVE);
+#endif
+    ((dynaFunc)((void*)(pBlock->code)))(m_pDynaSh2);
+#if defined(VITA_STACK_PROFILE) || defined(A9_PMU_REGIONS)
+    VitaStackPop();
+#endif
+  }
 #endif
 #ifdef VITA_SH2_RESIDENT_LOOPS
   m_pDynaSh2->exitcount = saved_exitcount;
 #endif
   ++native_returns;
+#ifndef VITA_SH2_LEAN_STATS
   native_cycles += static_cast<u32>(GET_COUNT() - native_start_cycle);
+#endif
 #ifdef VITA_SH2_RESIDENT_LOOPS
   // Only that compiler tier can create BLOCK_RESIDENT_LOOP. Keep its counter
   // arithmetic out of both inlined dispatch paths when the tier is disabled.
@@ -2134,6 +3105,13 @@ __attribute__((always_inline)) inline int DynarecSh2::ExecuteBlock(Block *pBlock
 }
 
 __attribute__((always_inline)) inline int DynarecSh2::FinishBlock(Block *pBlock) {
+#ifdef VITA_SH2_STACK_SPEC
+  if (UNLIKELY(m_pDynaSh2->spec_bail)) {  // entry validation failed, nothing executed
+    m_pCompiler->SpecDeny(m_pDynaSh2->spec_bail);
+    m_pDynaSh2->spec_bail = 0;
+    return 0;
+  }
+#endif
   if ((GET_SR() & 0xF0) < GET_ICOUNT()) {
     this->CheckInterupt();
   }

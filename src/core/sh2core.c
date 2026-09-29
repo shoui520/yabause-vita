@@ -50,6 +50,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #if defined(SH2_DYNAREC)
 #include "sh2_dynarec/sh2_dynarec.h"
 #endif
+#include "sh2_div64.h"
 
 SH2_struct *MSH2=NULL;
 SH2_struct *SSH2=NULL;
@@ -1827,8 +1828,9 @@ void FASTCALL OnchipWriteLong(u32 addr, u32 val)  {
          }
          else
          {
-            s64 quotient = dividend / divisor;
-            s32 remainder = dividend % divisor;
+            s64 quotient;
+            s32 remainder;
+            SH2Div64(dividend, divisor, &quotient, &remainder);
 
             if (quotient > 0x7FFFFFFF)
             {

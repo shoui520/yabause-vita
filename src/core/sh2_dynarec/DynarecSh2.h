@@ -25,8 +25,10 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <array>
 #include <vector>
+#include <algorithm>
 
 #include <sys/types.h>
 #include <stdint.h>
@@ -158,6 +160,14 @@ struct Block
 
 #define IN_INFINITY_LOOP (-1)
 
+extern "C" void sh2_block_exit(void);  // dynalib_arm.s: plain block return
+extern "C" void sh2_dispatch(void);
+extern "C" void sh2_dispatch_end(void);  // end of sh2_dispatch (position independent)
+extern "C" void sh2_macw_saturate(void);  // dynalib_arm.s: MAC.W S=1 tail
+extern "C" void sh2_macl_saturate(void);  // dynalib_arm.s: MAC.L S=1 tail
+extern "C" void sh2_macl_region(void);    // dynalib_arm.s: MAC_L template as a call
+extern "C" void sh2_macw_region(void);    // dynalib_arm.s: MAC_W template as a call
+
 // Sh2 Registris
 struct tagSH2
 {
@@ -172,6 +182,20 @@ struct tagSH2
   uintptr_t setmemlong;
   uintptr_t eachclock;
   u32 exitcount;
+  u32 spec_bail;   // stack speculation: nonzero PC = entry validation failed, nothing executed
+  uintptr_t spec_high;   // #136 HighWram (stack speculation entry check)
+  uintptr_t spec_pages;  // #140 CompileBlocks::code_pages
+  // Native dispatch (VITA_SH2_NATIVE_DISPATCH): every block exit is
+  // LDR pc,[r7,#144]. sh2_block_exit returns to C; sh2_dispatch enters the
+  // next cached high-RAM block directly while chain_budget allows it and the
+  // C dispatcher would do nothing but look that block up.
+  uintptr_t dispatch = reinterpret_cast<uintptr_t>(&sh2_block_exit); // #144
+  u32 chain_budget = 0;       // #148 further blocks sh2_dispatch may enter
+  uintptr_t chain_table = 0;  // #152 CompileBlocks::LookupTable (high RAM)
+  uintptr_t chain_cur = 0;    // #156 Block last entered (by C or sh2_dispatch)
+  u32 memcycle = 0;             // #160 DynarecSh2::memcycle_ itself (one load from r7)
+  uintptr_t macw_saturate = 0;  // #164 sh2_macw_saturate (VITA_SH2_MACW_WRAM)
+  uintptr_t macl_saturate = 0;  // #168 sh2_macl_saturate (VITA_SH2_MACL_WRAM)
 };
 
 #ifdef VITA
@@ -306,6 +330,62 @@ public:
   Block * dCode = nullptr;
   
   std::unordered_map<u32, int> self_modify_block;
+  // VITA_SH2_SMC_VARIANTS: high-RAM PCs whose code the guest rewrote keep up
+  // to kSmcVariants compiled slots. A slot is published again, in place of a
+  // compile, only while every source word the compiler read for it (and the
+  // PC's stack-speculation denial) is unchanged, i.e. when a compile now
+  // would emit that same code. (Members unconditional: one class layout.)
+  struct SmcVariant { u32 pc = 0; bool denied = false; std::vector<u16> words; };
+  static constexpr unsigned kSmcVariants = 8;
+  std::vector<SmcVariant> smc_slot_;                  // by slot; pc 0: none
+  std::unordered_map<u32, std::vector<int>> smc_pcs_; // PC -> its variant slots
+  std::vector<u16> SmcSourceWords(u32 pc, u32 e_addr);
+  Block *SmcReuse(u32 pc, addrs *ParentT);
+  std::vector<u16> smc_words_;  // SmcReuse's scratch: the current source words
+  int SmcSlot(u32 pc);
+  // VITA_SH2_PACKED_CODE: slot code is placed at a cursor in the arena, each
+  // block right after the previous one, instead of at a fixed 4 KiB slot. A
+  // compile still has MAXBLOCKSIZE bytes of room, so blocks end where they
+  // did; live blocks whose code the room overlaps are evicted as a recycled
+  // slot is. (Members unconditional: one class layout.)
+  std::vector<u32> code_off_, code_bytes_;             // by slot; bytes 0: none
+  std::vector<std::vector<int>> code_page_slots_;      // by 4 KiB arena page
+  size_t code_cursor_ = 0;
+  u32 last_code_bytes_ = 0;                            // set by EmmitCode
+  void EvictSlot(int slot);
+  void CodeRelease(int slot);
+  void PlaceCode(int slot);
+  void PlacedCode(int slot);
+  std::unordered_set<u32> spec_deny;   // block starts compiled without stack speculation
+  void SpecDeny(u32 pc) {
+#ifdef VITA_STACK_PROFILE
+    extern u32 g_prof_spec[4]; ++g_prof_spec[3];
+#endif
+    spec_deny.insert(pc);
+    if ((pc & 0x0FF00000) == 0x06000000) SetHigh((pc & 0x000FFFFF) >> 1, NULL);
+  }
+
+  // Every high-RAM LookupTable write. Keeps Block::link_pc equal to b_addr
+  // exactly while sh2_dispatch would find the block for that PC, and relinks
+  // the block exits waiting for a newly published block (VITA_SH2_LINK).
+  void SetHigh(u32 index, Block *b) {
+    if (Block *old = LookupTable[index]) { old->link_pc = 0; ++g_code_epoch; }
+    LookupTable[index] = b;
+    if (b && (b->b_addr & 0xFFF00001u) == 0x06000000u && ((b->b_addr & 0x000FFFFFu) >> 1) == index) {
+      b->link_pc = b->b_addr;
+      Relink(b);
+    }
+  }
+  // Block linking: a block's static exits (at most two) into high RAM, as
+  // byte offsets of their link stubs, and the reverse index by target PC.
+  struct LinkExit { u32 target, offset; };
+  LinkExit (*link_out)[2] = nullptr;
+  std::unordered_multimap<u32, u32> link_in;  // target PC -> slot * 2 + exit
+  u8 *link_check = nullptr;                   // shared check routine (code arena)
+  u8 *arena_dispatch = nullptr;               // sh2_dispatch copy (code arena), see EmmitCode
+  void Relink(Block *b);
+  void UnlinkSlot(int slot);
+  void PatchLink(int slot, int exit, const Block *target);
 
   inline void setDirty(u32 addr) {
     addr = adress_mask(addr);
@@ -320,7 +400,7 @@ public:
          LOG("%d %08X is removed", LookupTable[*it]->id, (*it) << 1);
         remove_count_++;
         self_modify_block[ (((*it) << 1) | 0x06000000) ] = LookupTable[*it]->id;
-        LookupTable[*it] = NULL;
+        SetHigh(*it, NULL);
       }
     }
     LookupParentTable[addr].clear();
@@ -337,6 +417,10 @@ public:
 
   int findFreeBlock(u32 pc);
   int EmmitCode(Block *page, addrs * ParentT = NULL);
+  // Second compile pass of a block holding MAC operations (VITA_SH2_MAC_REGIONS):
+  // admit them into register regions, ending exactly after forced_end_.
+  bool mac_regions_ = false;
+  u32 forced_end_ = 0;
 
   // statics
   u32 compile_count_ ;
@@ -400,6 +484,11 @@ public:
 
   void ResetCPU();  
   void ExecuteCount(u32 Count );
+  void ExecuteCountDebug(u32 Count);
+#ifdef VITA_SH2_LEAN_DISPATCH
+  void ExecuteCountLean(u32 Count);
+  void ExecuteCountLeanFull(u32 Count);
+#endif
   int Execute();
   int ExecuteBlock(Block *block);
   int FinishBlock(Block *block);
@@ -410,7 +499,7 @@ public:
   }
 
   u32 addcycle_ = 0;
-  u32 memcycle_ = 0;
+  u32 &memcycle_;               // m_pDynaSh2->memcycle
   bool counted_slice_active_ = false;
   void ShowStatics();
   void ShowCompileInfo();

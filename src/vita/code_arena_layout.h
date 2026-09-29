@@ -4,6 +4,9 @@
 #ifndef VITA_M68K_CODE_RESERVE_KIB
 #define VITA_M68K_CODE_RESERVE_KIB 0
 #endif
+#ifndef VITA_SH2_BLOCK_STAGGER
+#define VITA_SH2_BLOCK_STAGGER 0
+#endif
 namespace vitacode {
 enum class Region { Sh2, M68k };
 struct Layout {
@@ -14,7 +17,16 @@ struct Layout {
   static_assert(VITA_M68K_CODE_RESERVE_KIB % 4 == 0, "reserve must be 4 KiB aligned");
   static constexpr std::size_t M68k = VITA_M68K_CODE_RESERVE_KIB * 1024u;
   static constexpr std::size_t Sh2 = Total - M68k;
-  static constexpr unsigned Sh2Blocks = Sh2 / Block;
+  /* Slot stride. Block-sized strides start every block on a 4 KiB boundary:
+   * on the A9's 32 KiB 4-way L1 (8 KiB per way) all block entries then share
+   * two cache sets. A few extra lines per slot spread them over all sets. */
+  static_assert(VITA_SH2_BLOCK_STAGGER % 32 == 0, "stagger must be whole cache lines");
+  static constexpr std::size_t Stride = Block + VITA_SH2_BLOCK_STAGGER;
+  /* Shared runtime code (the sh2_dispatch copy and the block-link check) at
+   * the end of the SH-2 region, within branch range of every block. */
+  static constexpr std::size_t Stubs = 512;
+  static constexpr std::size_t StubOffset = Sh2 - Stubs;
+  static constexpr unsigned Sh2Blocks = StubOffset / Stride;
   static constexpr unsigned NextSh2Block(unsigned current) {
     if constexpr ((Sh2Blocks & (Sh2Blocks - 1)) == 0)
       return (current + 1) & (Sh2Blocks - 1);

@@ -12,3 +12,8 @@ trap 'rm -f -- "$test_dir/a9-region" "$test_dir/oracle.o"; rmdir -- "$test_dir"'
   "$repo_dir/tests/test_a9_register_region.cpp" "$test_dir/oracle.o" \
   -Wl,--gc-sections -o "$test_dir/a9-region"
 qemu-arm -cpu cortex-a9 "$test_dir/a9-region"
+"${ARM_CXX:-arm-linux-gnueabihf-g++}" -std=c++17 -O2 -g -static -DVITA_SH2_DIV_CHAIN \
+  -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -Wall -Wextra -Werror \
+  "$repo_dir/tests/test_a9_register_region.cpp" "$test_dir/oracle.o" \
+  -Wl,--gc-sections -o "$test_dir/a9-region"
+qemu-arm -cpu cortex-a9 "$test_dir/a9-region"

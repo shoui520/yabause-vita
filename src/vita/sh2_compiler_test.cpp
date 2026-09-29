@@ -4,6 +4,7 @@
 #include "sh2core.h"
 #include "sh2_dynarec/DynarecSh2.h"
 #include "sh2_dynarec/poll_step.h"
+#include "sh2_dynarec/a9_register_region.h"
 #include <cstring>
 #include <new>
 
@@ -43,7 +44,7 @@ static u32 PollWord(u32 a) {
 extern "C" int VitaSh2CompilerTest(void) {
   constexpr u32 offset = 0xff000, pc = 0x06000000 + offset;
   struct Restore {
-    u8 bytes[512];
+    u8 bytes[0x480];
     u8 low[32];
     Restore() {
       std::memcpy(bytes, HighWram + offset, sizeof(bytes));
@@ -140,6 +141,380 @@ extern "C" int VitaSh2CompilerTest(void) {
         return -1;
       }
     }
+#ifdef VITA_SH2_DEFER_SEPARATORS
+    { /* Differential: identical programs compiled with per-instruction
+       * separators and with deferred ones must leave identical state/memory. */
+      extern bool g_sh2_defer_separators;
+      struct Toggle { ~Toggle() { g_sh2_defer_separators = true; } } toggle;
+      constexpr u32 scratch = offset + 256;
+      static u8 *scratch_ram; scratch_ram = HighWram;
+      struct W { static void B(u32 a, u32 v) { a &= 0xfffff; if (a >= scratch && a < scratch + 64) T2WriteByte(scratch_ram, a, v); }
+                 static void Wd(u32 a, u32 v) { a &= 0xfffff; if (a >= scratch && a + 1 < scratch + 64) T2WriteWord(scratch_ram, a, v); }
+                 static void L(u32 a, u32 v) { a &= 0xfffff; if (a >= scratch && a + 3 < scratch + 64) T2WriteLong(scratch_ram, a, v); } };
+      u32 seed = 0x1234567u;
+      auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+      static const unsigned dsts[] = {0, 4, 5, 6}, ptrs[] = {1, 2, 3};
+      unsigned defer_cases = 0;
+      u8 init_code[128], init_scratch[64];
+      for (unsigned c = 0; c < 400; ++c) {
+        u16 program[16]; unsigned n = 0;
+        const unsigned body = 1 + rnd() % 11;
+        for (unsigned k = 0; k < body; ++k) {
+          const unsigned d = dsts[rnd() % 4], pr = ptrs[rnd() % 3], sz = rnd() % 3;
+          switch (rnd() % 9) {
+            case 0: program[n++] = 0x6000 | d << 8 | pr << 4 | (sz == 0 ? 2 : sz == 1 ? 1 : 0); break; // MOV.x @Rp,Rd
+            case 1: program[n++] = 0x2000 | pr << 8 | d << 4 | (sz == 0 ? 2 : sz == 1 ? 1 : 0); break; // MOV.x Rd,@Rp
+            case 2: program[n++] = 0x9000 | d << 8 | (rnd() & 15); break;                           // MOV.W @(d,PC)
+            case 3: program[n++] = 0xd000 | d << 8 | (rnd() & 15); break;                           // MOV.L @(d,PC)
+            case 4: program[n++] = 0xc700 | (rnd() & 15); break;                                    // MOVA
+            case 5: program[n++] = 0x300c | d << 8 | dsts[rnd() % 4] << 4; break;                   // ADD Rm,Rn
+            case 6: program[n++] = 0xe000 | d << 8 | (rnd() & 255); break;                          // MOV #i
+            case 7: program[n++] = 0x4008 | d << 8; break;                                          // SHLL2
+            default: program[n++] = 0x0009; break;                                                 // NOP
+          }
+        }
+        switch (rnd() % 3) {
+          case 0: program[n++] = 0x000b; program[n++] = 0x0009; break; // RTS; NOP
+          case 1: program[n++] = 0x8902; program[n++] = 0x0009; break; // BT +2
+          default: program[n++] = 0x8b01; program[n++] = 0x0009; break; // BF +1
+        }
+        for (unsigned i = 0; i < sizeof(init_code); i += 2) T2WriteWord(HighWram, offset + i, (u16)rnd());
+        for (unsigned i = 0; i < n; ++i) T2WriteWord(HighWram, offset + i * 2, program[i]);
+        for (unsigned i = 0; i < 64; i += 4) T2WriteLong(HighWram, scratch + i, rnd());
+        std::memcpy(init_code, HighWram + offset, sizeof(init_code));
+        std::memcpy(init_scratch, HighWram + scratch, sizeof(init_scratch));
+        tagSH2 start = {};
+        for (unsigned i = 0; i < 16; ++i) start.GenReg[i] = rnd();
+        for (unsigned i = 1; i <= 3; ++i) start.GenReg[i] = 0x06000000 + scratch + 16 * (i - 1) + 4 * (rnd() % 3);
+        start.CtrlReg[0] = 0x3f0 | (rnd() & 1);
+        start.SysReg[2] = 0x06001230; start.SysReg[3] = pc; start.SysReg[4] = rnd() & 0xffff;
+        start.getmembyte = reinterpret_cast<uintptr_t>(&TestByte);
+        start.getmemword = reinterpret_cast<uintptr_t>(&TestWord);
+        start.getmemlong = reinterpret_cast<uintptr_t>(&TestLong);
+        start.setmembyte = reinterpret_cast<uintptr_t>(&W::B);
+        start.setmemword = reinterpret_cast<uintptr_t>(&W::Wd);
+        start.setmemlong = reinterpret_cast<uintptr_t>(&W::L);
+        tagSH2 result[2]; u8 memory[2][64];
+        for (unsigned mode = 0; mode < 2; ++mode) {
+          std::memcpy(HighWram + offset, init_code, sizeof(init_code));
+          std::memcpy(HighWram + scratch, init_scratch, sizeof(init_scratch));
+          g_sh2_defer_separators = mode != 0;
+          Block *block = compiler->CompileBlock(pc, nullptr);
+          if (!block) { YuiMsg("jit_defer_test_failed compile case=%u", c); return -1; }
+          result[mode] = start;
+          reinterpret_cast<void (*)(tagSH2 *)>(block->code)(&result[mode]);
+          std::memcpy(memory[mode], HighWram + scratch, 64);
+        }
+        if (std::memcmp(&result[0], &result[1], sizeof(tagSH2)) || std::memcmp(memory[0], memory[1], 64)) {
+          YuiMsg("jit_defer_test_failed case=%u pc=%08x/%08x cycles=%u/%u r0=%08x/%08x", c,
+            result[0].SysReg[3], result[1].SysReg[3], result[0].SysReg[4], result[1].SysReg[4],
+            result[0].GenReg[0], result[1].GenReg[0]);
+          return -1;
+        }
+        ++defer_cases;
+      }
+      YuiMsg("jit_defer_test_pass cases=%u", defer_cases);
+    }
+#endif
+#ifdef VITA_SH2_RAM_STORES
+    { /* Differential: the same programs compiled as high-RAM blocks (owner
+       * tracking on) with region stores and with the original templates must
+       * leave identical state and memory. Scratch is either in the code's own
+       * KiB (owned: helper path) or the next KiB (unowned: inline path). */
+      extern bool g_sh2_region_stores;
+      struct Toggle { ~Toggle() { g_sh2_region_stores = true; } } toggle;
+      static u32 scratch; static u8 *scratch_ram; scratch_ram = HighWram;
+      struct W { static bool In(u32 a, unsigned w) { a &= 0xfffff; return a >= scratch && a + w <= scratch + 128; }
+                 static void B(u32 a, u32 v) { if (In(a, 1)) T2WriteByte(scratch_ram, a & 0xfffff, v); }
+                 static void Wd(u32 a, u32 v) { if (In(a, 2)) T2WriteWord(scratch_ram, a & 0xfffff, v); }
+                 static void L(u32 a, u32 v) { if (In(a, 4)) T2WriteLong(scratch_ram, a & 0xfffff, v); } };
+      u32 seed = 0x5354524fu;
+      auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+      // R0 is the index for @(R0,Rn) forms: a small multiple of 4, never a
+      // destination, so every access stays inside this test's scratch.
+      static const unsigned dsts[] = {4, 5, 6, 7}, ptrs[] = {1, 2, 3};
+      unsigned store_cases = 0;
+      u8 init_code[128], init_scratch[128];
+      for (unsigned c = 0; c < 600; ++c) {
+        scratch = (c & 1) ? offset + 0x400 : offset + 256;
+        u16 program[20]; unsigned n = 0;
+        const unsigned body = 1 + rnd() % 15;
+        for (unsigned k = 0; k < body; ++k) {
+          const unsigned d = dsts[rnd() % 4], pr = ptrs[rnd() % 3], sz = rnd() % 3;
+          const unsigned sizes = sz == 0 ? 2 : sz == 1 ? 1 : 0;
+          static const u16 shifts[] = {0x4000, 0x4001, 0x4020, 0x4021};
+          switch (rnd() % 16) {
+            case 0: program[n++] = 0x6000 | d << 8 | pr << 4 | sizes; break;          // MOV.x @Rp,Rd
+            case 1: program[n++] = 0x2000 | pr << 8 | d << 4 | sizes; break;          // MOV.x Rd,@Rp
+            case 2: program[n++] = 0x1000 | pr << 8 | d << 4 | (rnd() % 4); break;    // MOV.L Rd,@(disp,Rp)
+            case 3: program[n++] = 0x8000 | pr << 4 | (rnd() % 16); break;            // MOV.B R0,@(disp,Rp)
+            case 4: program[n++] = 0x8100 | pr << 4 | (rnd() % 8); break;             // MOV.W R0,@(disp,Rp)
+            case 5: program[n++] = 0x5000 | d << 8 | pr << 4 | (rnd() % 4); break;    // MOV.L @(disp,Rp),Rd
+            case 6: program[n++] = 0x000c | d << 8 | pr << 4 | (2 - sizes); break;    // MOV.x @(R0,Rp),Rd
+            case 7: program[n++] = 0x0004 | pr << 8 | d << 4 | sizes; break;          // MOV.x Rd,@(R0,Rp)
+            case 8: program[n++] = 0x2004 | pr << 8 | (rnd() & 1 ? pr : d) << 4 | sizes; break; // MOV.x Rm,@-Rp
+            case 9: program[n++] = 0x300c | d << 8 | dsts[rnd() % 4] << 4; break;     // ADD Rm,Rn
+            case 10: program[n++] = 0xe000 | d << 8 | (rnd() & 255); break;          // MOV #i
+            case 11: program[n++] = 0x4008 | d << 8; break;                          // SHLL2
+            case 12: case 13: program[n++] = shifts[rnd() % 4] | d << 8; break;      // SHLL/SHLR/SHAL/SHAR
+            case 14: program[n++] = 0x0029 | d << 8; break;                          // MOVT
+            default: program[n++] = 0x0009; break;                                   // NOP
+          }
+        }
+        switch (rnd() % 3) {
+          case 0: program[n++] = 0x000b; program[n++] = 0x0009; break; // RTS; NOP
+          case 1: program[n++] = 0x8902; program[n++] = 0x0009; break; // BT +2
+          default: program[n++] = 0x8b01; program[n++] = 0x0009; break; // BF +1
+        }
+        for (unsigned i = 0; i < sizeof(init_code); i += 2) T2WriteWord(HighWram, offset + i, (u16)rnd());
+        for (unsigned i = 0; i < n; ++i) T2WriteWord(HighWram, offset + i * 2, program[i]);
+        for (unsigned i = 0; i < 128; i += 4) T2WriteLong(HighWram, scratch + i, rnd());
+        std::memcpy(init_code, HighWram + offset, sizeof(init_code));
+        std::memcpy(init_scratch, HighWram + scratch, sizeof(init_scratch));
+        tagSH2 start = {};
+        for (unsigned i = 0; i < 16; ++i) start.GenReg[i] = rnd();
+        // Pointers leave room for up to 15 pre-decrements below and index 12 above.
+        for (unsigned i = 1; i <= 3; ++i) start.GenReg[i] = 0x06000000 + scratch + 64 + 16 * (i - 1) + 4 * (rnd() % 3);
+        start.GenReg[0] = 4 * (rnd() % 4);
+        start.CtrlReg[0] = 0x3f0 | (rnd() & 1);
+        start.SysReg[2] = 0x06001230; start.SysReg[3] = pc; start.SysReg[4] = rnd() & 0xffff;
+        start.getmembyte = reinterpret_cast<uintptr_t>(&TestByte);
+        start.getmemword = reinterpret_cast<uintptr_t>(&TestWord);
+        start.getmemlong = reinterpret_cast<uintptr_t>(&TestLong);
+        start.setmembyte = reinterpret_cast<uintptr_t>(&W::B);
+        start.setmemword = reinterpret_cast<uintptr_t>(&W::Wd);
+        start.setmemlong = reinterpret_cast<uintptr_t>(&W::L);
+        tagSH2 result[2]; u8 memory[2][128];
+        for (unsigned mode = 0; mode < 2; ++mode) {
+          std::memcpy(HighWram + offset, init_code, sizeof(init_code));
+          std::memcpy(HighWram + scratch, init_scratch, sizeof(init_scratch));
+          g_sh2_region_stores = mode != 0;
+          Block *block = compiler->CompileBlock(pc, compiler->LookupParentTable);
+          if (!block) { YuiMsg("jit_store_test_failed compile case=%u", c); return -1; }
+          result[mode] = start;
+          reinterpret_cast<void (*)(tagSH2 *)>(block->code)(&result[mode]);
+          std::memcpy(memory[mode], HighWram + scratch, 128);
+          for (u32 i = 0; i < 64; ++i) compiler->LookupParentTable[adress_mask(pc) + i].clear();
+        }
+        if (std::memcmp(&result[0], &result[1], sizeof(tagSH2)) || std::memcmp(memory[0], memory[1], 128)) {
+          YuiMsg("jit_store_test_failed case=%u pc=%08x/%08x cycles=%u/%u r0=%08x/%08x", c,
+            result[0].SysReg[3], result[1].SysReg[3], result[0].SysReg[4], result[1].SysReg[4],
+            result[0].GenReg[0], result[1].GenReg[0]);
+          return -1;
+        }
+        ++store_cases;
+      }
+      // Owners were only this test's; the KiB is unowned again.
+      bool owned = false;
+      for (u32 i = 0; i < 512; ++i)
+        owned |= compiler->LookupParentTable[(adress_mask(pc) & ~511u) + i].size() != 0;
+      if (!owned) compiler->code_pages[adress_mask(pc) >> 9] = 0;
+      YuiMsg("jit_store_test_pass cases=%u", store_cases);
+    }
+#endif
+#ifdef VITA_SH2_STACK_SPEC
+    { /* Differential: stack-heavy programs compiled as high-RAM blocks with and
+       * without block-entry validated R15 speculation leave identical state and
+       * memory; an invalid R15 must return before executing anything. */
+      constexpr u32 stack_off = 0x80000;               // 0x06080000, inside the validation window
+      struct StackRestore { u8 bytes[0x800]; StackRestore() { std::memcpy(bytes, HighWram + 0x80000 - 0x400, sizeof(bytes)); }
+                            ~StackRestore() { std::memcpy(HighWram + 0x80000 - 0x400, bytes, sizeof(bytes)); } } stack_restore;
+      struct Toggle { ~Toggle() { sh2a9::RegisterRegion::stack_spec_enabled = true; } } toggle;
+      u32 seed = 0x53545350u;
+      auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+      unsigned spec_cases = 0, spec_bails = 0;
+      u8 init_code[128], init_stack[0x800];
+      for (unsigned c = 0; c < 400; ++c) {
+        u16 program[40]; unsigned n = 0;
+        const unsigned body = 2 + rnd() % 30;
+        for (unsigned k = 0; k < body; ++k) {
+          const unsigned a = 1 + rnd() % 6, b = 1 + rnd() % 6, d = rnd() % 16;
+          switch (rnd() % 10) {
+            case 0: program[n++] = 0x2f04 | a << 4 | (rnd() % 3); break;           // MOV.x Ra,@-R15
+            case 1: program[n++] = 0x60f4 | a << 8 | (rnd() % 3); break;           // MOV.x @R15+,Ra
+            case 2: program[n++] = 0x50f0 | a << 8 | d; break;                     // MOV.L @(d,R15),Ra
+            case 3: program[n++] = 0x1f00 | a << 4 | d; break;                     // MOV.L Ra,@(d,R15)
+            case 4: program[n++] = (rnd() & 1 ? 0x85f0 : 0x84f0) | d; break;        // MOV.W/B @(d,R15),R0
+            case 5: program[n++] = (rnd() & 1 ? 0x81f0 : 0x80f0) | d; break;        // MOV.W/B R0,@(d,R15)
+            case 6: program[n++] = 0x7f00 | u8(s8(4 * (int(rnd() % 9) - 4))); break; // ADD #imm,R15
+            case 7: program[n++] = 0x300c | a << 8 | b << 4; break;                // ADD Rb,Ra
+            case 8: program[n++] = 0x4f22; break;                                  // STS.L PR,@-R15 (template)
+            default: program[n++] = 0x62f2 | a << 8; break;                        // MOV.L @R15,Ra
+          }
+        }
+        program[n++] = 0x000b; program[n++] = 0x0009;                            // RTS; NOP
+        for (unsigned i = 0; i < sizeof(init_code); i += 2) T2WriteWord(HighWram, offset + i, (u16)rnd());
+        for (unsigned i = 0; i < n; ++i) T2WriteWord(HighWram, offset + i * 2, program[i]);
+        for (unsigned i = 0; i < sizeof(init_stack); i += 4) T2WriteLong(HighWram, stack_off - 0x400 + i, rnd());
+        std::memcpy(init_code, HighWram + offset, sizeof(init_code));
+        std::memcpy(init_stack, HighWram + stack_off - 0x400, sizeof(init_stack));
+        tagSH2 start = {};
+        for (unsigned i = 0; i < 16; ++i) start.GenReg[i] = rnd();
+        start.GenReg[15] = 0x06000000 + stack_off + 4 * (rnd() % 64);
+        start.CtrlReg[0] = 0x3f0 | (rnd() & 1);
+        start.SysReg[2] = 0x06001230; start.SysReg[3] = pc; start.SysReg[4] = rnd() & 0xffff;
+        start.getmembyte = reinterpret_cast<uintptr_t>(&TestByte);
+        start.getmemword = reinterpret_cast<uintptr_t>(&TestWord);
+        start.getmemlong = reinterpret_cast<uintptr_t>(&TestLong);
+        struct SW { static bool In(u32 a, unsigned w) { a &= 0xfffff; return a >= stack_off - 0x400 && a + w <= stack_off + 0x400; }
+                    static void B(u32 a, u32 v) { if (In(a, 1)) T2WriteByte(HighWram, a & 0xfffff, v); }
+                    static void Wd(u32 a, u32 v) { if (In(a, 2)) T2WriteWord(HighWram, a & 0xfffff, v); }
+                    static void L(u32 a, u32 v) { if (In(a, 4)) T2WriteLong(HighWram, a & 0xfffff, v); } };
+        start.setmembyte = reinterpret_cast<uintptr_t>(&SW::B);
+        start.setmemword = reinterpret_cast<uintptr_t>(&SW::Wd);
+        start.setmemlong = reinterpret_cast<uintptr_t>(&SW::L);
+        start.spec_high = reinterpret_cast<uintptr_t>(HighWram);
+        start.spec_pages = reinterpret_cast<uintptr_t>(compiler->code_pages);
+        tagSH2 result[2]; static u8 memory[2][0x800];
+        // Every 4th case: compiled code in a KiB at or next to the stack. Its
+        // blocks must bail (nothing executed) when a planned store touches it.
+        const int marked = c % 4 == 3 ? int(stack_off >> 10) + int(rnd() % 3) - 1 : -1;
+        if (marked >= 0) compiler->code_pages[marked] = 1;
+        for (unsigned mode = 0; mode < 2; ++mode) {
+          std::memcpy(HighWram + offset, init_code, sizeof(init_code));
+          std::memcpy(HighWram + stack_off - 0x400, init_stack, sizeof(init_stack));
+          sh2a9::RegisterRegion::stack_spec_enabled = mode != 0;
+          compiler->spec_deny.clear();
+          Block *block = compiler->CompileBlock(pc, compiler->LookupParentTable);
+          if (!block) { YuiMsg("jit_stack_spec_test_failed compile case=%u", c); return -1; }
+          result[mode] = start;
+          reinterpret_cast<void (*)(tagSH2 *)>(block->code)(&result[mode]);
+          if (result[mode].spec_bail) {             // like the dispatcher: deny, recompile, rerun
+            tagSH2 untouched = result[mode]; untouched.spec_bail = 0;
+            if (result[mode].spec_bail != pc || std::memcmp(&untouched, &start, sizeof(tagSH2)) ||
+                std::memcmp(HighWram + stack_off - 0x400, init_stack, sizeof(init_stack))) {
+              YuiMsg("jit_stack_spec_test_failed bail_side_effect case=%u", c); return -1;
+            }
+            ++spec_bails;
+            for (u32 i = 0; i < 64; ++i) compiler->LookupParentTable[adress_mask(pc) + i].clear();
+            compiler->SpecDeny(pc);
+            block = compiler->CompileBlock(pc, compiler->LookupParentTable);
+            if (!block) { YuiMsg("jit_stack_spec_test_failed recompile case=%u", c); return -1; }
+            result[mode] = start;
+            reinterpret_cast<void (*)(tagSH2 *)>(block->code)(&result[mode]);
+          }
+          std::memcpy(memory[mode], HighWram + stack_off - 0x400, sizeof(memory[mode]));
+          for (u32 i = 0; i < 64; ++i) compiler->LookupParentTable[adress_mask(pc) + i].clear();
+        }
+        if (marked >= 0) compiler->code_pages[marked] = 0;
+        if (std::memcmp(&result[0], &result[1], sizeof(tagSH2)) || std::memcmp(memory[0], memory[1], sizeof(memory[0]))) {
+          YuiMsg("jit_stack_spec_test_failed case=%u pc=%08x/%08x r15=%08x/%08x bail=%08x", c,
+            result[0].SysReg[3], result[1].SysReg[3], result[0].GenReg[15], result[1].GenReg[15], result[1].spec_bail);
+          return -1;
+        }
+        ++spec_cases;
+      }
+      { /* Invalid R15: the validated block must return with nothing executed. */
+        const u16 prog[] = {0x2f16, 0x51f1, 0x7f08, 0x000b, 0x0009};
+        for (unsigned i = 0; i < 5; ++i) T2WriteWord(HighWram, offset + i * 2, prog[i]);
+        compiler->spec_deny.clear();
+        Block *block = compiler->CompileBlock(pc, compiler->LookupParentTable);
+        tagSH2 st = {}, before;
+        for (unsigned i = 0; i < 16; ++i) st.GenReg[i] = 0x1111 * i;
+        st.GenReg[15] = 0x05a00100; st.SysReg[3] = pc; st.SysReg[4] = 77;
+        before = st;
+        reinterpret_cast<void (*)(tagSH2 *)>(block->code)(&st);
+        const bool ok = st.spec_bail == pc && (st.spec_bail = 0, !std::memcmp(&st, &before, sizeof(st)));
+        for (u32 i = 0; i < 64; ++i) compiler->LookupParentTable[adress_mask(pc) + i].clear();
+        if (!ok) { YuiMsg("jit_stack_spec_test_failed bail pc=%08x", st.SysReg[3]); return -1; }
+      }
+      compiler->spec_deny.clear();
+      bool owned = false;
+      for (u32 i = 0; i < 512; ++i)
+        owned |= compiler->LookupParentTable[(adress_mask(pc) & ~511u) + i].size() != 0;
+      if (!owned) compiler->code_pages[adress_mask(pc) >> 9] = 0;
+      YuiMsg("jit_stack_spec_test_pass cases=%u bails=%u", spec_cases, spec_bails);
+    }
+#endif
+#ifdef VITA_SH2_NATIVE_DISPATCH
+    { /* sh2_dispatch: A -> B -> C (BRA-linked high-RAM blocks) chained in one
+       * native call must equal C-driven single-block execution, and each exit
+       * condition must stop the chain at exactly the right block boundary. */
+      static const u16 progA[] = {0xe101, 0x7102, 0xa01c, 0x0009};  // @pc
+      static const u16 progB[] = {0x7103, 0x4100, 0xa01c, 0x0009};  // @pc+0x40
+      static const u16 progC[] = {0x7205, 0x000b, 0x0009};          // @pc+0x80, RTS to PR
+      u8 saved[0xc0]; std::memcpy(saved, HighWram + offset, sizeof(saved));
+      for (unsigned i = 0; i < 4; ++i) T2WriteWord(HighWram, offset + i * 2, progA[i]);
+      for (unsigned i = 0; i < 4; ++i) T2WriteWord(HighWram, offset + 0x40 + i * 2, progB[i]);
+      for (unsigned i = 0; i < 3; ++i) T2WriteWord(HighWram, offset + 0x80 + i * 2, progC[i]);
+      Block *blk[3];
+      for (unsigned b = 0; b < 3; ++b) {
+        blk[b] = compiler->CompileBlock(pc + b * 0x40, compiler->LookupParentTable);
+        if (!blk[b]) { YuiMsg("jit_dispatch_test_failed compile %u", b); return -1; }
+        compiler->SetHigh((offset + b * 0x40) >> 1, blk[b]);
+      }
+      tagSH2 start = {};
+      for (unsigned i = 0; i < 16; ++i) start.GenReg[i] = 0x100 * i;
+      start.CtrlReg[0] = 0xf0; start.SysReg[2] = 0x00001230; start.SysReg[3] = pc; start.SysReg[5] = 0; // PR outside high RAM
+      start.exitcount = 100000;
+      start.chain_table = reinterpret_cast<uintptr_t>(compiler->LookupTable);
+      // Reference: C-driven, one block per call.
+      tagSH2 ref[4]; ref[0] = start;
+      for (unsigned b = 0; b < 3; ++b) {
+        ref[b + 1] = ref[b];
+        reinterpret_cast<void (*)(tagSH2 *)>(blk[b]->code)(&ref[b + 1]);
+      }
+      auto same = [](const tagSH2 &x, const tagSH2 &y) {
+        return !std::memcmp(x.GenReg, y.GenReg, sizeof(x.GenReg)) && !std::memcmp(x.CtrlReg, y.CtrlReg, sizeof(x.CtrlReg)) &&
+               !std::memcmp(x.SysReg, y.SysReg, sizeof(x.SysReg));
+      };
+      bool ok = ref[1].SysReg[3] == pc + 0x40 && ref[2].SysReg[3] == pc + 0x80 && ref[3].SysReg[3] == 0x00001230;
+      // Chained runs: {budget, exitcount, memcycle, pending level, loop flag on A} -> blocks run.
+      struct Case { u32 budget, exitcount, memcycle, level; bool loop; unsigned expect; } cases[] = {
+        {100, 100000, 0, 0, false, 3}, {1, 100000, 0, 0, false, 2}, {0, 100000, 0, 0, false, 1},
+        {100, ref[1].SysReg[4], 0, 0, false, 1}, {100, ref[2].SysReg[4], 0, 0, false, 2},
+#ifdef VITA_SH2_DISPATCH_MEMCYCLE
+        // Memory cycles are folded into the count and the chain continues
+        // while the sum stays below the target.
+        {100, 100000, 1, 0, false, 3}, {100, ref[1].SysReg[4] + 5, 5, 0, false, 1},
+        {100, ref[1].SysReg[4] + 6, 5, 0, false, 2},
+#else
+        {100, 100000, 1, 0, false, 1},
+#endif
+        {100, 100000, 0, 0x100, false, 1},
+        // No BLOCK_LOOP cases: loop blocks never link their exits (EmmitCode),
+        // so link_check has no loop test and setting the flag on the linked
+        // blocks here would describe an unreachable state.
+      };
+      for (const Case &k : cases) {
+        tagSH2 st = start;
+        st.dispatch = reinterpret_cast<uintptr_t>(&sh2_dispatch);
+        st.chain_budget = k.budget; st.exitcount = k.exitcount; st.SysReg[5] = k.level;
+        st.chain_cur = reinterpret_cast<uintptr_t>(blk[0]);
+        st.memcycle = k.memcycle;
+        if (k.loop) blk[0]->flags |= BLOCK_LOOP;
+        reinterpret_cast<void (*)(tagSH2 *)>(blk[0]->code)(&st);
+        if (k.loop) blk[0]->flags &= ~BLOCK_LOOP;
+        // Memory cycles of the first block are folded into the count once.
+        tagSH2 want = ref[k.expect]; want.SysReg[5] = k.level; 
+#ifdef VITA_SH2_DISPATCH_MEMCYCLE
+        const bool folded = k.memcycle && !k.loop && k.budget != 0;
+        if (folded) want.SysReg[4] += k.memcycle;
+        const bool mem_ok = st.memcycle == (folded ? 0 : k.memcycle);
+#else
+        const bool mem_ok = st.memcycle == k.memcycle;
+#endif
+        const u32 ran = k.budget - st.chain_budget + 1;
+        if (!same(st, want) || ran != k.expect || !mem_ok || st.chain_cur != reinterpret_cast<uintptr_t>(blk[k.expect - 1]) ||
+            (k.budget == 0 && st.chain_budget != 0)) {
+          YuiMsg("jit_dispatch_test_failed budget=%u exit=%u mem=%u level=%u loop=%u ran=%u pc=%08x want=%08x",
+                 k.budget, k.exitcount, k.memcycle, k.level, unsigned(k.loop), ran, st.SysReg[3], want.SysReg[3]);
+          ok = false;
+        }
+      }
+      for (unsigned b = 0; b < 3; ++b) {
+        compiler->SetHigh((offset + b * 0x40) >> 1, nullptr);
+        for (u32 i = 0; i < 16; ++i) compiler->LookupParentTable[adress_mask(pc + b * 0x40) + i].clear();
+      }
+      std::memcpy(HighWram + offset, saved, sizeof(saved));
+      bool owned = false;
+      for (u32 i = 0; i < 512; ++i)
+        owned |= compiler->LookupParentTable[(adress_mask(pc) & ~511u) + i].size() != 0;
+      if (!owned) compiler->code_pages[adress_mask(pc) >> 9] = 0;
+      if (!ok) { YuiMsg("jit_dispatch_test_failed"); return -1; }
+      YuiMsg("jit_dispatch_test_pass cases=%u", unsigned(sizeof(cases) / sizeof(cases[0])));
+    }
+#endif
     // Region lowering must retain the loop detector's progress accounting.
     // These loops change a register and must never be fast-forwarded as idle.
     for (unsigned variant = 0; variant < 2; ++variant) {
@@ -377,7 +752,7 @@ extern "C" int VitaSh2CompilerTest(void) {
           DynarecSh2::CurrentContext = context;
           CurrentSH2->cycles = cycles;
           poll_memory_cycles = 0;
-          CompileBlocks::getInstance()->LookupTable[0xff000 >> 1] = nullptr;
+          CompileBlocks::getInstance()->SetHigh(0xff000 >> 1, nullptr);
         }
       } context_restore;
       struct TestCpu : DynarecSh2 {
@@ -398,7 +773,7 @@ extern "C" int VitaSh2CompilerTest(void) {
         if (!block || !block->poll) return -1;
         // CompileBlock creates code; Execute normally publishes its lookup.
         // Explicitly select this block so both sides execute the same code.
-        compiler->LookupTable[(pc & 0xfffff) >> 1] = block;
+        compiler->SetHigh((pc & 0xfffff) >> 1, block);
         const u32 recipe = block->poll;
         for (unsigned cost : {0u, 2u, 4u}) {
           tagSH2 snapshots[9] = {};
@@ -553,7 +928,7 @@ extern "C" int VitaSh2CompilerTest(void) {
       YuiMsg("jit_region_test_pass instructions=%u", words);
     }
     // Exercise actual compiler lowering and VM publication, including fallback
-    // callback preservation and the intentionally unchanged delay-slot path.
+    // callback preservation and the delay-slot path.
     unsigned load_cases = 0;
     T2WriteLong(LowWram, offset + 16, 0x89abcdef);
     T2WriteLong(HighWram, offset + 256, 0x89abcdef);
@@ -590,7 +965,12 @@ extern "C" int VitaSh2CompilerTest(void) {
             reinterpret_cast<void (*)(tagSH2 *)>(block->code)(&actual);
             unsigned expected_calls = 1;
 #ifdef VITA_SH2_RAM_LOADS
-            if (!delayed && (address >> 20 == 2 || address >> 20 == 0x60))
+#ifdef VITA_SH2_FUSED_DELAY
+            const bool direct = true;          // a BRA delay slot is a region too
+#else
+            const bool direct = !delayed;
+#endif
+            if (direct && (address >> 20 == 2 || address >> 20 == 0x60))
               expected_calls = 0;
 #endif
             if (std::memcmp(&actual, &expected, sizeof(actual)) || load_calls != expected_calls) {
@@ -671,7 +1051,7 @@ extern "C" int VitaSh2CompilerTest(void) {
         ~AliasRestore() { DynarecSh2::CurrentContext=context;
           CurrentSH2->cycles=cycles;
           auto *c=CompileBlocks::getInstance();
-          c->LookupTable[offset>>1]=nullptr; c->LookupTableLow[offset>>1]=nullptr;
+          c->SetHigh(offset>>1, nullptr); c->LookupTableLow[offset>>1]=nullptr;
         }
       } alias_restore;
       struct AliasCpu : DynarecSh2 { void ClearCarry() { pre_exe_count_=0; } } cpu;
@@ -759,7 +1139,7 @@ extern "C" int VitaSh2CompilerTest(void) {
       for (unsigned k = 0; k < 4; ++k) T2WriteWord(HighWram, offset + k * 2, source[k]);
       Block *block = compiler->CompileBlock(pc, compiler->LookupParentTable);
       if (!block || (!block->poll_step && !(block->flags & BLOCK_POLL_FUSED))) return -1;
-      compiler->LookupTable[offset >> 1] = block;
+      compiler->SetHigh(offset >> 1, block);
       T2WriteWord(HighWram, offset + 4, 0xa000); // Break the polling recipe.
       SH2WriteNotify(pc + 4, 2);
       if (compiler->LookupTable[offset >> 1]) return -1;
@@ -797,7 +1177,7 @@ extern "C" int VitaSh2CompilerTest(void) {
     for (unsigned i = 0; i < 4; ++i) T2WriteWord(HighWram, offset + 2 + i * 2, low_program[i]);
     Block *high_block = compiler->CompileBlock(pc + 2, compiler->LookupParentTable);
     if (!high_block) return -1;
-    compiler->LookupTable[(offset + 2) >> 1] = high_block;
+    compiler->SetHigh((offset + 2) >> 1, high_block);
     SH2WriteNotify(pc + 1, 0);
     if (compiler->LookupTable[(offset + 2) >> 1] != high_block) {
       YuiMsg("jit_invalidation_test_failed empty_range"); return -1;
@@ -821,7 +1201,7 @@ extern "C" int VitaSh2CompilerTest(void) {
           for(unsigned i=0;i<4;++i) T2WriteWord(HighWram,offset+2*i,program[i]);
           Block *b=compiler->CompileBlock(pc,compiler->LookupParentTable);
           if(!b) return -1;
-          compiler->LookupTable[offset>>1]=b;
+          compiler->SetHigh(offset>>1, b);
           const u32 target=pc+(overlap ? (width==1 ? 3 : 2) : 480);
           const u32 address=target|(alias ? 0x20000000u : 0);
           const u32 value=width==1 ? 2 : width==2 ? 0x7002 : 0x7002a000;
@@ -853,7 +1233,7 @@ extern "C" int VitaSh2CompilerTest(void) {
         for(unsigned i=0;i<4;++i) T2WriteWord(HighWram,offset+2+2*i,program[i]);
         Block *b=compiler->CompileBlock(pc+2,compiler->LookupParentTable);
         if(!b || compiler->LookupParentTable[offset>>1].size()!=0) return -1;
-        compiler->LookupTable[(offset+2)>>1]=b;
+        compiler->SetHigh((offset+2)>>1, b);
         cpu.memcycle_=17;
         memSetLong(pc|(alias ? 0x20000000u : 0),0x0009e003);
         if(compiler->LookupTable[(offset+2)>>1] ||

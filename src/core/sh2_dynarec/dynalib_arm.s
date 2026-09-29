@@ -90,9 +90,110 @@ extern _EachClock, _DelayEachClock, _DebugEachClock, _DebugDelayClock
 .ifdef VITA_SH2_CHAIN_ABI
   bx r11
 .else
+.ifdef VITA_SH2_NATIVE_DISPATCH
+  ldr pc, [r7, #144] // tagSH2::dispatch: sh2_block_exit or sh2_dispatch
+.else
+.ifdef VITA_SH2_BASE_REG
+  pop {r3-r11, pc}   // r11: region high-RAM base; r3 keeps 8-byte alignment
+.else
   pop {r4-r10, pc}
 .endif
+.endif
+.endif
 .endm
+
+// Plain return to the C caller from any block exit (PC/count already stored).
+.text
+.align 2
+.global sh2_block_exit
+.type sh2_block_exit, %function
+sh2_block_exit:
+.ifdef VITA_SH2_BASE_REG
+  pop {r3-r11, pc}
+.else
+  pop {r4-r10, pc}
+.endif
+.size sh2_block_exit, .-sh2_block_exit
+
+.ifdef VITA_SH2_NATIVE_DISPATCH
+// Block exit with PC/count stored and all guest state in tagSH2 (r7). Enter
+// the next block directly, within the caller's frame, exactly when the C
+// lean loop would do nothing but dispatch it natively:
+//   chain budget left (sampling cadence), no acceptable interrupt
+//   ((SR & 0xF0) >= pending level), the block just run is not a BLOCK_LOOP
+//   (idle inference), then memory cycles folded into the count, count below
+//   the slice target, and the PC is cached high work RAM with a compiled
+//   block starting there. Same order as the C loop.
+// Otherwise return to C. r0-r3, ip are free at every block exit.
+// (Measured: per-block exit stubs with their own indirect BX were ~2% slower
+// than this single shared jump on the A9.)
+.global sh2_dispatch
+.type sh2_dispatch, %function
+sh2_dispatch:
+  ldr   r0, [r7, #148]      // chain_budget
+  ldr   r1, [r7, #128]      // exitcount = slice target
+  subs  r0, r0, #1
+  blo   .Ldispatch_exit     // budget was 0
+  cmp   r9, r1
+  bhs   .Ldispatch_exit     // count reached
+  ldr   r2, [r7, #64]       // SR
+  ldr   r3, [r7, #96]       // pending interrupt level
+  and   r2, r2, #0xF0
+  cmp   r2, r3
+  blo   .Ldispatch_exit     // interrupt acceptable: C runs CheckInterupt
+  ldr   r3, [r7, #156]      // block just run
+.ifdef VITA_SH2_DISPATCH_MEMCYCLE
+  ldr   ip, [r7, #160]      // memcycle_
+  ldr   r3, [r3, #16]       // flags
+  tst   r3, #1
+  bne   .Ldispatch_exit     // BLOCK_LOOP: C infers idle loops
+  cmp   ip, #0
+  beq   1f
+  // Fold the memory cycles into the count as the C loop does after its
+  // interrupt and idle-loop checks, then its loop condition on the sum.
+  add   r9, r9, ip
+  mov   r3, #0
+  str   r9, [r7, #92]       // count (the next block reloads r9 from it)
+  str   r3, [r7, #160]
+  ldr   r1, [r7, #128]      // exitcount
+  cmp   r9, r1
+  bhs   .Ldispatch_exit     // count reached
+1:
+.else
+  ldr   r2, [r7, #160]      // memcycle_
+  ldr   r3, [r3, #16]       // flags
+  cmp   r2, #0
+  bne   .Ldispatch_exit     // memory cycles to account
+  tst   r3, #1
+  bne   .Ldispatch_exit     // BLOCK_LOOP: C infers idle loops
+.endif
+  ldr   r1, [r7, #88]       // PC
+  ldr   r2, [r7, #152]      // high-RAM lookup table
+  eor   r3, r1, #0x06000000
+  mov   r3, r3, ror #1      // even offset -> index; odd or other region -> huge
+  cmp   r3, #0x80000
+  bhs   .Ldispatch_exit
+  ldr   r2, [r2, r3, lsl #2]
+  cmp   r2, #0
+  beq   .Ldispatch_exit
+  ldr   r3, [r2, #4]        // b_addr (PC-tagged entries)
+  ldr   ip, [r2]            // code
+  cmp   r3, r1
+  bne   .Ldispatch_exit
+  str   r0, [r7, #148]
+  str   r2, [r7, #156]
+  add   pc, ip, #8          // past push + mov r7,r0: reload r8/r9, run
+// Position independent (local branches only): the compiler may run a copy.
+.Ldispatch_exit:
+.ifdef VITA_SH2_BASE_REG
+  pop   {r3-r11, pc}
+.else
+  pop   {r4-r10, pc}
+.endif
+.global sh2_dispatch_end
+sh2_dispatch_end:
+.size sh2_dispatch, .-sh2_dispatch
+.endif
  
 .macro opfunc name
 .section .text 
@@ -246,7 +347,11 @@ b .Lblock_public_body
 pop {r4-r11, r12, pc}
 .Lblock_public_body:
 .else
+.ifdef VITA_SH2_BASE_REG
+push {r3-r11, lr}   // 40 bytes: r11 is the region high-RAM base
+.else
 push {r4-r10, lr}   // push regs
+.endif
 .endif
 mov r7, r0      // GenReg( r0 has adress of m_pDynaSh2)
 LDR_PC r8       // PC
@@ -1800,6 +1905,121 @@ STR_MACL r1
 // MACL   ans = 32bit -> 64 bit MUL
 //        (MACH << 32 + MACL)  + ans 
 //-------------------------------------------------------------
+.ifdef VITA_SH2_MACL_WRAM
+// Same 52 words as the declared size of the callback template below (which
+// is 50 instructions plus the next template's first two). Cached high
+// work-RAM operands (0x060xxxxx) are read inline: memGetLong's result for
+// that area (T2ReadLong = halfword-swapped word, no memory-cycle cost); other
+// addresses take the callback. The S=1 tail is the original sequence moved
+// to sh2_macl_saturate (tagSH2 #168), which returns NE.
+// Everything after the two operand moves (r0 = Rm*4, r1 = Rn*4); shared
+// with sh2_macl_region below.
+.macro MACL_BODY
+mov r6, r0
+ldr r0, [r7, r1]
+mov r4, r1
+	lsr	r10, r0, #20
+	cmp	r10, #0x60
+	ldreq	r10, [r7, #136]
+	ubfxeq	r3, r0, #0, #20
+	ldreq	r0, [r10, r3]
+	roreq	r0, r0, #16
+	ldrne	r10, [r7, #(16+3+6+2)*4]
+	blxne	r10
+ldr r3, [r7, r4]
+add r3, r3, #4
+str r3, [r7, r4]
+mov r4, #0
+mov r5, r0
+ldr r0, [r7, r6]
+	lsr	r10, r0, #20
+	cmp	r10, #0x60
+	ldreq	r10, [r7, #136]
+	ubfxeq	r3, r0, #0, #20
+	ldreq	r0, [r10, r3]
+	roreq	r0, r0, #16
+	ldrne	r10, [r7, #(16+3+6+2)*4]
+	blxne	r10
+ldr r2, [r7, r6]
+add r2, r2, #4
+str r2, [r7, r6]
+LDR_MACL r1
+mov r3,r5
+LDR_MACH r5
+LDR_SR r2
+orr     r6, r4, r1
+smull   r4, r1, r0, r3
+adds    r6, r6, r4
+adc     ip, r5, r1
+tst     r2, #2
+ldrne   r10, [r7, #168]
+blxne   r10
+moveq   r4, r6
+moveq   r2, ip
+  STR_MACL  r4
+  STR_MACH  r2
+.endm
+opdesc MAC_L, ((52)*4),0,4,0xff,0xff,0xff
+opfunc MAC_L
+mov r0, #0
+mov r1, #0
+MACL_BODY
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+MAC_L.END:
+.if (MAC_L.END - x86_MAC_L) != 52*4
+.error "MAC_L must fill its 52-word template size"
+.endif
+
+// S=1 tail of MAC_L, instruction for instruction (sum ip:r6, product r1:r4,
+// operand r0): MACL in r4, MACH in r2.
+.text
+.align 2
+.global sh2_macl_saturate
+.type sh2_macl_saturate, %function
+sh2_macl_saturate:
+        mov     r5, #0
+        mov     r4, #32768
+        adds    r5, r5, r6
+        movt    r4, 65535
+        adc     r4, r4, ip
+        mvn     r2, #65536
+        cmp     r4, r2
+        mvn     r3, #0
+        cmpeq   r5, r3
+        bhi     1f
+        cmp     r0, #0
+        sbcs    r2, r1, #0
+        mov     r2, #32768
+        movw    r1, #32767
+        movt    r2, 65535
+        mvnge   r4, #0
+        movge   r2, r1
+        b       2f
+1:
+        mov     r4, r6
+        mov     r2, ip
+2:
+        cmp     r7, #0      // NE: the caller skips its S=0 moves
+        bx      lr
+.size sh2_macl_saturate, .-sh2_macl_saturate
+
+// The MAC_L template as a call for register regions' slow edge: r0 = Rm*4,
+// r1 = Rn*4, canonical state published, r8/r9 live PC/cycles. Clobbers
+// r0-r6, r10, ip and the flags; preserves r7-r9 and r11.
+.global sh2_macl_region
+.type sh2_macl_region, %function
+sh2_macl_region:
+        push    {r4, lr}
+        MACL_BODY
+        pop     {r4, pc}
+.size sh2_macl_region, .-sh2_macl_region
+.else
 opdesc MAC_L, ((52)*4),0,4,0xff,0xff,0xff 
 opfunc MAC_L
 mov r0, #0
@@ -1853,12 +2073,110 @@ MAC_L.NO_S:
 MAC_L.FINISH:
   STR_MACL  r4
   STR_MACH  r2
+.endif
 //CALL_EACHCLOCK
 
 //--------------------------------------------------------------
 // MACW   ans = 32bit -> 64 bit MUL
 //        (MACH << 32 + MACL)  + ans 
 //-------------------------------------------------------------
+.ifdef VITA_SH2_MACW_WRAM
+// Same size (42 words) as the callback template below, so block boundaries
+// are unchanged. Cached high work-RAM operands (0x060xxxxx) are read inline,
+// exactly memGetWord's result for that area (T2ReadWord, no memory-cycle
+// cost); other addresses take the callback. The S=1 path is the original
+// instruction sequence moved to sh2_macw_saturate (tagSH2 #164), which
+// returns NE so the plain MACH:MACL stores are skipped.
+// Everything after the two operand moves (r0 = Rm*4, r1 = Rn*4); shared
+// with sh2_macw_region below.
+.macro MACW_BODY
+	mov	r5, r0
+	ldr	r0, [r7, r0]
+	mov	r6, r1
+	lsr	r10, r0, #20
+	cmp	r10, #0x60
+	ldreq	r10, [r7, #136]
+	ubfxeq	r3, r0, #0, #20
+	ldreqh	r0, [r10, r3]
+	ldrne	r10, [r7, #(16+3+6+1)*4]
+	blxne	r10
+	ldr	r3, [r7, r5]
+	add	r3, r3, #2
+	str	r3, [r7, r5]
+	uxth	r5, r0
+	ldr	r0, [r7, r6]
+	lsr	r10, r0, #20
+	cmp	r10, #0x60
+	ldreq	r10, [r7, #136]
+	ubfxeq	r3, r0, #0, #20
+	ldreqh	r0, [r10, r3]
+	ldrne	r10, [r7, #(16+3+6+1)*4]
+	blxne	r10
+  LDR_MACL r2
+  LDR_SR lr
+	ldr	r1, [r7, r6]
+	mov	r3, r2, asr #31
+	add	r1, r1, #2
+	str	r1, [r7, r6]
+	smulbb	r0, r5, r0
+	adds	r2, r2, r0
+	adc	r3, r3, r0, asr #31
+	tst	lr, #2
+	ldrne	r10, [r7, #164]
+	blxne	r10
+	streq	r2, [r7, #(16+3+1)*4]   // MACL
+	streq	r3, [r7, #(16+3+0)*4]   // MACH
+.endm
+opdesc MAC_W, (42*4),0,4,0xff,0xff,0xff
+opfunc MAC_W
+  mov r0, #0  // m
+  mov r1, #0  // n
+MACW_BODY
+	nop
+	nop
+	nop
+	nop
+MAC_W.END:
+.if (MAC_W.END - x86_MAC_W) != 42*4
+.error "MAC_W must keep the 42-word template size"
+.endif
+
+// S=1 tail of MAC_W, instruction for instruction (r0 product, r3:r2 sum).
+.text
+.align 2
+.global sh2_macw_saturate
+.type sh2_macw_saturate, %function
+sh2_macw_saturate:
+	adds	r6, r2, #-2147483648
+	mvn	r5, #1
+	sbc	r12, r3, #0
+	mvn	r4, #0
+	cmp	r12, r5
+	cmpeq	r6, r4
+	bhi	1f
+	cmp	r0, #0
+	ldr	r1, [r3]
+	movlt	r2, #-2147483648
+	mvnge	r2, #-2147483648
+	orr	r1, r1, #1
+	STR_MACH r1
+1:
+	STR_MACL r2
+	cmp	r7, #0      // NE: the caller skips its S=0 stores
+	bx	lr
+.size sh2_macw_saturate, .-sh2_macw_saturate
+
+// The MAC_W template as a call for register regions' slow edge: r0 = Rm*4,
+// r1 = Rn*4, canonical state published, r8/r9 live PC/cycles. Clobbers
+// r0-r6, r10, ip, lr and the flags; preserves r7-r9 and r11.
+.global sh2_macw_region
+.type sh2_macw_region, %function
+sh2_macw_region:
+        push    {r4, lr}
+        MACW_BODY
+        pop     {r4, pc}
+.size sh2_macw_region, .-sh2_macw_region
+.else
 opdesc MAC_W, (42*4),0,4,0xff,0xff,0xff
 opfunc MAC_W
   mov r0, #0  // m
@@ -1904,6 +2222,7 @@ MAC_W.L2:
   STR_MACL r2
   STR_MACH r3
 MAC_W.FINISH:
+.endif
 
 
   

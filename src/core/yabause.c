@@ -765,9 +765,25 @@ int YabauseEmulate(void) {
                SH2Exec(SSH2, step);
         }
       }else{
+#if defined(VITA_SH2_SLICE_DECILINES) && VITA_SH2_SLICE_DECILINES > 1
+        /* Experimental, NOT cycle-exact: run both SH-2s ahead for a batch of
+         * decilines at once (fewer, longer slices). Total cycles are kept. */
+        static s32 sh2_slice_credit;
+        sh2_slice_credit += (s32)sh2cycles;
+        if (yabsys.DecilineCount % VITA_SH2_SLICE_DECILINES == 0) {
+          const s32 run = sh2_slice_credit + (s32)sh2cycles * (VITA_SH2_SLICE_DECILINES - 1);
+          if (run > 0) {
+            SH2Exec(MSH2, (u32)run);
+            if (yabsys.IsSSH2Running)
+              SH2Exec(SSH2, (u32)run);
+          }
+          sh2_slice_credit -= run;
+        }
+#else
         SH2Exec(MSH2, sh2cycles);
         if (yabsys.IsSSH2Running)
           SH2Exec(SSH2, sh2cycles);
+#endif
       }
 
 #ifdef VITA

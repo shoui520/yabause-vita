@@ -378,7 +378,7 @@ void SH2DynWriteNotify(u32 start, u32 length){
 #if defined(SET_DIRTY)
     block->setDirty(static_cast<u32>(addr));
 #else
-    block->LookupTable[ (addr&0x000FFFFF)>>1 ] = NULL;
+    block->SetHigh((addr&0x000FFFFF)>>1, NULL);
 #endif
     break;
 
@@ -518,7 +518,7 @@ WRITE_LINKAGE void WRITE_NAME(Byte)(u32 addr , u8 data )
 #if defined(SET_DIRTY)
     if (!SAME_HIGH(Byte, addr, data)) InvalidateHighWrite(block, addr);
 #else
-    block->LookupTable[ (addr&0x000FFFFF)>>1 ] = NULL;
+    block->SetHigh((addr&0x000FFFFF)>>1, NULL);
 #endif
     T2WriteByte(HighWram, addr & 0xFFFFF, data);
     if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
@@ -571,7 +571,7 @@ WRITE_LINKAGE void WRITE_NAME(Word)(u32 addr, u16 data )
 #if defined(SET_DIRTY)
      if (!SAME_HIGH(Word, addr, data)) InvalidateHighWrite(block, addr);
 #else
-     block->LookupTable[(addr & 0x000FFFFF) >> 1] = NULL;
+     block->SetHigh((addr & 0x000FFFFF) >> 1, NULL);
 #endif
     T2WriteWord(HighWram, addr & 0xFFFFF, data);
     if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
@@ -625,8 +625,8 @@ WRITE_LINKAGE void WRITE_NAME(Long)(u32 addr , u32 data )
     if (!SAME_HIGH(Word, addr, (u16)(data >> 16))) InvalidateHighWrite(block, addr);
     if (!SAME_HIGH(Word, addr + 2, (u16)data)) InvalidateHighWrite(block, addr+2);
 #else
-    block->LookupTable[(addr & 0x000FFFFF) >> 1] = NULL;
-    block->LookupTable[((addr & 0x000FFFFF) >> 1) + 1] = NULL;
+    block->SetHigh((addr & 0x000FFFFF) >> 1, NULL);
+    block->SetHigh(((addr & 0x000FFFFF) >> 1) + 1, NULL);
 #endif
     T2WriteLong(HighWram, addr & 0xFFFFF, data);
     if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
@@ -678,12 +678,14 @@ WRITE_LINKAGE void WRITE_NAME(Long)(u32 addr , u32 data )
       if(addr&0x20000000u) DynarecSh2::CurrentContext->memcycle_+=2; \
       return; \
     } \
+    ONCHIP_WRITE(Name, addr, data) \
     WriteSlow##Name(addr,data); \
   }
 WRITE_LEAF(Byte,u8,1)
 WRITE_LEAF(Word,u16,2)
 WRITE_LEAF(Long,u32,4)
 #undef WRITE_LEAF
+#undef ONCHIP_WRITE
 #pragma GCC pop_options
 #endif
 #undef WRITE_LINKAGE

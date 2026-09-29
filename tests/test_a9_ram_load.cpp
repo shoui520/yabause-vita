@@ -43,6 +43,7 @@ static uint32_t Word(uint32_t a) { return Slow(a, 2) & 65535; }
 static uint32_t Long(uint32_t a) { return Slow(a, 4); }
 
 int main() {
+  sh2a9::RegisterRegion::base_reg_enabled = true; // r11 high-RAM base
   for (unsigned op = 0; op < 65536; ++op) {
     const unsigned kind = op & 0xf00f;
     const bool expected = kind == 0x6000 || kind == 0x6001 || kind == 0x6002 ||
@@ -74,7 +75,7 @@ int main() {
       for (unsigned m = 0; m < 16; ++m) {
         auto body = sh2a9::RamLoad(n, m, width,
           reinterpret_cast<uint32_t>(low.data()), reinterpret_cast<uint32_t>(high.data()), postincrement);
-        std::vector<uint32_t> fn = {0xe92d47f0u, 0xe1a07000u};
+        std::vector<uint32_t> fn = {0xe92d4ff8u, 0xe1a07000u};
         if (region_mode) {
           sh2a9::RegisterRegion region(reinterpret_cast<uint32_t>(low.data()),
                                      reinterpret_cast<uint32_t>(high.data()), true);
@@ -97,7 +98,7 @@ int main() {
           fn.push_back(0xe5878058u);
           fn.push_back(0xe587905cu);
         }
-        fn.push_back(0xe8bd87f0u);
+        fn.push_back(0xe8bd8ff8u);
         assert(fn.size() * 4 <= 4096);
         std::memcpy(code, fn.data(), fn.size() * 4);
         __builtin___clear_cache(reinterpret_cast<char *>(code),
@@ -187,9 +188,9 @@ int main() {
     region.Finish();
     expected[22] += 256;
     expected[23] += 128;
-    std::vector<uint32_t> fn{0xe92d47f0u, 0xe1a07000u, 0xe5978058u, 0xe597905cu};
+    std::vector<uint32_t> fn{0xe92d4ff8u, 0xe1a07000u, 0xe5978058u, 0xe597905cu};
     fn.insert(fn.end(), region.code.begin(), region.code.end());
-    fn.insert(fn.end(), {0xe5878058u, 0xe587905cu, 0xe8bd87f0u});
+    fn.insert(fn.end(), {0xe5878058u, 0xe587905cu, 0xe8bd8ff8u});
     assert(fn.size() * 4 <= code_capacity);
     std::memcpy(code, fn.data(), fn.size() * 4);
     __builtin___clear_cache(reinterpret_cast<char *>(code),
@@ -230,9 +231,9 @@ int main() {
     assert(region.Emit(0x0229)); // MOVT must reload the callback's T
     assert(region.Emit(0x051a)); // STS MACL,R5 must see the callback's new MACL
     region.Finish();
-    std::vector<uint32_t> fn{0xe92d47f0u, 0xe1a07000u, 0xe5978058u, 0xe597905cu};
+    std::vector<uint32_t> fn{0xe92d4ff8u, 0xe1a07000u, 0xe5978058u, 0xe597905cu};
     fn.insert(fn.end(), region.code.begin(), region.code.end());
-    fn.insert(fn.end(), {0xe5878058u, 0xe587905cu, 0xe8bd87f0u});
+    fn.insert(fn.end(), {0xe5878058u, 0xe587905cu, 0xe8bd8ff8u});
     assert(fn.size() * 4 <= code_capacity);
     std::memcpy(code, fn.data(), fn.size() * 4);
     __builtin___clear_cache(reinterpret_cast<char *>(code),
@@ -242,6 +243,282 @@ int main() {
     assert(calls == 1 && std::memcmp(state, expected, sizeof(state)) == 0);
     ++cases;
   }
+  // Displacement loads (5nmd, 85md, 84md): effective address Rm + disp*width,
+  // Rm unchanged, 84/85 load R0. Same guard, alias and callback contract.
+  for (unsigned op = 0; op < 65536; ++op) {
+    const bool expected = (op >> 12) == 5 || (op >> 8) == 0x85 || (op >> 8) == 0x84;
+    assert(sh2a9::RegisterRegion::IsDisplacementLoad(uint16_t(op)) == expected);
+  }
+  check_sr = false;
+  callback_snapshots.clear();
+  sh2a9::RegisterRegion::disp_loads_enabled = true;
+  for (unsigned form = 0; form < 3; ++form)
+    for (unsigned m = 0; m < 16; ++m)
+      for (unsigned n = 0; n < (form == 0 ? 16u : 1u); ++n)
+        for (unsigned disp = 0; disp < 16; ++disp) {
+          const unsigned width = form == 0 ? 4 : form == 1 ? 2 : 1;
+          const uint16_t op = form == 0 ? uint16_t(0x5000 | (n << 8) | (m << 4) | disp)
+                                        : uint16_t((form == 1 ? 0x8500 : 0x8400) | (m << 4) | disp);
+          sh2a9::RegisterRegion region(reinterpret_cast<uint32_t>(low.data()),
+                                     reinterpret_cast<uint32_t>(high.data()), true);
+          assert(region.Emit(uint16_t(0x7001 | (((m + 1) & 15) << 8))));
+          assert(region.Emit(uint16_t(0xe080 | (((m + 2) & 15) << 8))));
+          const auto before = region.code.size();
+          const unsigned maximum = region.MaxEmissionWords(op);
+          assert(region.Emit(op));
+          assert(region.code.size() - before <= maximum);
+          assert(region.Emit(uint16_t(0x7005 | (((m + 1) & 15) << 8))));
+          region.Finish();
+          std::vector<uint32_t> fn{0xe92d4ff8u, 0xe1a07000u, 0xe5978058u, 0xe597905cu};
+          fn.insert(fn.end(), region.code.begin(), region.code.end());
+          fn.insert(fn.end(), {0xe5878058u, 0xe587905cu, 0xe8bd8ff8u});
+          assert(fn.size() * 4 <= code_capacity);
+          std::memcpy(code, fn.data(), fn.size() * 4);
+          __builtin___clear_cache(reinterpret_cast<char *>(code),
+                                 reinterpret_cast<char *>(code) + fn.size() * 4);
+          for (uint32_t address : addresses) {
+            uint32_t state[40], expected[40];
+            for (auto &v : state) v = random();
+            state[25] = reinterpret_cast<uint32_t>(&Byte);
+            state[26] = reinterpret_cast<uint32_t>(&Word);
+            state[27] = reinterpret_cast<uint32_t>(&Long);
+            state[m] = address - disp * width;
+            std::memcpy(expected, state, sizeof(state));
+            callback_state = state;
+            expected[(m + 1) & 15] += 1;
+            expected[(m + 2) & 15] = 0xffffff80u;
+            std::memcpy(before_callback, expected, sizeof(before_callback));
+            const bool direct = ((address >> 20) == 2 || (address >> 20) == 0x60)
+              && !(address & (width - 1));
+            uint32_t value = 0;
+            if (direct) {
+              const auto &ram = (address >> 20) == 2 ? low : high;
+              for (unsigned i = 0; i < width; ++i)
+                value = (value << 8) | ram[((address & (size - 1)) + i) ^ 1];
+            } else {
+              value = address ^ 0x8f73c591u;
+              expected[15] ^= 0x76543210u;
+            }
+            if (width == 1) value = static_cast<int8_t>(value);
+            if (width == 2) value = static_cast<int16_t>(value);
+            expected[n] = value;
+            expected[(m + 1) & 15] += 5;
+            expected[22] += 8;
+            expected[23] += 4;
+            calls = 0;
+            reinterpret_cast<void (*)(uint32_t *)>(code)(state);
+            assert(std::memcmp(state, expected, sizeof(state)) == 0);
+            assert(calls == (direct ? 0u : 1u));
+            if (!direct) assert(called_address == address && called_width == width);
+            ++cases;
+          }
+        }
+  // GBR loads MOV.B/W/L @(disp,GBR),R0 (C4dd-C6dd): effective address
+  // GBR + disp*width (up to 1020, one or two ADDs), GBR unchanged.
+  for (unsigned op = 0; op < 65536; ++op) {
+    const bool expected = (op >> 8) == 0xc4 || (op >> 8) == 0xc5 || (op >> 8) == 0xc6;
+    assert(sh2a9::RegisterRegion::IsGbrLoad(uint16_t(op)) == expected);
+  }
+  sh2a9::RegisterRegion::gbr_loads_enabled = true;
+  for (unsigned kind = 0; kind < 3; ++kind)
+    for (unsigned disp : {0u, 1u, 15u, 63u, 64u, 127u, 128u, 129u, 191u, 255u}) {
+      const unsigned width = 1u << kind, m = 3;
+      const uint16_t op = uint16_t(((0xc4 + kind) << 8) | disp);
+      sh2a9::RegisterRegion region(reinterpret_cast<uint32_t>(low.data()),
+                                 reinterpret_cast<uint32_t>(high.data()), true);
+      assert(region.Emit(uint16_t(0x7001 | ((m + 1) << 8))));
+      assert(region.Emit(uint16_t(0xe080 | ((m + 2) << 8))));
+      const auto before = region.code.size();
+      const unsigned maximum = region.MaxEmissionWords(op);
+      assert(region.Emit(op));
+      assert(region.code.size() - before <= maximum);
+      assert(region.Emit(uint16_t(0x7005 | ((m + 1) << 8))));
+      region.Finish();
+      std::vector<uint32_t> fn{0xe92d4ff8u, 0xe1a07000u, 0xe5978058u, 0xe597905cu};
+      fn.insert(fn.end(), region.code.begin(), region.code.end());
+      fn.insert(fn.end(), {0xe5878058u, 0xe587905cu, 0xe8bd8ff8u});
+      assert(fn.size() * 4 <= code_capacity);
+      std::memcpy(code, fn.data(), fn.size() * 4);
+      __builtin___clear_cache(reinterpret_cast<char *>(code),
+                             reinterpret_cast<char *>(code) + fn.size() * 4);
+      for (uint32_t address : addresses) {
+        uint32_t state[40], expected[40];
+        for (auto &v : state) v = random();
+        state[25] = reinterpret_cast<uint32_t>(&Byte);
+        state[26] = reinterpret_cast<uint32_t>(&Word);
+        state[27] = reinterpret_cast<uint32_t>(&Long);
+        state[17] = address - disp * width;
+        std::memcpy(expected, state, sizeof(state));
+        callback_state = state;
+        expected[m + 1] += 1;
+        expected[m + 2] = 0xffffff80u;
+        std::memcpy(before_callback, expected, sizeof(before_callback));
+        const bool direct = ((address >> 20) == 2 || (address >> 20) == 0x60)
+          && !(address & (width - 1));
+        uint32_t value = 0;
+        if (direct) {
+          const auto &ram = (address >> 20) == 2 ? low : high;
+          for (unsigned i = 0; i < width; ++i)
+            value = (value << 8) | ram[((address & (size - 1)) + i) ^ 1];
+        } else {
+          value = address ^ 0x8f73c591u;
+          expected[15] ^= 0x76543210u;
+        }
+        if (width == 1) value = static_cast<int8_t>(value);
+        if (width == 2) value = static_cast<int16_t>(value);
+        expected[0] = value;
+        expected[m + 1] += 5;
+        expected[22] += 8;
+        expected[23] += 4;
+        calls = 0;
+        reinterpret_cast<void (*)(uint32_t *)>(code)(state);
+        assert(std::memcmp(state, expected, sizeof(state)) == 0);
+        assert(calls == (direct ? 0u : 1u));
+        if (!direct) assert(called_address == address && called_width == width);
+        ++cases;
+      }
+    }
+  // Indexed loads MOV.B/W/L @(R0,Rm),Rn (0nmC-E): effective address R0 + Rm.
+  for (unsigned op = 0; op < 65536; ++op) {
+    const bool expected = (op >> 12) == 0 && (op & 15) >= 0xc && (op & 15) <= 0xe;
+    assert(sh2a9::RegisterRegion::IsIndexedLoad(uint16_t(op)) == expected);
+  }
+  for (unsigned kind = 0; kind < 3; ++kind)
+    for (unsigned m = 0; m < 14; ++m)
+      for (unsigned n = 0; n < 16; ++n) {
+        const unsigned width = 1u << kind;
+        const uint16_t op = uint16_t(0x000c | (n << 8) | (m << 4)) + kind;
+        sh2a9::RegisterRegion region(reinterpret_cast<uint32_t>(low.data()),
+                                   reinterpret_cast<uint32_t>(high.data()), true);
+        assert(region.Emit(uint16_t(0x7001 | (((m + 1) & 15) << 8))));
+        assert(region.Emit(uint16_t(0xe080 | (((m + 2) & 15) << 8))));
+        const auto before = region.code.size();
+        const unsigned maximum = region.MaxEmissionWords(op);
+        assert(region.Emit(op));
+        assert(region.code.size() - before <= maximum);
+        assert(region.Emit(uint16_t(0x7005 | (((m + 1) & 15) << 8))));
+        region.Finish();
+        std::vector<uint32_t> fn{0xe92d4ff8u, 0xe1a07000u, 0xe5978058u, 0xe597905cu};
+        fn.insert(fn.end(), region.code.begin(), region.code.end());
+        fn.insert(fn.end(), {0xe5878058u, 0xe587905cu, 0xe8bd8ff8u});
+        std::memcpy(code, fn.data(), fn.size() * 4);
+        __builtin___clear_cache(reinterpret_cast<char *>(code),
+                               reinterpret_cast<char *>(code) + fn.size() * 4);
+        for (uint32_t address : addresses) {
+          if (m == 0 && (address & 1)) continue;
+          uint32_t state[40], expected[40];
+          for (auto &v : state) v = random();
+          state[25] = reinterpret_cast<uint32_t>(&Byte);
+          state[26] = reinterpret_cast<uint32_t>(&Word);
+          state[27] = reinterpret_cast<uint32_t>(&Long);
+          const uint32_t index = m == 0 ? address / 2 : random() % 0x2000;
+          state[0] = index;
+          if (m) state[m] = address - index;
+          std::memcpy(expected, state, sizeof(state));
+          callback_state = state;
+          expected[(m + 1) & 15] += 1;
+          expected[(m + 2) & 15] = 0xffffff80u;
+          std::memcpy(before_callback, expected, sizeof(before_callback));
+          const bool direct = ((address >> 20) == 2 || (address >> 20) == 0x60)
+            && !(address & (width - 1));
+          uint32_t value = 0;
+          if (direct) {
+            const auto &ram = (address >> 20) == 2 ? low : high;
+            for (unsigned i = 0; i < width; ++i)
+              value = (value << 8) | ram[((address & (size - 1)) + i) ^ 1];
+          } else {
+            value = address ^ 0x8f73c591u;
+            expected[15] ^= 0x76543210u;
+          }
+          if (width == 1) value = static_cast<int8_t>(value);
+          if (width == 2) value = static_cast<int16_t>(value);
+          expected[n] = value;
+          expected[(m + 1) & 15] += 5;
+          expected[22] += 8;
+          expected[23] += 4;
+          calls = 0;
+          reinterpret_cast<void (*)(uint32_t *)>(code)(state);
+          assert(std::memcmp(state, expected, sizeof(state)) == 0);
+          assert(calls == (direct ? 0u : 1u));
+          if (!direct) assert(called_address == address && called_width == width);
+          ++cases;
+        }
+      }
+  // Mixed random sequences of indirect and displacement loads.
+  for (unsigned run = 0; run < 400; ++run) {
+    uint32_t state[40], expected[40];
+    for (auto &v : state) v = random();
+    for (unsigned r = 0; r < 16; ++r) state[r] = addresses[random() % 22] - (random() % 16) * 4;
+    state[25] = reinterpret_cast<uint32_t>(&Byte);
+    state[26] = reinterpret_cast<uint32_t>(&Word);
+    state[27] = reinterpret_cast<uint32_t>(&Long);
+    std::memcpy(expected, state, sizeof(state));
+    sh2a9::RegisterRegion region(reinterpret_cast<uint32_t>(low.data()),
+                               reinterpret_cast<uint32_t>(high.data()), true);
+    callback_snapshots.clear();
+    for (unsigned step = 0; step < 48; ++step) {
+      const unsigned form = random() % 4, m = random() % 16, disp = random() % 16;
+      unsigned n = random() % 16, width;
+      uint16_t op;
+      uint32_t address;
+      if (form == 3) {
+        const unsigned kind = random() % 3;
+        width = 1u << kind;
+        op = uint16_t(0x6000 | (n << 8) | (m << 4) | kind);
+        address = expected[m];
+      } else {
+        width = form == 0 ? 4 : form == 1 ? 2 : 1;
+        if (form != 0) n = 0;
+        op = form == 0 ? uint16_t(0x5000 | (n << 8) | (m << 4) | disp)
+                       : uint16_t((form == 1 ? 0x8500 : 0x8400) | (m << 4) | disp);
+        address = expected[m] + disp * width;
+      }
+      const bool direct = ((address >> 20) == 2 || (address >> 20) == 0x60) &&
+                          !(address & (width - 1));
+      uint32_t value = 0;
+      if (direct) {
+        const auto &ram = (address >> 20) == 2 ? low : high;
+        for (unsigned i = 0; i < width; ++i)
+          value = (value << 8) | ram[((address & 0xfffff) + i) ^ 1];
+      } else {
+        std::array<uint32_t, 16> snapshot;
+        std::memcpy(snapshot.data(), expected, sizeof(snapshot));
+        callback_snapshots.push_back(snapshot);
+        expected[15] ^= 0x76543210u;
+        value = address ^ 0x8f73c591u;
+      }
+      if (width == 1) value = int8_t(value);
+      if (width == 2) value = int16_t(value);
+      expected[n] = value;
+      assert(region.Emit(op));
+      // Keep loaded values plausible bases for later steps half of the time.
+      if (random() & 1) {
+        const uint32_t base = addresses[random() % 22];
+        assert(region.Emit(uint16_t(0xe000 | (n << 8) | (base & 0xff))));
+        expected[n] = uint32_t(int32_t(int8_t(base & 0xff)));
+      } else {
+        assert(region.Emit(uint16_t(0x7001 | (n << 8))));
+        ++expected[n];
+      }
+    }
+    region.Finish();
+    std::vector<uint32_t> fn{0xe92d4ff8u, 0xe1a07000u, 0xe5978058u, 0xe597905cu};
+    fn.insert(fn.end(), region.code.begin(), region.code.end());
+    fn.insert(fn.end(), {0xe5878058u, 0xe587905cu, 0xe8bd8ff8u});
+    assert(fn.size() * 4 <= code_capacity);
+    std::memcpy(code, fn.data(), fn.size() * 4);
+    __builtin___clear_cache(reinterpret_cast<char *>(code),
+                           reinterpret_cast<char *>(code) + fn.size() * 4);
+    callback_state = state;
+    snapshot_index = calls = 0;
+    reinterpret_cast<void (*)(uint32_t *)>(code)(state);
+    expected[22] = state[22];
+    expected[23] = state[23];
+    assert(std::memcmp(state, expected, sizeof(state)) == 0);
+    assert(calls == callback_snapshots.size() && snapshot_index == calls);
+    ++cases;
+  }
+  sh2a9::RegisterRegion::disp_loads_enabled = false;
   munmap(code, code_capacity);
   std::printf("A9 RAM loads: %u executed cases, direct/postincrement templates and guarded regions, all register pairs and three widths\n", cases);
 }
