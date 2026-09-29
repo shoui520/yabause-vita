@@ -132,6 +132,9 @@ int YuiCapturePending(void) {
 #ifdef YABAUSE_VITAGL
 #include <vitaGL.h>
 #include "vidogl.h"
+#ifdef VITA_RENDER_THREAD
+extern VideoInterface_struct VIDProxy;  /* render_proxy.c */
+#endif
 #include "ygl.h"
 static SceUID graphics_owner = -1;
 static int graphics_ready;
@@ -199,6 +202,10 @@ int YuiUseOGLOnThisThread(void) {
 #endif
 }
 int YuiRevokeOGLOnThisThread(void) { return 0; }
+#ifdef VITA_RENDER_THREAD
+/* The render thread (render_proxy.c) becomes the only graphics submitter. */
+void VitaGraphicsAdoptOwner(void) { graphics_owner = sceKernelGetThreadId(); }
+#endif
 
 /* Reference renderer presentation. Display manual: CDRAM, 256-byte base,
  * pitch multiple of 64; never write the buffer currently being scanned out. */
@@ -206,6 +213,10 @@ void YuiSwapBuffers(void) {
   VT_SCOPE(VT_PRESENT);
 #ifdef YABAUSE_VITAGL
   if (YuiUseOGLOnThisThread() != 0) {
+#ifdef VITA_RENDER_THREAD
+    extern int VitaRenderCall(void (*)(void));
+    if (VitaRenderCall(YuiSwapBuffers) == 0) return;   /* presented on the render thread */
+#endif
     YuiMsg("fatal: graphics submission from non-owner thread");
     abort();
   }
@@ -441,7 +452,11 @@ CDInterface *CDCoreList[] = {&DummyCD, &ISOCD, NULL};
 SoundInterface_struct *SNDCoreList[] = {&SNDDummy, &sound_vita, NULL};
 VideoInterface_struct *VIDCoreList[] = {
 #ifdef YABAUSE_VITAGL
+#ifdef VITA_RENDER_THREAD
+  &VIDProxy,
+#else
   &VIDOGL,
+#endif
 #endif
   &VIDSoft, NULL};
 
@@ -647,13 +662,23 @@ int main(void) {
 #endif
   VitaLogBackupRam(init.buppath);
 #ifdef YABAUSE_VITAGL
+#ifdef VITA_RENDER_THREAD
+  if (VIDCore != &VIDProxy || VIDProxy.ColorRamWriteWord == NULL) {   /* the proxy forwards to YglOnUpdateColorRamWord */
+#else
   if (VIDCore->ColorRamWriteWord != YglOnUpdateColorRamWord) {
+#endif
     YuiMsg("fatal: accelerated renderer palette notification is not connected");
     YabauseDeInit();
     goto done;
   }
+#ifdef VITA_RENDER_THREAD
+  /* The renderer runs on the render thread: go through the proxy. */
+  VIDCore->SetSettingValue(VDP_SETTING_RESOLUTION_MODE, RES_ORIGINAL);
+  VIDCore->Resize(0, 0, 960, 544, 1, ORIGINAL);
+#else
   VIDOGL.SetSettingValue(VDP_SETTING_RESOLUTION_MODE, RES_ORIGINAL);
   VIDOGL.Resize(0, 0, 960, 544, 1, ORIGINAL);
+#endif
   if (capture_frame) {
     extern int YglVitaValidatePalette(void);
     extern int YglVitaValidateRotation(void);
@@ -783,6 +808,11 @@ int main(void) {
         YuiMsg("scsp_early commits=%u rollbacks=%u self_rollbacks=%u commit_waits=%u completed=%u",
                g_early_stats[0], g_early_stats[1], g_early_stats[2], g_early_stats[3], g_early_stats[4]);
         memset(g_early_stats, 0, sizeof(g_early_stats)); }
+#endif
+#ifdef VITA_RENDER_THREAD
+      { extern uint64_t VitaRenderBusyUs(void);
+        YuiMsg("render_thread_busy us=%llu frames=%u", (unsigned long long)VitaRenderBusyUs(), batch); }
+      { extern void VitaRenderProxyReport(void); VitaRenderProxyReport(); }
 #endif
       YuiMsg("progress frames=%u elapsed_us=%llu fps=%.3f presentation_us=%llu copy_us=%llu master_pc=%08x slave_pc=%08x",
         frames, now-start, batch * 1000000.0/(now-last), present_us, copy_us,

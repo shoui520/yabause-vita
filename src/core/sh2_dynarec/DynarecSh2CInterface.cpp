@@ -768,6 +768,9 @@ u8 memGetByte(u32 addr)
 #endif
 }
  
+#ifdef VITA_FB_DIRECT_READ
+extern "C" int VitaFbReadWord(u32 addr, u16 *out);
+#endif
 u16 memGetWord(u32 addr)
 {
   PROF_MEM(0, addr);
@@ -798,6 +801,17 @@ u16 memGetWord(u32 addr)
   VITA_IO_READ(addr);
 #ifdef VITA_SH2_IDLE_EDSR
   if ((addr & 0xDFFFFFFFu) == 0x05D00010u) ++g_mem_io_edsr;  // VDP1 EDSR word: pure register read (idle skip)
+#endif
+#ifdef VITA_FB_DIRECT_READ
+  // VDP1 framebuffer (Vdp1FrameBufferReadWord), with its 50 read cycles.
+  if ((addr & 0xDFF80000) == 0x05C80000) {
+    u16 fb;
+    if (VitaFbReadWord(addr, &fb)) {
+      DynarecSh2::CurrentContext->memcycle_ += 50;
+      dynaFree();
+      return fb;
+    }
+  }
 #endif
 #ifdef VITA_SH2_DATA_ARRAY_DIRECT
   if ((addr >> 29) == 6) return T2ReadWord(CurrentSH2->DataArray, addr & 0xFFF);

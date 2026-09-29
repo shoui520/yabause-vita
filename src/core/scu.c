@@ -1152,6 +1152,9 @@ void ScuSetAddValue(scudmainfo_struct * dmainfo) {
 
 }
 
+#ifdef VITA_FB_DIRECT_READ
+int VitaFbReadWord(u32 addr, u16 *out);
+#endif
 void SucDmaExec(scudmainfo_struct * dma, int * time ) {
   //LOG("DoDMA src=%08X,dst=%08X,size=%d, ra:%d/wa:%d flame=%d:%d\n",
   //  dma->ReadAddress, dma->WriteAddress, dma->TransferNumber, dma->ReadAdd, dma->WriteAdd, yabsys.frame_count, yabsys.LineCount);
@@ -1334,6 +1337,9 @@ void SucDmaExec(scudmainfo_struct * dma, int * time ) {
           u32 r = ra, w = wa;
           for (u32 k = 0; k < n; ++k, r += 2, w += step) {
             u16 v;
+#ifdef VITA_FB_DIRECT_READ
+            if (!VitaFbReadWord(r, &v))
+#endif
               v = Vdp1FrameBufferReadWord(r);
             T2WriteWord(HighWram, w & 0xFFFFF, v);
           }

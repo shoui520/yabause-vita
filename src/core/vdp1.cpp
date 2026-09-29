@@ -128,6 +128,7 @@ extern "C" u32 FASTCALL Vdp1RamReadLong(u32 addr) {
 
 extern "C" void FASTCALL Vdp1RamWriteByte(u32 addr, u8 val) {
    addr &= 0x7FFFF;
+   VDP_TOUCH_PAGE(vdp1_page_ver, vdp1_touched, addr);
    T1WriteByte(Vdp1Ram, addr, val);
    vdp1_clock = 0;
 }
@@ -135,13 +136,29 @@ extern "C" void FASTCALL Vdp1RamWriteByte(u32 addr, u8 val) {
 //////////////////////////////////////////////////////////////////////////////
 extern "C" void FASTCALL Vdp1RamWriteWord(u32 addr, u16 val) {
    addr &= 0x7FFFF;
+   VDP_TOUCH_PAGE(vdp1_page_ver, vdp1_touched, addr);
    T1WriteWord(Vdp1Ram, addr, val);
    vdp1_clock = 0;
 }
 
+#ifdef VITA_SCU_DMA_FAST_VRAM
+/* n Vdp1RamWriteWord(addr + k * stride, vals[k]) calls in order, without the
+ * per-word call; each 4 KiB page is touched once per run of words in it. */
+extern "C" void Vdp1RamWriteWordSpan(u32 addr, u32 stride, const u16 *vals, u32 n) {
+   u32 page = ~0u;
+   for (u32 k = 0; k < n; ++k, addr += stride) {
+      const u32 a = addr & 0x7FFFF;
+      if ((a >> 12) != page) { page = a >> 12; VDP_TOUCH_PAGE(vdp1_page_ver, vdp1_touched, a); }
+      T1WriteWord(Vdp1Ram, a, vals[k]);
+   }
+   if (n) vdp1_clock = 0;
+}
+#endif
+
 //////////////////////////////////////////////////////////////////////////////
 extern "C" void FASTCALL Vdp1RamWriteLong(u32 addr, u32 val) {
    addr &= 0x7FFFF;
+   VDP_TOUCH_PAGE(vdp1_page_ver, vdp1_touched, addr);
    //if(addr == 0x00000)
    //LOG("Vdp1RamWriteLong @ %08X", CurrentSH2->regs.PC);
    T1WriteLong(Vdp1Ram, addr, val);
@@ -339,6 +356,7 @@ extern "C" void VideoDeInit(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 extern "C" void Vdp1Reset(void) {
+   VDP_TOUCH_ALL(vdp1_page_ver, 128, vdp1_touched);
   memset(Vdp1Regs, 0, sizeof(Vdp1Regs));
    Vdp1Regs->PTMR = 0;
    Vdp1Regs->MODR = 0x1000; // VDP1 Version 1
@@ -896,6 +914,7 @@ extern "C" int Vdp1SaveState(FILE *fp)
 
 extern "C" int Vdp1LoadState(FILE *fp, UNUSED int version, int size)
 {
+   VDP_TOUCH_ALL(vdp1_page_ver, 128, vdp1_touched);
    IOCheck_struct check = { 0, 0 };
 #ifdef IMPROVED_SAVESTATES
    int i = 0;

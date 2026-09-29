@@ -50,6 +50,20 @@ extern "C" {
 #endif
 
 extern u8 * Vdp2Ram;
+#ifdef VITA_RENDER_THREAD
+/* Render-thread snapshots (render_proxy.c): writes stamp the current
+ * snapshot epoch on their 4 KiB page / line; the *_touched values are the
+ * latest stamp per area. */
+extern u32 vdp_snap_epoch;
+extern u32 vdp1_page_ver[128], vdp2_page_ver[128], vdp2_line_ver[270];
+extern u32 vdp1_touched, vdp2_touched, cram_touched, lines_touched;
+#define VDP_TOUCH_PAGE(tab, area, addr) ((tab)[((addr) >> 12) & 127] = (area) = vdp_snap_epoch)
+#define VDP_TOUCH_ALL(tab, n, area) do { for (unsigned vdp_i_ = 0; vdp_i_ < (n); ++vdp_i_) (tab)[vdp_i_] = vdp_snap_epoch; \
+                                         (area) = vdp_snap_epoch; } while (0)
+#else
+#define VDP_TOUCH_PAGE(tab, area, addr) ((void)0)
+#define VDP_TOUCH_ALL(tab, n, area) ((void)0)
+#endif
 #if defined(VITA_ROTATION_PATTERN_CACHE) && defined(OPTIMIZED_DMA)
 #error "Pattern cache requires tracked VDP2 writers; raw-pointer optimized DMA is not supported"
 #endif

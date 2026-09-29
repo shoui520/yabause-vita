@@ -77,6 +77,17 @@ extern OSD_struct * OSDCoreList[];
 
 static OSD_struct * OSD = NULL;
 static OSDMessage_struct osdmessages[OSDMSG_COUNT] ={0};
+#ifdef VITA_RENDER_THREAD
+/* Messages are pushed by the emulation thread and displayed (and freed when
+ * they expire) by the render thread. */
+#include <pthread.h>
+static pthread_mutex_t osd_lock = PTHREAD_MUTEX_INITIALIZER;
+#define OSD_LOCK() pthread_mutex_lock(&osd_lock)
+#define OSD_UNLOCK() pthread_mutex_unlock(&osd_lock)
+#else
+#define OSD_LOCK() ((void)0)
+#define OSD_UNLOCK() ((void)0)
+#endif
 
 int OSDInit(int coreid)
 {
@@ -141,6 +152,7 @@ void OSDPushMessage(int msgtype, int ttl, const char * format, ...)
    vsprintf(message, format, arglist);
    va_end(arglist);
 
+   OSD_LOCK();
    osdmessages[msgtype].type = msgtype;
    if( osdmessages[msgtype].message != NULL ){
       free(osdmessages[msgtype].message);
@@ -149,6 +161,7 @@ void OSDPushMessage(int msgtype, int ttl, const char * format, ...)
    osdmessages[msgtype].message = strdup(message);
    osdmessages[msgtype].timetolive = ttl;
    osdmessages[msgtype].timeleft = ttl;
+   OSD_UNLOCK();
 }
 
 
@@ -159,6 +172,7 @@ int OSDDisplayMessages(pixel_t * buffer, int w, int h)
  
    if (OSD == NULL) return somethingnew;
 
+   OSD_LOCK();
    for(i = 0;i < OSDMSG_COUNT;i++)
       if (osdmessages[i].timeleft > 0)
       {
@@ -173,6 +187,7 @@ int OSDDisplayMessages(pixel_t * buffer, int w, int h)
             osdmessages[i].message = NULL;
          }
       }
+   OSD_UNLOCK();
 
    return somethingnew;
 }

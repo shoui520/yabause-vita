@@ -1288,6 +1288,17 @@ option(VITA_VDP2_PERLINE_VERIFY "Diagnostics: compare the per-line cell path wit
 if(VITA_VDP2_PERLINE_VERIFY)
   set_property(SOURCE src/video/opengl/vidogl.c APPEND PROPERTY COMPILE_DEFINITIONS VITA_VDP2_PERLINE_VERIFY)
 endif()
+option(VITA_VDP1_SPRITE_REUSE "Skip re-decoding an unchanged VDP1 sprite texture into the atlas rectangle it occupied last frame" OFF)
+option(VITA_VDP1_SPRITE_REUSE_VERIFY "Diagnostics: decode anyway when sprite reuse would apply and count mismatches" OFF)
+if(VITA_VDP1_SPRITE_REUSE)
+  if(NOT VITA_RENDER_THREAD)
+    message(FATAL_ERROR "Sprite reuse compares the render snapshots' VDP1 page stamps")
+  endif()
+  set_property(SOURCE src/video/opengl/vidogl.c APPEND PROPERTY COMPILE_DEFINITIONS VITA_VDP1_SPRITE_REUSE)
+  if(VITA_VDP1_SPRITE_REUSE_VERIFY)
+    set_property(SOURCE src/video/opengl/vidogl.c APPEND PROPERTY COMPILE_DEFINITIONS VITA_VDP1_SPRITE_REUSE_VERIFY)
+  endif()
+endif()
 option(VITA_SCU_DSP_FAST "SCU DSP loop with register-resident state and inlined bus helpers (reference loop kept for breakpoints)" OFF)
 if(VITA_SCU_DSP_FAST)
   set_property(SOURCE src/core/scu.c APPEND PROPERTY COMPILE_DEFINITIONS VITA_SCU_DSP_FAST)
@@ -1390,6 +1401,41 @@ target_link_options(yabause-vita PRIVATE -Wl,--wrap=abort)
 target_link_libraries(yabause-vita PRIVATE FLAC ogg z m pthread
   SceDisplay_stub SceCtrl_stub SceAudio_stub ScePower_stub SceAppUtil_stub
   SceCommonDialog_stub SceAppMgr_stub)
+# Render-thread pipeline (VITA_RENDER_THREAD): a shadow copy of the VDP
+# subsystem (vdp1.cpp, vdp2.cpp, vidshared.c with every symbol renamed rs_*,
+# src/vita/render_shadow_names.h) for the renderer, fed by the VIDCore proxy.
+# The shadow copies and the proxy take the originals' per-source flags.
+option(VITA_RENDER_THREAD "Renderer on a shadow VDP instance behind a VIDCore proxy" OFF)
+option(VITA_FB_DIRECT_READ "SH-2 word reads of the VDP1 framebuffer take the render proxy's no-GL answer directly" ON)
+if(VITA_RENDER_THREAD AND VITA_FB_DIRECT_READ)
+  set_property(SOURCE src/core/sh2_dynarec/DynarecSh2CInterface.cpp src/core/scu.c src/vita/render_proxy.c
+    src/video/opengl/ygles.c APPEND PROPERTY COMPILE_DEFINITIONS VITA_FB_DIRECT_READ)
+endif()
+if(VITA_RENDER_THREAD)
+  if(NOT YABAUSE_VITAGL)
+    message(FATAL_ERROR "The render proxy wraps the vitaGL renderer")
+  endif()
+  target_sources(yabause-vita PRIVATE src/vita/render_proxy.c src/vita/render_shadow_vdp1.cpp
+    src/vita/render_shadow_vdp2.cpp src/vita/render_shadow_vidshared.c)
+  set_property(SOURCE src/core/vdp1.cpp src/core/vdp2.cpp APPEND PROPERTY COMPILE_DEFINITIONS VITA_RENDER_THREAD)
+  foreach(pair "vdp1.cpp;render_shadow_vdp1.cpp" "vdp2.cpp;render_shadow_vdp2.cpp"
+               "vidshared.c;render_shadow_vidshared.c" "vdp2.cpp;render_proxy.c")
+    list(GET pair 0 original)
+    list(GET pair 1 shadow)
+    foreach(property COMPILE_DEFINITIONS COMPILE_OPTIONS)
+      get_source_file_property(value src/core/${original} ${property})
+      if(value)
+        set_property(SOURCE src/vita/${shadow} APPEND PROPERTY ${property} ${value})
+      endif()
+    endforeach()
+  endforeach()
+  set_property(SOURCE src/vita/render_proxy.c src/vita/main.c src/core/osdcore.c APPEND PROPERTY
+    COMPILE_DEFINITIONS VITA_RENDER_THREAD)
+  set_property(SOURCE src/vita/render_proxy.c APPEND PROPERTY COMPILE_DEFINITIONS HAVE_LIBGL)
+  target_compile_options(yabause-vitagl-renderer PRIVATE
+    -include "${PROJECT_SOURCE_DIR}/src/vita/render_shadow_names.h")
+  target_compile_definitions(yabause-vitagl-renderer PRIVATE VITA_RENDER_SHADOW)
+endif()
 if(VITA_PGO STREQUAL "generate")
   target_sources(yabause-vita PRIVATE src/vita/pgo_dump.c)
   set_property(SOURCE src/vita/pgo_dump.c APPEND PROPERTY COMPILE_OPTIONS -fno-profile-arcs)

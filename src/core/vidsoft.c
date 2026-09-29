@@ -105,8 +105,8 @@ void VIDSoftVdp1SystemClipping(u8 * ram, Vdp1 * regs);
 void VIDSoftVdp1LocalCoordinate(u8 * ram, Vdp1 * regs);
 void VIDSoftVdp1ReadFrameBuffer(u32 type, u32 addr, void * out);
 void VIDSoftVdp1WriteFrameBuffer(u32 type, u32 addr, u32 val);
-void VIDSoftVdp1EraseWrite(){};
-void VIDSoftVdp1FrameChange(){};
+void VIDSoftVdp1EraseWrite(void);
+void VIDSoftVdp1FrameChange(void);
 int VIDSoftVdp2Reset(void);
 void VIDSoftVdp2DrawStart(void);
 void VIDSoftVdp2DrawEnd(void);
@@ -3933,8 +3933,6 @@ void VIDSoftVdp2DrawEnd(void)
 
    TitanRender(dispbuffer);
 
-   VIDSoftVdp1SwapFrameBuffer();
-
    if (OSDUseBuffer())
       OSDDisplayMessages(dispbuffer, vdp2width, vdp2height);
 #if !defined(ANDROID)
@@ -4169,6 +4167,30 @@ void VIDSoftVdp2SetResolution(u16 TVMD)
 }
 
 //////////////////////////////////////////////////////////////////////////////
+
+/* Core-driven erase (VBlank erase, one-cycle mode, manual erase), issued
+ * just before a frame change: clears the displayed buffer, the next one drawn. */
+void VIDSoftVdp1EraseWrite(void)
+{
+   const int manualerase = Vdp1External.manualerase;
+   if (vidsoft_vdp1_thread_enabled)
+      VidsoftWaitForVdp1Thread();
+   Vdp1External.manualerase = 1;
+   VIDSoftVdp1EraseFrameBuffer(Vdp1Regs, vdp1frontframebuffer);
+   Vdp1External.manualerase = manualerase;
+}
+
+/* The core decides frame changes (Vdp2 VBlank-out, including manual change
+ * mode, whose flag it consumes before Vdp2DrawEnd), so swap when it says. */
+void VIDSoftVdp1FrameChange(void)
+{
+   u8 *temp;
+   if (vidsoft_vdp1_thread_enabled)
+      VidsoftWaitForVdp1Thread();
+   temp = vdp1frontframebuffer;
+   vdp1frontframebuffer = vdp1backframebuffer;
+   vdp1backframebuffer = temp;
+}
 
 void VIDSoftVdp1SwapFrameBuffer(void)
 {

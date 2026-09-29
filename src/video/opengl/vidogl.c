@@ -573,6 +573,13 @@ static u32 FASTCALL Vdp1ReadPolygonColor(vdp1cmd_struct *cmd)
 }
 
 #include "vdp2_cell_decode.h"
+#ifdef VITA_VDP2_CELL_REUSE
+#ifdef VITA_RENDER_SHADOW
+#define VDP2_CELL_REUSE_PAGE_VERSIONS   /* snapshot page stamps (render_proxy.c) */
+extern u32 vdp2_page_ver[128];
+#endif
+#include "vdp2_cell_reuse.h"
+#endif
 #include "vdp2_bitmap_decode.h"
 #include <arm_neon.h>
 #include "vdp1_sprite_decode.h"
@@ -590,6 +597,94 @@ static unsigned vt_rt_hit, vt_rt_miss, vt_rt_why[5]; static uint64_t vt_rt_us, v
 extern unsigned vita_atlas_frame, vita_atlas_prev_frame;
 #endif
 static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, YglTexture *texture)
+{
+#ifdef VITA_STACK_PROFILE
+  if (((vt_rt_hit + vt_rt_miss) & 8191) == 8191) {
+    YuiMsg("diag_v1tex hit=%u miss=%u miss_us=%llu texels=%llu why dst=%u frame=%u gen=%u ver=%u attrs=%u prev=%u frame=%u",
+           vt_rt_hit, vt_rt_miss, vt_rt_us, vt_rt_texels, vt_rt_why[0], vt_rt_why[1], vt_rt_why[2], vt_rt_why[3], vt_rt_why[4],
+           vita_atlas_prev_frame, vita_atlas_frame);
+    vt_rt_hit = vt_rt_miss = 0; vt_rt_us = vt_rt_texels = 0; memset(vt_rt_why, 0, sizeof(vt_rt_why));
+  }
+#endif
+#ifdef VITA_VDP1_SPRITE_REUSE
+  /* Skip the decode when this rectangle already holds it (vdp1_sprite_reuse.h). */
+  extern unsigned vita_atlas_frame, vita_atlas_gen, vita_atlas_prev_frame;
+  extern u32 vdp1_page_ver[128];
+  static Vdp1SpriteReuseRecord *reuse_records;
+  if (!reuse_records) reuse_records = calloc(SPRITE_REUSE_SETS * SPRITE_REUSE_WAYS, sizeof(*reuse_records));
+  Vdp1SpriteReuseRecord *reuse_record = NULL, reuse_query;
+  int sprite_reused = 0;
+  if (reuse_records) {
+    const int mode = (cmd->CMDPMOD >> 3) & 7;
+    const u32 w = sprite->w, h = sprite->h, start = cmd->CMDSRCA * 8;
+    const u32 bytes = mode <= 1 ? (w + 1) / 2 * h : mode == 5 ? 2 * w * h : w * h;
+    u32 ver = Vdp1SpriteReusePages(vdp1_page_ver, start, bytes, 0);
+    if (mode == 1) ver = Vdp1SpriteReusePages(vdp1_page_ver, cmd->CMDCOLR * 8, 32, ver);
+    reuse_query = (Vdp1SpriteReuseRecord){ texture->textdata, vita_atlas_frame, vita_atlas_gen,
+      w | h << 16, (u32)texture->w, cmd->CMDSRCA, cmd->CMDPMOD, cmd->CMDCOLR, fixVdp2Regs->SPCTL, ver };
+    reuse_record = Vdp1SpriteReuseSlot(reuse_records, texture->textdata, vita_atlas_frame);
+    sprite_reused = Vdp1SpriteReuseMatch(reuse_record, &reuse_query, vita_atlas_prev_frame);
+  }
+#ifndef VITA_VDP1_SPRITE_REUSE_VERIFY
+  if (sprite_reused) {
+    /* The decode's side effects outside the texels. */
+    const int mode = (cmd->CMDPMOD >> 3) & 7;
+    const int msb = (cmd->CMDPMOD & 0x8000) != 0;
+    if (msb) _Ygl->msb_shadow_count_[_Ygl->drawframe]++;
+#ifdef VITA_VDP1_FAST_SPRITE
+    const int fast_rgb16 = (cmd->CMDPMOD & 0x80) && !msb && !(cmd->CMDPMOD & 0x40) && (fixVdp2Regs->SPCTL & 0x20);
+#else
+    const int fast_rgb16 = 0;
+#endif
+    if (mode == 5 && !fast_rgb16) ((u8 *)&fixVdp2Regs->CCRSA)[0] &= 0x1F;
+    reuse_record->frame = reuse_query.frame;
+#ifdef VITA_STACK_PROFILE
+    ++vt_rt_hit;
+#endif
+    return;
+  }
+#else
+  u32 *const verify_dst = texture->textdata;
+  const u32 verify_w = sprite->w, verify_h = sprite->h, verify_pitch = texture->w + sprite->w;
+  u32 *kept = NULL;
+  if (sprite_reused && (kept = malloc((size_t)verify_w * verify_h * 4)))
+    for (u32 r = 0; r < verify_h; ++r) memcpy(kept + r * verify_w, verify_dst + r * verify_pitch, verify_w * 4);
+#endif
+#endif
+  DIAG_T0(t);
+  Vdp1ReadTextureInner(cmd, sprite, texture);
+#ifdef VITA_STACK_PROFILE
+  ++vt_rt_miss; vt_rt_texels += sprite->w * sprite->h;
+  if (reuse_record) {
+    const Vdp1SpriteReuseRecord *r = reuse_record, *q = &reuse_query;
+    const int why = r->dst != q->dst ? 0 : r->frame != vita_atlas_prev_frame ? 1 : r->gen != q->gen ? 2 :
+      r->ver != q->ver ? 3 : 4;
+    ++vt_rt_why[why];
+  }
+#endif
+  DIAG_T1(t, DT_SPRITE);
+#ifdef VITA_VDP1_SPRITE_REUSE
+  if (reuse_record) *reuse_record = reuse_query;
+#ifdef VITA_VDP1_SPRITE_REUSE_VERIFY
+  { static unsigned verify[3];
+    ++verify[2];
+    if (kept) {
+      int bad = 0;
+      for (u32 r = 0; r < verify_h && !bad; ++r)
+        bad = memcmp(kept + r * verify_w, verify_dst + r * verify_pitch, verify_w * 4) != 0;
+      ++verify[bad]; free(kept);
+    }
+    if ((verify[2] & 4095) == 0)
+      YuiMsg("vdp1_sprite_reuse_verify match=%u mismatch=%u sprites=%u", verify[0], verify[1], verify[2]); }
+#endif
+#endif
+#ifdef VITA_DIAG_TIMERS
+  { const unsigned m = (cmd->CMDPMOD >> 3) & 7;
+    vita_diag_sprite_us[m] += sceKernelGetProcessTimeWide() - t;
+    vita_diag_sprite_texels[m] += (uint64_t)sprite->w * sprite->h; ++vita_diag_sprite_calls[m]; }
+#endif
+}
+static void FASTCALL Vdp1ReadTextureInner(vdp1cmd_struct *cmd, YglSprite *sprite, YglTexture *texture)
 {
   VT_SCOPE(VT_TEXTURE_DECODE);
   int shadow = 0;
@@ -3332,6 +3427,68 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
   const int cell_skip = 0;
 #endif
 
+#ifdef VITA_VDP2_CELL_REUSE
+  /* Skip the decode when this rectangle already holds it (vdp2_cell_reuse.h).
+   * Only the fast 4/8bpp path (Vdp2DrawCell), whose output depends on exactly
+   * the recorded inputs and source bytes. */
+  int cell_reused = 0;
+  Vdp2CellReuseRecord *reuse_record = NULL;
+  Vdp2CellReuseQuery reuse_query;
+  {
+    uint32_t reuse_alpha;
+    const unsigned reuse_bytes = Vdp2CellReuseBytes(info->patternwh, info->colornumber);
+    if (!cell_skip && (info->patternwh == 1 || info->patternwh == 2) && (info->colornumber == 0 || info->colornumber == 1) &&
+        info->specialprimode != 2 && info->cellw == 8 && info->cellh == 8 &&
+        (uint32_t)info->charaddr + reuse_bytes <= 0x80000 &&
+        Vdp2CellConstantAlpha((fixVdp2Regs->CCCTL >> 8) & 1, info->specialcolormode,
+                              info->specialcolorfunction, (uint32_t)info->alpha, &reuse_alpha)) {
+      extern unsigned vita_atlas_frame, vita_atlas_gen, vita_atlas_prev_frame;
+      static Vdp2CellReuseRecord *records;
+      if (!records) records = calloc(CELL_REUSE_SLOTS, sizeof(*records));
+      if (records) {
+        reuse_query = (Vdp2CellReuseQuery){ texture->textdata, vita_atlas_prev_frame, vita_atlas_frame,
+          vita_atlas_gen, texture->w, info->patternwh, info->colornumber, info->transparencyenable != 0,
+          (uint32_t)info->charaddr, (uint32_t)info->coloroffset, (uint32_t)(info->paladdr << 4),
+          reuse_alpha << 24, info->char_bank, reuse_bytes, Vdp2Ram + info->charaddr
+#ifdef VDP2_CELL_REUSE_PAGE_VERSIONS
+          , vdp2_page_ver
+#endif
+          };
+        reuse_record = &records[Vdp2CellReuseSlot(records, texture->textdata, vita_atlas_frame)];
+        cell_reused = Vdp2CellReuseMatch(reuse_record, &reuse_query);
+#ifdef VITA_STACK_PROFILE
+        { static unsigned rd[8]; const Vdp2CellReuseRecord *r = reuse_record; const Vdp2CellReuseQuery *q = &reuse_query;
+          int why = cell_reused ? 0 : r->dst != q->dst ? 1 : r->frame != q->prev_frame ? 2 : r->gen != q->gen ? 3 :
+            (r->charaddr != q->charaddr || r->patternwh != q->patternwh || r->colornumber != q->colornumber) ? 4 :
+            (r->co != q->co || r->pal != q->pal || r->abits != q->abits || r->transparent != q->transparent || r->pitch != q->pitch) ? 5 : 6;
+          ++rd[why]; ++rd[7];
+          if ((rd[7] & 16383) == 0) {
+            YuiMsg("diag_cell_reuse id=%d hit=%u dst=%u frame=%u gen=%u addr=%u attrs=%u pages=%u total=%u",
+                   info->id, rd[0], rd[1], rd[2], rd[3], rd[4], rd[5], rd[6], rd[7]);
+            memset(rd, 0, sizeof(rd)); } }
+#endif
+      }
+    }
+#ifdef VITA_STACK_PROFILE
+    else { static unsigned ne[6]; ++ne[info->id & 3]; ++ne[5];
+      ne[4] += !cell_skip && (info->colornumber == 0 || info->colornumber == 1) && (info->patternwh == 1 || info->patternwh == 2) && info->specialprimode != 2;
+      if ((ne[5] & 16383) == 0) { YuiMsg("diag_cell_ineligible nbg0=%u nbg1=%u nbg2=%u nbg3=%u shape_ok=%u skip=%d col=%d pwh=%d spm=%d scm=%d",
+        ne[0], ne[1], ne[2], ne[3], ne[4], cell_skip, info->colornumber, info->patternwh, info->specialprimode, info->specialcolormode); memset(ne, 0, sizeof(ne)); } }
+#endif
+  }
+#ifdef VITA_VDP2_CELL_REUSE_VERIFY
+  /* Diagnostic: keep the retained texels, decode anyway, compare. */
+  u32 reuse_kept[16 * 16];
+  const int reuse_side = 8 * info->patternwh, reuse_pitch = texture->w + 8 * info->patternwh;
+  u32 *const reuse_dst = texture->textdata;
+  if (cell_reused)
+    for (int r = 0; r < reuse_side; ++r)
+      memcpy(reuse_kept + r * reuse_side, reuse_dst + (size_t)r * reuse_pitch, reuse_side * 4);
+  if (1)
+#else
+  if (!cell_reused)
+#endif
+#endif
   if (!cell_skip)
   switch (info->patternwh)
   {
@@ -3349,6 +3506,24 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
     Vdp2DrawCell(info, texture);
     break;
   }
+#ifdef VITA_VDP2_CELL_REUSE
+  if (reuse_record) {
+    if (cell_reused) reuse_record->frame = reuse_query.frame;
+    else Vdp2CellReuseStore(reuse_record, &reuse_query);
+  }
+#ifdef VITA_VDP2_CELL_REUSE_VERIFY
+  { static unsigned verify[3];
+    ++verify[2];
+    if (cell_reused) {
+      int bad = 0;
+      for (int r = 0; r < reuse_side && !bad; ++r)
+        bad = memcmp(reuse_kept + r * reuse_side, reuse_dst + (size_t)r * reuse_pitch, reuse_side * 4) != 0;
+      ++verify[bad];
+    }
+    if ((verify[2] & 4095) == 0)
+      YuiMsg("vdp2_cell_reuse_verify match=%u mismatch=%u patterns=%u", verify[0], verify[1], verify[2]); }
+#endif
+#endif
 #ifdef VITA_SKIP_TRANSPARENT_CELLS
   /* These programs sample only this cell's texels (texcoords span the cell
    * inset by ATLAS_BIAS) and discard when the texel alpha is 0 before any
@@ -6515,6 +6690,10 @@ static void Vdp2DrawRotation_in(RBGDrawInfo * rbg) {
   }
 #endif
 #ifdef VITA_ROTATION_SPLIT
+#ifdef YABAUSE_VITAGL
+  if (gpu_rotation < 0)
+#endif
+  if (Vdp2RotationSplit(rbg, info, texture, cellw, cellh, vstep, hstep, line_texture, lineInc, linecl)) return;
 #endif
   //for (j = 0; j < vres; j += vstep)
   j = 0.0f;

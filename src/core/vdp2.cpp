@@ -82,6 +82,11 @@ static void NotifyColorRamWriteWord(u32 address) {
 }
 
 u8 * Vdp2Ram;
+#ifdef VITA_RENDER_THREAD
+u32 vdp_snap_epoch;
+u32 vdp1_page_ver[128], vdp2_page_ver[128], vdp2_line_ver[270];
+u32 vdp1_touched, vdp2_touched, cram_touched, lines_touched;
+#endif
 #if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
 u32 Vdp2RamGeneration;
 #ifdef VITA_ROTATION_OUTPUT_GENERATION
@@ -181,6 +186,7 @@ int prelinev = 0;
 #endif
 void FASTCALL Vdp2RamWriteByte(u32 addr, u8 val) {
    addr &= 0x7FFFF;
+   VDP_TOUCH_PAGE(vdp2_page_ver, vdp2_touched, addr);
 #if VRAM_WRITE_CHECK
    if (yabsys.LineCount != prelinev) {
      LOG("VRAM: write byte @%d, cycle_a=%d cycle_b=%d A0=%04X%04X A1=%04X%04X B0=%04X%04X B1=%04X%04X ",
@@ -219,6 +225,7 @@ void FASTCALL Vdp2RamWriteByte(u32 addr, u8 val) {
 
 void FASTCALL Vdp2RamWriteWord(u32 addr, u16 val) {
    addr &= 0x7FFFF;
+   VDP_TOUCH_PAGE(vdp2_page_ver, vdp2_touched, addr);
 #if VRAM_WRITE_CHECK
    if (yabsys.LineCount != prelinev) {
      LOG("VRAM: write word @%d, cycle_a=%d cycle_b=%d A0=%04X%04X A1=%04X%04X B0=%04X%04X B1=%04X%04X ",
@@ -253,11 +260,92 @@ void FASTCALL Vdp2RamWriteWord(u32 addr, u16 val) {
 #endif
 }
 
+#ifdef VITA_SCU_DMA_FAST_VRAM
+/* n Vdp2RamWriteWord(addr + k * stride, vals[k]) calls in order, without the
+ * per-word call (SCU DMA and DSP DMA spans into VDP2 VRAM). */
+void Vdp2RamWriteWordSpan(u32 addr, u32 stride, const u16 *vals, u32 n) {
+   /* Page touch and bank flag once per 4 KB page (a page lies in one bank);
+    * the generation advances once if any word changed, as consumers only
+    * compare it for equality. */
+   u32 page = ~0u;
+#if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
+   u32 changed = 0;
+#endif
+#if defined(__ARM_NEON) && !defined(WORDS_BIGENDIAN)
+   if (stride == 2) {
+      /* Contiguous words: one run per page, swapped 8 at a time. A page
+       * whose words all equal what it holds is left untouched: the page
+       * stamps and bank flags then change exactly when the content does. */
+      while (n) {
+         const u32 a = addr & 0x7FFFF;
+         u32 m = (0x1000 - (a & 0xFFF)) >> 1;
+         if (m > n) m = n;
+         u16 *dst = (u16 *)(Vdp2Ram + a);
+         uint16x8_t diff = vdupq_n_u16(0);
+         u32 d = 0, k = 0;
+         for (; k + 8 <= m; k += 8) {
+            const uint16x8_t v = vreinterpretq_u16_u8(vrev16q_u8(vreinterpretq_u8_u16(vld1q_u16(vals + k))));
+            diff = vorrq_u16(diff, veorq_u16(vld1q_u16(dst + k), v));
+            vst1q_u16(dst + k, v);
+         }
+         for (; k < m; ++k) {
+            const u16 v = BSWAP16L(vals[k]);
+            d |= dst[k] ^ v;
+            dst[k] = v;
+         }
+         const uint32x4_t d4 = vpaddlq_u16(diff);
+         d |= vgetq_lane_u32(d4, 0) | vgetq_lane_u32(d4, 1) | vgetq_lane_u32(d4, 2) | vgetq_lane_u32(d4, 3);
+         if (d) {
+            VDP_TOUCH_PAGE(vdp2_page_ver, vdp2_touched, a);
+            switch (a >> 17) {
+            case 0: A0_Updated = 1; break;
+            case 1: A1_Updated = 1; break;
+            case 2: B0_Updated = 1; break;
+            default: B1_Updated = 1; break;
+            }
+#if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
+            changed = 1;
+#endif
+         }
+         vals += m;
+         n -= m;
+         addr += 2 * m;
+      }
+#if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
+      if (changed) Vdp2AdvanceRamGeneration();
+#endif
+      return;
+   }
+#endif
+   for (u32 k = 0; k < n; ++k, addr += stride) {
+      const u32 a = addr & 0x7FFFF;
+      const u16 val = vals[k];
+      if ((a >> 12) != page) {
+         page = a >> 12;
+         VDP_TOUCH_PAGE(vdp2_page_ver, vdp2_touched, a);
+         switch (a >> 17) {
+         case 0: A0_Updated = 1; break;
+         case 1: A1_Updated = 1; break;
+         case 2: B0_Updated = 1; break;
+         default: B1_Updated = 1; break;
+         }
+      }
+#if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
+      changed |= T1ReadWord(Vdp2Ram, a) ^ val;
+#endif
+      T1WriteWord(Vdp2Ram, a, val);
+   }
+#if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
+   if (changed) Vdp2AdvanceRamGeneration();
+#endif
+}
+#endif
 
 //////////////////////////////////////////////////////////////////////////////
 
 void FASTCALL Vdp2RamWriteLong(u32 addr, u32 val) {
   addr &= 0x7FFFF;
+  VDP_TOUCH_PAGE(vdp2_page_ver, vdp2_touched, addr);
 #if VRAM_WRITE_CHECK
   if (yabsys.LineCount != prelinev) {
     LOG("VRAM: write long @%d, cycle_a=%d cycle_b=%d A0=%04X%04X A1=%04X%04X B0=%04X%04X B1=%04X%04X ", 
@@ -316,6 +404,9 @@ u32 FASTCALL Vdp2ColorRamReadLong(u32 addr) {
 //////////////////////////////////////////////////////////////////////////////
 
 void FASTCALL Vdp2ColorRamWriteByte(u32 addr, u8 val) {
+#ifdef VITA_RENDER_THREAD
+   cram_touched = vdp_snap_epoch;
+#endif
    addr &= 0xFFF;
    //LOG("[VDP2] Update Coloram Byte %08X:%02X", addr, val);
    T2WriteByte(Vdp2ColorRam, addr, val);
@@ -324,6 +415,9 @@ void FASTCALL Vdp2ColorRamWriteByte(u32 addr, u8 val) {
 //////////////////////////////////////////////////////////////////////////////
 
 void FASTCALL Vdp2ColorRamWriteWord(u32 addr, u16 val) {
+#ifdef VITA_RENDER_THREAD
+   cram_touched = vdp_snap_epoch;
+#endif
    addr &= 0xFFF;
    //LOG("[VDP2] Update Coloram Word %08X:%04X", addr, val);
    if (Vdp2Internal.ColorMode == 0 ) {
@@ -350,6 +444,9 @@ void FASTCALL Vdp2ColorRamWriteWord(u32 addr, u16 val) {
 //////////////////////////////////////////////////////////////////////////////
 
 void FASTCALL Vdp2ColorRamWriteLong(u32 addr, u32 val) {
+#ifdef VITA_RENDER_THREAD
+   cram_touched = vdp_snap_epoch;
+#endif
    addr &= 0xFFF;
    //LOG("[VDP2] Update Coloram Long %08X:%08X", addr, val);
 
@@ -448,6 +545,11 @@ void Vdp2DeInit(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 void Vdp2Reset(void) {
+   VDP_TOUCH_ALL(vdp2_page_ver, 128, vdp2_touched);
+   VDP_TOUCH_ALL(vdp2_line_ver, 270, lines_touched);
+#ifdef VITA_RENDER_THREAD
+   cram_touched = vdp_snap_epoch;
+#endif
    Vdp2Regs->TVMD = 0x0000;
    Vdp2Regs->EXTEN = 0x0000;
    Vdp2Regs->TVSTAT = Vdp2Regs->TVSTAT & 0x1;
@@ -861,8 +963,25 @@ void Vdp2HBlankOUT(void) {
   {
     Vdp2Regs->TVSTAT &= ~0x0004;
     u32 cell_scroll_table_start_addr = (Vdp2Regs->VCSTA.all & 0x7FFFE) << 1;
+#ifdef VITA_RENDER_THREAD
+    /* Stamp only a changed row: the render snapshot copies stamped rows. */
+    static_assert(sizeof(Vdp2) % 4 == 0 && alignof(Vdp2) >= 4, "rows compare as words");
+    const u32 *row = reinterpret_cast<const u32 *>(Vdp2Lines + yabsys.LineCount);
+    const u32 *regs = reinterpret_cast<const u32 *>(Vdp2Regs);
+    u32 diff = 0;
+    for (unsigned w = 0; w < sizeof(Vdp2) / 4; ++w) diff |= row[w] ^ regs[w];
+    if (diff) {
+      memcpy(Vdp2Lines + yabsys.LineCount, Vdp2Regs, sizeof(Vdp2));
+      vdp2_line_ver[yabsys.LineCount] = lines_touched = vdp_snap_epoch;
+    }
+#else
     memcpy(Vdp2Lines + yabsys.LineCount, Vdp2Regs, sizeof(Vdp2));
-    for (i = 0; i < 88; i++)
+#endif
+    // Same masked reads as Vdp2RamReadLong, without 88 calls per line.
+#ifdef VITA_VDP2_CELL_SCROLL_SOFT_ONLY
+    // Only VIDSoft reads cell_scroll_data (not saved in states).
+    if (VIDCore && VIDCore->id == VIDCORE_SOFT)
+#endif
     {
       u32 *cell_line = cell_scroll_data[yabsys.LineCount].data;
       for (i = 0; i < 88; i++)
@@ -2449,6 +2568,11 @@ int Vdp2SaveState(FILE *fp)
 
 int Vdp2LoadState(FILE *fp, UNUSED int version, int size)
 {
+   VDP_TOUCH_ALL(vdp2_page_ver, 128, vdp2_touched);
+   VDP_TOUCH_ALL(vdp2_line_ver, 270, lines_touched);
+#ifdef VITA_RENDER_THREAD
+   cram_touched = vdp_snap_epoch;
+#endif
    IOCheck_struct check = { 0, 0 };
 
    // Read registers

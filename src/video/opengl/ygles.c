@@ -508,7 +508,7 @@ int YglCalcTextureQ(
  * NOT pure GPU execution times, utilization, or a normal FPS benchmark. */
 enum { VITA_GPU_STAGES = 8 };
 static const char *const vita_gpu_stage_names[VITA_GPU_STAGES] =
-  {"pre_rot", "rotation", "vdp1", "compose", "blit", "swap"};
+  {"pre_rot", "rotation", "vdp1", "layers", "blit", "swap", "v1comp", "shadow"};
 static uint64_t vita_gpu_stage_us[VITA_GPU_STAGES];
 static unsigned vita_gpu_stage_calls[VITA_GPU_STAGES], vita_gpu_stage_frames;
 void YglVitaGpuStage(int stage) {
@@ -1145,7 +1145,8 @@ void YglDrawCpuFramebufferWrite(int target) {
 
 
 
-void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void * out) {
+/* Pixel (x, y) of the CPU-visible VDP1 framebuffer address for the TV mode. */
+static void Vdp1FrameBufferPixel(u32 addr, u32 *px, u32 *py) {
   u32 x = 0;
   u32 y = 0;
   int tvmode = (Vdp1Regs->TVMR & 0x7);
@@ -1170,6 +1171,133 @@ void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void * out) {
       break;
   }
 
+  *px = x; *py = y;
+}
+/* The guest value at (Line, Pix) from the read-back pixels (mutex held). */
+static void Vdp1FrameBufferFromPixels(u32 type, int Line, int Pix, void *out) {
+  int index;
+  if( _Ygl->rwidth >= 640 ){
+    index = (_Ygl->rheight-1-Line) *(_Ygl->rwidth * 4) + (Pix<<1) * 4;  
+  }else{
+    index = (_Ygl->rheight-1-Line) *(_Ygl->rwidth * 4) + Pix * 4;  
+  }
+#ifdef VITA_FB_LAZY_READ
+  if (pfb_src) {
+    /* index is (rheight-1-Line) rows plus a column byte offset below. */
+    const u32 row = (u32)(_Ygl->rheight - 1 - Line);
+    const u32 at = (u32)index - row * (u32)_Ygl->rwidth * 4u;
+    YglPfbNeed(row, at);
+    /* Some formats also read the next pixel, which may start another piece
+     * or, past the row end, the next row. */
+    if (((at + 4u) & (PFB_PIECE - 1u)) == 0 || at + 4u == (u32)_Ygl->rwidth * 4u) {
+      if (at + 4u < (u32)_Ygl->rwidth * 4u) YglPfbNeed(row, at + 4u);
+      else if (row + 1u < (u32)_Ygl->rheight) YglPfbNeed(row + 1u, 0);
+    }
+  }
+#endif
+ 
+  // 16bit mode
+  if ((Vdp2Regs->SPCTL & 0xF) < 8) {
+    // ToDo: index color mode
+    switch (type) {
+    case 1: {
+      u8 r = *((u8*)(_Ygl->pFrameBuffer) + index);
+      u16 g = *((u8*)(_Ygl->pFrameBuffer) + index + 1);
+      u8 b = *((u8*)(_Ygl->pFrameBuffer) + index + 2);
+      u16 a = *((u8*)(_Ygl->pFrameBuffer) + index + 3);
+      if( (a&0x40) == 0 ){
+        *(u16*)out = ((r >> 3) & 0x1f) | (((g >> 3) & 0x1f) << 5) | (((b >> 3) & 0x1F) << 10) | 0x8000;
+      }else{
+        u8 sptype = Vdp2Regs->SPCTL & 0x0F;
+        switch(sptype){
+        case 0:
+          *(u16*)out = ((a<<(5+8))&0xE000) | (((a>>3)&0x03)<<11) | (((g<<8)|r)&0x7FF);
+          break;
+        case 1:
+          *(u16*)out = ((a<<(5+8))&0xE000) | (((a>>3)&0x03)<<11) | (((g<<8)|r)&0x7FF);
+          break;
+        default:
+          *(u16*)out = 0;
+          LOG("VIDOGLVdp1ReadFrameBuffer sprite type %d is not supported",sptype);
+          break;
+        }
+      }
+    }
+    break;
+    case 2: {
+      u32 r = *((u8*)(_Ygl->pFrameBuffer) + index);
+      u32 g = *((u8*)(_Ygl->pFrameBuffer) + index + 1);
+      u32 b = *((u8*)(_Ygl->pFrameBuffer) + index + 2);
+      u32 r2 = *((u8*)(_Ygl->pFrameBuffer) + index + 4);
+      u32 g2 = *((u8*)(_Ygl->pFrameBuffer) + index + 5);
+      u32 b2 = *((u8*)(_Ygl->pFrameBuffer) + index + 6);
+      /*  BBBBBGGGGGRRRRR */
+      *(u32*)out = (((r2 >> 3) & 0x1f) | (((g2 >> 3) & 0x1f) << 5) | (((b2 >> 3) & 0x1F) << 10) | 0x8000) |
+        ((((r >> 3) & 0x1f) | (((g >> 3) & 0x1f) << 5) | (((b >> 3) & 0x1F) << 10) | 0x8000) << 16);
+    }
+            break;
+    }
+  }
+  // 8bitmode
+  else {
+      u16 r = *((u8*)(_Ygl->pFrameBuffer) + index);
+      u16 r2 = *((u8*)(_Ygl->pFrameBuffer) + index + 4);
+      *(u16*)out = (r<<8) | (r2<<0);
+  }
+  }
+/* The whole read without any GL call when possible: the CPU-written or
+ * out-of-clip path, or pixels already read back. Returns 0 (nothing done)
+ * when a read-back would be needed. */
+#ifdef VITA_STACK_PROFILE
+int _Ygl_pfb_null(void) { return (_Ygl->pFrameBuffer == NULL) | (_Ygl->vpd1_running ? 2 : 0); }
+#endif
+int VIDOGLVdp1ReadFrameBufferNoGL(u32 type, u32 addr, void * out) {
+  u32 x, y;
+  Vdp1FrameBufferPixel(addr, &x, &y);
+  const int Line = y;
+  const int Pix = x;
+  if (_Ygl->cpu_framebuffer_write[_Ygl->drawframe] || (Pix >= Vdp1Regs->systemclipX2 || Line >= Vdp1Regs->systemclipY2)){
+    switch (type)
+    {
+    case 0:
+      *(u8*)out = T1ReadByte(Vdp1FrameBuffer[_Ygl->drawframe], addr);
+      break;
+    case 1:
+      *(u16*)out = T1ReadWord(Vdp1FrameBuffer[_Ygl->drawframe], addr);
+      break;
+    case 2:
+      *(u32*)out = T1ReadLong(Vdp1FrameBuffer[_Ygl->drawframe], addr);
+      break;
+    default:
+      break;
+    }
+    return 1;
+  }
+  /* No mutex: the caller guarantees the renderer, the only other user of
+   * pFrameBuffer, is idle. */
+  if (_Ygl->vpd1_running || _Ygl->pFrameBuffer == NULL) return 0;
+  Vdp1FrameBufferFromPixels(type, Line, Pix, out);
+  return 1;
+}
+
+#ifdef VITA_FB_DIRECT_READ
+/* VIDOGLVdp1ReadFrameBufferNoGL for a word read. */
+int VIDOGLVdp1ReadWordNoGL(u32 addr, u16 *out) {
+  u32 x, y;
+  Vdp1FrameBufferPixel(addr, &x, &y);
+  if (_Ygl->cpu_framebuffer_write[_Ygl->drawframe] || x >= Vdp1Regs->systemclipX2 || y >= Vdp1Regs->systemclipY2) {
+    *out = T1ReadWord(Vdp1FrameBuffer[_Ygl->drawframe], addr);
+    return 1;
+  }
+  if (_Ygl->vpd1_running || _Ygl->pFrameBuffer == NULL) return 0;
+  Vdp1FrameBufferFromPixels(1, y, x, out);
+  return 1;
+}
+#endif
+
+void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void * out) {
+  u32 x, y;
+  Vdp1FrameBufferPixel(addr, &x, &y);
   const int Line = y;
   const int Pix = x;
   if (_Ygl->cpu_framebuffer_write[_Ygl->drawframe] || (Pix >= Vdp1Regs->systemclipX2 || Line >= Vdp1Regs->systemclipY2)){
@@ -1283,12 +1411,47 @@ void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void * out) {
 #ifdef YABAUSE_VITAGL
     _Ygl->pFrameBuffer = malloc((size_t)_Ygl->rwidth * _Ygl->rheight * 4);
     if (!_Ygl->pFrameBuffer) abort();
+#ifdef VITA_FB_LAZY_READ
+    {
+      /* A one-texel read completes the blit like the full read would. */
+      u32 texel;
+      glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &texel);
+      if (glGetError() != GL_NO_ERROR) {
+        fprintf(stderr, "Vita VDP1 framebuffer readback failed\n");
+        abort();
+      }
+      GLint bound = 0;
+      glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+      glBindTexture(GL_TEXTURE_2D, _Ygl->smallfbotex);
+      pfb_src = (const u8 *)sceGxmTextureGetData(vglGetGxmTexture(GL_TEXTURE_2D));
+      glBindTexture(GL_TEXTURE_2D, bound);
+      pfb_stride = ((u32)_Ygl->rwidth + 7u) / 8u * 8u * 4u;
+      pfb_pieces = ((u32)_Ygl->rwidth * 4u + PFB_PIECE - 1u) / PFB_PIECE;
+      free(pfb_have);
+      pfb_have = calloc((size_t)pfb_pieces * _Ygl->rheight, 1);
+      if (!pfb_src || !pfb_have) abort();
+      /* The first read-backs also take the full copy and must match it. */
+      static unsigned checked;
+      if (checked < 8) {
+        ++checked;
+        glReadPixels(0, 0, _Ygl->rwidth, _Ygl->rheight, GL_RGBA,
+                     GL_UNSIGNED_BYTE, _Ygl->pFrameBuffer);
+        const u32 row_bytes = (u32)_Ygl->rwidth * 4u;
+        for (int r = 0; r < _Ygl->rheight; ++r)
+          if (memcmp((u8 *)_Ygl->pFrameBuffer + r * row_bytes, pfb_src + r * pfb_stride, row_bytes)) {
+            fprintf(stderr, "Vita VDP1 lazy framebuffer layout mismatch at row %d\n", r);
+            abort();
+          }
+      }
+    }
+#else
     glReadPixels(0, 0, _Ygl->rwidth, _Ygl->rheight, GL_RGBA,
                  GL_UNSIGNED_BYTE, _Ygl->pFrameBuffer);
     if (glGetError() != GL_NO_ERROR) {
       fprintf(stderr, "Vita VDP1 framebuffer readback failed\n");
       abort();
     }
+#endif
 #else
     glBindBuffer(GL_PIXEL_PACK_BUFFER, _Ygl->vdp1pixelBufferID);
     glReadPixels(0, 0, _Ygl->rwidth, _Ygl->rheight, GL_RGBA, GL_UNSIGNED_BYTE, 0);
@@ -1312,61 +1475,7 @@ void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void * out) {
     FrameProfileAdd("ReadFrameBuffer end");
   }
 
-  int index;
-  if( _Ygl->rwidth >= 640 ){
-    index = (_Ygl->rheight-1-Line) *(_Ygl->rwidth * 4) + (Pix<<1) * 4;  
-  }else{
-    index = (_Ygl->rheight-1-Line) *(_Ygl->rwidth * 4) + Pix * 4;  
-  }
- 
-  // 16bit mode
-  if ((Vdp2Regs->SPCTL & 0xF) < 8) {
-    // ToDo: index color mode
-    switch (type) {
-    case 1: {
-      u8 r = *((u8*)(_Ygl->pFrameBuffer) + index);
-      u16 g = *((u8*)(_Ygl->pFrameBuffer) + index + 1);
-      u8 b = *((u8*)(_Ygl->pFrameBuffer) + index + 2);
-      u16 a = *((u8*)(_Ygl->pFrameBuffer) + index + 3);
-      if( (a&0x40) == 0 ){
-        *(u16*)out = ((r >> 3) & 0x1f) | (((g >> 3) & 0x1f) << 5) | (((b >> 3) & 0x1F) << 10) | 0x8000;
-      }else{
-        u8 sptype = Vdp2Regs->SPCTL & 0x0F;
-        switch(sptype){
-        case 0:
-          *(u16*)out = ((a<<(5+8))&0xE000) | (((a>>3)&0x03)<<11) | (((g<<8)|r)&0x7FF);
-          break;
-        case 1:
-          *(u16*)out = ((a<<(5+8))&0xE000) | (((a>>3)&0x03)<<11) | (((g<<8)|r)&0x7FF);
-          break;
-        default:
-          *(u16*)out = 0;
-          LOG("VIDOGLVdp1ReadFrameBuffer sprite type %d is not supported",sptype);
-          break;
-        }
-      }
-    }
-    break;
-    case 2: {
-      u32 r = *((u8*)(_Ygl->pFrameBuffer) + index);
-      u32 g = *((u8*)(_Ygl->pFrameBuffer) + index + 1);
-      u32 b = *((u8*)(_Ygl->pFrameBuffer) + index + 2);
-      u32 r2 = *((u8*)(_Ygl->pFrameBuffer) + index + 4);
-      u32 g2 = *((u8*)(_Ygl->pFrameBuffer) + index + 5);
-      u32 b2 = *((u8*)(_Ygl->pFrameBuffer) + index + 6);
-      /*  BBBBBGGGGGRRRRR */
-      *(u32*)out = (((r2 >> 3) & 0x1f) | (((g2 >> 3) & 0x1f) << 5) | (((b2 >> 3) & 0x1F) << 10) | 0x8000) |
-        ((((r >> 3) & 0x1f) | (((g >> 3) & 0x1f) << 5) | (((b >> 3) & 0x1F) << 10) | 0x8000) << 16);
-    }
-            break;
-    }
-  }
-  // 8bitmode
-  else {
-      u16 r = *((u8*)(_Ygl->pFrameBuffer) + index);
-      u16 r2 = *((u8*)(_Ygl->pFrameBuffer) + index + 4);
-      *(u16*)out = (r<<8) | (r2<<0);
-  }
+  Vdp1FrameBufferFromPixels(type, Line, Pix, out);
   YabThreadUnLock(_Ygl->mutex);
 }
 
@@ -1472,6 +1581,8 @@ int YglGenFrameBuffer() {
   YglVdp1AttachDepth(_Ygl->rboid_depth,_Ygl->rboid_stencil,0);
   glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+  YglFbRegionEmpty(0);
+  YglFbRegionEmpty(1);
   status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE) {
     YGLDEBUG("YglGLInit:Framebuffer status = %08X\n", status);
@@ -1837,6 +1948,10 @@ static void YglTessDrain(void);
 #endif
 #include "geometry_buffer.inc"
 
+/* vitaGL loses the vertices of one glDrawArrays beyond a limit found on
+ * hardware between 32769 and 65535 (a 98850-vertex VDP1 batch drew only its
+ * start); every slot stays at or under this many vertices. */
+#define YGL_DRAW_MAX_VERTICES 32768u
 YglProgram * YglGetProgram( YglSprite * input, int prg, unsigned needed )
 {
    YglLevel   *level;
@@ -1907,9 +2022,58 @@ YglProgram * YglGetProgram( YglSprite * input, int prg, unsigned needed )
   //}
 #ifdef YABAUSE_VITAGL
    /* Preserve command boundaries for reads of previously drawn pixels. */
+#if defined(VITA_VDP1_FB_FETCH)
+   /* Destination-reading shaders read the target itself, in draw order. */
+#elif defined(VITA_FEEDBACK_BATCH)
+   /* Each batch samples one snapshot taken before it, at the written pixel
+    * only, so a primitive may join the batch when its bounds are disjoint
+    * from everything the batch already draws. */
+   if (prg == PG_VFP1_HALFTRANS || prg == PG_VFP1_SHADOW ||
+       prg == PG_VFP1_GOURAUDSAHDING_HALFTRANS) {
+     static const YglProgram *fb_prg;
+     static float fb_box[4];
+     float box[4] = { input->vertices[0], input->vertices[1], input->vertices[0], input->vertices[1] };
+     for (int i = 1; i < 4; ++i) {
+       const float x = input->vertices[i * 2], y = input->vertices[i * 2 + 1];
+       if (x < box[0]) box[0] = x;
+       if (y < box[1]) box[1] = y;
+       if (x > box[2]) box[2] = x;
+       if (y > box[3]) box[3] = y;
+     }
+     const YglProgram *cur = &level->prg[level->prgcurrent];
+     if (cur->currentQuad != 0) {
+       const int disjoint = cur == fb_prg &&
+           (box[0] > fb_box[2] + 2.0f || box[2] < fb_box[0] - 2.0f ||
+            box[1] > fb_box[3] + 2.0f || box[3] < fb_box[1] - 2.0f);
+       if (!disjoint) {
+         if (YglProgramChange(level, prg) != 0) abort();
+         level->prg[level->prgcurrent].id = input->id;
+         level->prg[level->prgcurrent].blendmode = input->blendmode;
+         cur = &level->prg[level->prgcurrent];
+       }
+     }
+     if (cur->currentQuad == 0 || cur != fb_prg) {
+       fb_prg = cur;
+       memcpy(fb_box, box, sizeof box);
+     } else {
+       if (box[0] < fb_box[0]) fb_box[0] = box[0];
+       if (box[1] < fb_box[1]) fb_box[1] = box[1];
+       if (box[2] > fb_box[2]) fb_box[2] = box[2];
+       if (box[3] > fb_box[3]) fb_box[3] = box[3];
+     }
+   }
+#else
    if ((prg == PG_VFP1_HALFTRANS || prg == PG_VFP1_SHADOW ||
         prg == PG_VFP1_GOURAUDSAHDING_HALFTRANS) &&
        level->prg[level->prgcurrent].currentQuad != 0) {
+     if (YglProgramChange(level, prg) != 0) abort();
+     level->prg[level->prgcurrent].id = input->id;
+     level->prg[level->prgcurrent].blendmode = input->blendmode;
+   }
+#endif
+   /* Continue a full slot in a new one (YGL_DRAW_MAX_VERTICES). */
+   if (level->prg[level->prgcurrent].currentQuad != 0 &&
+       (unsigned)level->prg[level->prgcurrent].currentQuad / 2 + needed / 2 > YGL_DRAW_MAX_VERTICES) {
      if (YglProgramChange(level, prg) != 0) abort();
      level->prg[level->prgcurrent].id = input->id;
      level->prg[level->prgcurrent].blendmode = input->blendmode;

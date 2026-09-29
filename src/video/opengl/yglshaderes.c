@@ -2557,8 +2557,12 @@ void Ygl_uniformVDP2DrawFramebuffer(void * p, float from, float to, float * offs
    _Ygl->renderfb.mtxModelView = glGetUniformLocation(_prgid[pgid], (const GLchar *)"u_mvpMatrix");
 
    YglVitaBindFramebufferUniforms(pgid);
+#ifdef YABAUSE_VITAGL
+   YglVitaFramebufferRange(pgid, from, to);
+#else
    glUniform1f(g_draw_framebuffer_uniforms[arrayid].idfrom, from);
    glUniform1f(g_draw_framebuffer_uniforms[arrayid].idto, to);
+#endif
 
    glUniform1i(g_draw_framebuffer_uniforms[arrayid].idcram, 1);
    glActiveTexture(GL_TEXTURE1);
