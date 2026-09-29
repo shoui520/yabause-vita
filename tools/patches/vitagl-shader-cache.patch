@@ -1,0 +1,67 @@
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -657,6 +657,8 @@
+ #endif
+ 	shark_clear_output();
+ #ifdef HAVE_SHADER_CACHE
++	if (!s->prog)
++		return;
+ 	SceUID f = sceIoOpen(cache_fname, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
+ 	size_t sz;
+ 	void *buf = serialize_shader(NULL, &sz, s, save_bindings);
+@@ -1746,8 +1748,7 @@
+ #ifdef HAVE_SHADER_CACHE
+ 	char fname[256];
+ 	uint64_t hash = XXH3_64bits(s->source, s->size);
+-	uint8_t subdir_hash = hash >> 56;
+-	sprintf(fname, "%s/%s/%02X/%llX.gxp", vgl_shader_cache_path, s->type == GL_VERTEX_SHADER ? "v" : "f", subdir_hash, hash);
++	sprintf(fname, "%s/%s/%llX.gxp", vgl_shader_cache_path, s->type == GL_VERTEX_SHADER ? "v" : "f", hash);
+ 	SceUID f = sceIoOpen(fname, SCE_O_RDONLY, 0777);
+ 	if (f >= 0) {
+ 		vgl_free(s->source);
+@@ -2126,8 +2127,7 @@
+ 		char *fname;
+ 		if (!p->vshader->prog) {
+ 			uint64_t hash = XXH3_64bits(p->vshader->source, p->vshader->size);
+-			uint8_t subdir_hash = hash >> 56;
+-			sprintf(vert_fname, "%s/v/%02X/%llX.gxp", vgl_shader_cache_path, subdir_hash, hash);
++			sprintf(vert_fname, "%s/v/%llX.gxp", vgl_shader_cache_path, hash);
+ 			SceUID f = sceIoOpen(vert_fname, SCE_O_RDONLY, 0777);
+ 			if (f >= 0) {
+ 				size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+@@ -2141,8 +2141,7 @@
+ 		}
+ 		if (!p->fshader->prog) {
+ 			uint64_t hash = XXH3_64bits(p->fshader->source, p->fshader->size);
+-			uint8_t subdir_hash = hash >> 56;
+-			sprintf(frag_fname, "%s/f/%02X/%llX.gxp", vgl_shader_cache_path, subdir_hash, hash);
++			sprintf(frag_fname, "%s/f/%llX.gxp", vgl_shader_cache_path, hash);
+ 			SceUID f = sceIoOpen(frag_fname, SCE_O_RDONLY, 0777);
+ 			if (f >= 0) {
+ 				size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -206,23 +206,8 @@
+ 	sceIoMkdir(vgl_shader_cache_path, 0777);
+ 	sprintf(fname, "%s/v", vgl_shader_cache_path);
+ 	sceIoMkdir(fname, 0777);
+-	char dirname[256];
+-	sprintf(dirname, "%s/00", fname);
+-	GLboolean skip_creation = sceIoMkdir(dirname, 0777) != 0;
+-	if (!skip_creation) {
+-		for (int i = 1; i <= 0xFF; i++) {
+-			sprintf(dirname, "%s/%02X", fname, i);
+-			sceIoMkdir(dirname, 0777);
+-		}
+-	}
+ 	sprintf(fname, "%s/f", vgl_shader_cache_path);
+ 	sceIoMkdir(fname, 0777);
+-	if (!skip_creation) {
+-		for (int i = 0; i <= 0xFF; i++) {
+-			sprintf(dirname, "%s/%02X", fname, i);
+-			sceIoMkdir(dirname, 0777);
+-		}
+-	}
+ #endif
+ 	// Check if framebuffer size is valid
+ 	GLboolean res_fallback = GL_FALSE;

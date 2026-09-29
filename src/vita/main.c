@@ -667,6 +667,14 @@ int main(void) {
 #else
   vglSetCircularPoolSize(8*1024*1024);
 #endif
+#ifdef YABAUSE_SHADER_CACHE
+  /* vitaGL keys entries by source hash only (variant #defines included), so
+   * the directory names the compiler policy of runtime_shader_vita.inc.
+   * Delete it after changing the policy or the shacccg module. */
+  sceIoMkdir(DATA "shader_cache", 0777);
+  vglSetShaderCachePath(DATA "shader_cache/cg-o3-strict");
+  YuiMsg("shader_cache=" DATA "shader_cache/cg-o3-strict");
+#endif
   /* Pinned vitaGL returns resolution-fallback, NOT success/failure. */
   GLboolean resolution_fallback = vglInitWithCustomSizes(0, 960, 544,
     32*1024*1024, 48*1024*1024, 0, 0, SCE_GXM_MULTISAMPLE_NONE);

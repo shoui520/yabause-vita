@@ -72,6 +72,20 @@ if(YABAUSE_RUNTIME_SHADERS)
   endif()
   target_compile_definitions(yabause-vitagl-renderer PRIVATE YABAUSE_RUNTIME_SHADERS)
   set_property(SOURCE src/vita/main.c APPEND PROPERTY COMPILE_DEFINITIONS YABAUSE_RUNTIME_SHADERS)
+  option(YABAUSE_SHADER_CACHE "Reuse runtime-compiled shaders across launches" ON)
+  if(YABAUSE_SHADER_CACHE)
+    string(JSON shader_cache ERROR_VARIABLE shader_cache_error
+      GET "${vitagl_manifest}" options HAVE_SHADER_CACHE)
+    file(SHA256 "${PROJECT_SOURCE_DIR}/tools/patches/vitagl-shader-cache.patch"
+      expected_cache_patch)
+    string(JSON actual_cache_patch ERROR_VARIABLE cache_patch_error
+      GET "${vitagl_manifest}" patches "vitagl-shader-cache.patch")
+    if(shader_cache_error OR NOT shader_cache STREQUAL "1" OR cache_patch_error
+        OR NOT actual_cache_patch STREQUAL expected_cache_patch)
+      message(FATAL_ERROR "Rebuild private vitaGL with --shader-cache and the current patches")
+    endif()
+    set_property(SOURCE src/vita/main.c APPEND PROPERTY COMPILE_DEFINITIONS YABAUSE_SHADER_CACHE)
+  endif()
 endif()
 target_compile_options(yabause-vitagl-renderer PRIVATE -Werror=implicit-function-declaration)
 target_include_directories(yabause-vitagl-renderer PRIVATE
