@@ -567,6 +567,9 @@ int main(void) {
                frames, benchmark_start_frame, now - benchmark_start);
       else
         YuiMsg("benchmark_complete frames=%u elapsed_us=%llu", frames, now - benchmark_start);
+#ifdef VITA_PGO_GENERATE
+      { extern void VitaPgoDump(void); VitaPgoDump(); YuiMsg("pgo_dumped"); }
+#endif
     }
     if (now - last >= 2000000) {
       VitaTelemetryReport();

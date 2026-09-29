@@ -6,6 +6,19 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "Vita toolchain")
 endif()
 project(yabause_vita LANGUAGES C CXX ASM)
+# Compiler cache shared by every build directory: with base_dir at the source
+# tree, per-directory paths (generated c68k tables, sources) hash the same, so
+# a variant directory recompiles only objects whose flags actually differ.
+# Settings are passed per invocation (no global ccache configuration).
+option(VITA_CCACHE "Compile through ccache when available" ON)
+find_program(VITA_CCACHE_PROGRAM ccache HINTS "$ENV{HOME}/.local/bin")
+if(VITA_CCACHE AND VITA_CCACHE_PROGRAM)
+  set(VITA_CCACHE_LAUNCHER env "CCACHE_BASEDIR=${CMAKE_CURRENT_SOURCE_DIR}" CCACHE_NOHASHDIR=1
+      "CCACHE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/build/ccache" CCACHE_MAXSIZE=20G
+      CCACHE_SLOPPINESS=time_macros,include_file_mtime,include_file_ctime "${VITA_CCACHE_PROGRAM}")
+  set(CMAKE_C_COMPILER_LAUNCHER ${VITA_CCACHE_LAUNCHER})
+  set(CMAKE_CXX_COMPILER_LAUNCHER ${VITA_CCACHE_LAUNCHER})
+endif()
 option(VITA_SH2_READ_HELPER_O3 "Optimize SH-2 read helpers for Cortex-A9 without changing write helpers" OFF)
 if(VITA_SH2_READ_HELPER_O3)
   set_property(SOURCE src/core/sh2_dynarec/DynarecSh2CInterface.cpp APPEND PROPERTY
@@ -75,13 +88,43 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options(-O3 -g -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard
   -ffunction-sections -fdata-sections -fno-strict-aliasing)
+# The C68K interpreter takes minutes to compile. It is its own object library,
+# created before the LTO/PGO options below so it keeps one command line (and
+# its ccache entry) across those variants; it takes the app's definitions and
+# include directories.
+# Profile-guided optimization. generate: the app writes .gcda files to
+# ux0:data/yabause-vita/pgo when a benchmark window completes (runs merge);
+# use: build from those files copied to VITA_PGO_DIR on the host.
+set(VITA_PGO "" CACHE STRING "Profile-guided optimization: empty, generate or use")
+set(VITA_PGO_DIR "" CACHE PATH "Host directory with the .gcda files (VITA_PGO=use)")
+if(VITA_PGO STREQUAL "generate")
+  # vitasdk's libgcov has no value or time profilers: arc counts only.
+  # vitasdk's libgcov has no file I/O (src/vita/pgo_dump.c writes the data)
+  # and no value or time profilers: arc counts only.
+  add_compile_options(-fprofile-generate=ux0:data/yabause-vita/pgo -fprofile-info-section=gcov_info
+    -fno-profile-values -fno-profile-reorder-functions)
+  add_link_options(-fprofile-generate=ux0:data/yabause-vita/pgo)
+  add_compile_definitions(VITA_PGO_GENERATE)
+elseif(VITA_PGO STREQUAL "use")
+  # main.c differs from the generate build (the dump call): its profile is dropped.
+  add_compile_options(-fprofile-use=${VITA_PGO_DIR} -fprofile-partial-training -Wno-missing-profile
+    -Wno-error=coverage-mismatch)
+elseif(NOT VITA_PGO STREQUAL "")
+  message(FATAL_ERROR "VITA_PGO must be empty, generate or use")
+endif()
 add_compile_definitions(VITA HAVE_STDINT_H HAVE_SYS_TIME_H HAVE_STRCASECMP
   HAVE_C99_VARIADIC_MACROS HAVE_FLOORF HAVE_LROUND NO_CLI
   PACKAGE_VERSION="0.1.0" VERSION="0.1.0")
 # GCC explicitly recommends considering -fno-gcse for computed-goto interpreters.
 # Keep the giant C68K dispatch function out of O3's loop transformations.
-set_source_files_properties(src/core/c68k/c68kexec.c PROPERTIES
-  COMPILE_OPTIONS "-O2;-fno-gcse;-fno-crossjumping")
+option(VITA_C68K_ARM "Compile the C68K interpreter as A32 instead of Thumb-2" OFF)
+if(VITA_C68K_ARM)
+  set_source_files_properties(src/core/c68k/c68kexec.c PROPERTIES
+    COMPILE_OPTIONS "-O2;-fno-gcse;-fno-crossjumping;-marm")
+else()
+  set_source_files_properties(src/core/c68k/c68kexec.c PROPERTIES
+    COMPILE_OPTIONS "-O2;-fno-gcse;-fno-crossjumping")
+endif()
 option(VITA_C68K_RAM_READS "Inline ordinary C68K sound-RAM reads (experimental)" OFF)
 option(VITA_M68K_NATIVE_GUARDS "Experimental native-tier synchronization only; does not enable native execution" OFF)
 option(VITA_M68K_NATIVE_EXECUTION "Experimental cached A32 68K tier, CPU-paced sound only" OFF)
@@ -767,6 +810,10 @@ endif()
 target_link_libraries(yabause-vita PRIVATE FLAC ogg z m pthread
   SceDisplay_stub SceCtrl_stub SceAudio_stub ScePower_stub SceAppUtil_stub
   SceCommonDialog_stub SceAppMgr_stub)
+if(VITA_PGO STREQUAL "generate")
+  target_sources(yabause-vita PRIVATE src/vita/pgo_dump.c)
+  set_property(SOURCE src/vita/pgo_dump.c APPEND PROPERTY COMPILE_OPTIONS -fno-profile-arcs)
+endif()
 vita_create_self(eboot.bin yabause-vita UNSAFE)
 vita_create_vpk(yabause-vita.vpk YABA00001 eboot.bin
   VERSION 00.10 NAME "Yabause Vita")

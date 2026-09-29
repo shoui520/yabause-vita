@@ -12,6 +12,7 @@
         "VITA_ATLAS_PRIVATE_TRIM": "ON",
         "VITA_ATLAS_REPLACE": "ON",
         "VITA_ATLAS_TRIM": "ON",
+        "VITA_C68K_ARM": "OFF",
         "VITA_C68K_RAM_READS": "OFF",
         "VITA_DIAG_CELL_ALPHA": "OFF",
         "VITA_DIAG_GPU_STAGES": "OFF",
