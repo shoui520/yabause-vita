@@ -369,6 +369,7 @@ endif()
 set_source_files_properties(third_party/libchdr/deps/lzma-19.00/src/LzmaEnc.c
   PROPERTIES COMPILE_DEFINITIONS _7ZIP_ST)
 add_dependencies(yabause-vita c68k_tables)
+add_dependencies(yabause-c68kexec c68k_tables)
 set(YABAUSE_PSP2CGC "$ENV{YABAUSE_PSP2CGC}" CACHE FILEPATH "User-supplied PSP2 shader compiler")
 option(YABAUSE_GXM_PROBE "Validate GXM resource setup before starting emulation" OFF)
 option(YABAUSE_GXM_COMPOSITOR "Development integration: GPU composition/presentation, CPU rasterization" OFF)
@@ -402,6 +403,7 @@ if(YABAUSE_PSP2CGC)
   # from the currently selected renderer until complete integration is ready.
   option(VITA_NORMAL_DIRECT_UV "Experimental vertex-normalized nearest atlas sampling" OFF)
   option(VITA_FB_BALANCED_SELECT "Experimental balanced framebuffer register selection" OFF)
+  option(VITA_FB_FAST "Sprite composition shaders in exact float arithmetic (no branch chains or derivatives)" OFF)
   option(VITA_PALETTE_FLOAT_ADDRESS "Experimental exact float palette address assembly" OFF)
   foreach(shader_name IN ITEMS normal_v normal_direct_v normal_reference_f normal_f cram_f opaque_normal_f opaque_cram_f priority_f line_offset_f add_color_f
       sprite_v sprite_normal_f sprite_gouraud_f sprite_spd_f sprite_half_f
@@ -475,6 +477,15 @@ if(YABAUSE_PSP2CGC)
     set(normal_defines)
     if(VITA_PALETTE_FLOAT_ADDRESS AND shader_name MATCHES "^(normal_f|cram_f|priority_f|line_offset_f|add_color_f)$")
       list(APPEND normal_defines --define "PALETTE_FLOAT_ADDRESS=1")
+    endif()
+    if(VITA_VDP1_FB_FETCH AND shader_name MATCHES "^sprite_(half|gouraud_half|shadow)_f|sprite_v$")
+      list(APPEND normal_defines --define "FB_FETCH=1")
+    endif()
+    if(VITA_FB_FAST AND shader_name MATCHES "^fb_.*_f$")
+      list(APPEND normal_defines --define "FB_FAST=1")
+    endif()
+    if(VITA_FB_FAST AND VITA_FB_META_LUT AND shader_name MATCHES "^fb_.*_f$")
+      list(APPEND normal_defines --define "FB_META_LUT=1")
     endif()
     if(VITA_FB_BALANCED_SELECT AND shader_name MATCHES "^fb_.*_f$")
       list(APPEND normal_defines --define "FB_BALANCED_SELECT=1")
@@ -723,6 +734,26 @@ endif()
 if(VITA_DIAG_LAYERS)
   set_property(SOURCE src/core/vdp2.cpp APPEND PROPERTY
     COMPILE_DEFINITIONS VITA_DIAG_LAYERS)
+endif()
+if(VITA_FB_REGION)
+  set_property(SOURCE src/video/opengl/ygles.c APPEND PROPERTY
+    COMPILE_DEFINITIONS VITA_FB_REGION)
+endif()
+if(VITA_FB_FAST AND VITA_FB_META_LUT)
+  set_property(SOURCE src/video/opengl/yglshaderes.c APPEND PROPERTY
+    COMPILE_DEFINITIONS VITA_FB_META_LUT)
+endif()
+if(VITA_VDP1_FB_FETCH)
+  set_property(SOURCE src/video/opengl/ygles.c APPEND PROPERTY
+    COMPILE_DEFINITIONS VITA_VDP1_FB_FETCH)
+endif()
+if(VITA_FEEDBACK_BATCH)
+  set_property(SOURCE src/video/opengl/ygles.c APPEND PROPERTY
+    COMPILE_DEFINITIONS VITA_FEEDBACK_BATCH)
+endif()
+if(VITA_FB_LAZY_READ)
+  set_property(SOURCE src/video/opengl/ygles.c APPEND PROPERTY
+    COMPILE_DEFINITIONS VITA_FB_LAZY_READ)
 endif()
 if(VITA_FB_PRIORITY_CULL)
   set_property(SOURCE src/video/opengl/ygles.c APPEND PROPERTY

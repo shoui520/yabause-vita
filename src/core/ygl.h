@@ -598,6 +598,9 @@ typedef struct {
    GLuint rboid_stencil;
    GLuint vdp1fbo;
    GLuint vdp1FrameBuff[2];
+   // Drawn bounds of each VDP1 framebuffer in VDP1 coordinates; untracked means whole.
+   int vdp1_region_tracked[2];
+   float vdp1_region[2][4];
    GLuint smallfbo;
    GLuint smallfbotex;
    GLuint vdp1pixelBufferID;

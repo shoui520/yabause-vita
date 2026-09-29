@@ -52,6 +52,100 @@ float4 lineFetch(int x, int y) {
   return tex2D(s_line, float2((float(x)+0.5)/512.0,0.5));
 #endif
 }
+#if defined(FB_FAST) && !defined(FB_HBLANK) && !defined(FB_SHADOW)
+// Same results as the generic body below, in float arithmetic: every value
+// is an integer below 2^24 or an exact one-hot selection, so nothing rounds.
+float select8(float4 lo, float4 hi, float index) {
+  const float4 lanes = float4(0.0, 1.0, 2.0, 3.0);
+  return dot(lo, (float4)(lanes == index)) + dot(hi, (float4)(lanes + 4.0 == index));
+}
+#if defined(FB_META_LUT) && FB_LINE == 0 && FB_CONDITION < 3
+// Metadata decisions from the per-draw table of fb_meta_lut.h (same results;
+// the depth is still the exact uniform).
+uniform sampler2D s_meta;
+void main(float2 v_texcoord : TEXCOORD0, float4 pixel : WPOS,
+          out float4 color : COLOR, out float fragment_depth : DEPTH) {
+  float4 fb = tex2D(s_vdp1FrameBuffer, v_texcoord);
+  float4 m = tex2D(s_meta, float2(fb.a * (255.0 / 256.0) + (0.5 / 256.0), 0.5));
+  if (m.a == 0.0) discard;
+  float depth = select8(u_pri[0], u_pri[1], floor(m.r * 255.0f + 0.5f));
+  if (m.b != 0.0) {
+    if (fb.b != 0.0) discard;
+    float index = floor(fb.r * 255.0f + 0.5f) + floor(fb.g * 255.0f + 0.5f) * 256.0;
+    if (index == 0.0 && m.a < 1.0) discard;
+    index += (float)u_color_ram_offset;
+    color = tex2D(s_color,float2((index+0.5)/2048.0,0.5),float2(0.0,0.0),float2(0.0,0.0));
+  } else {
+    if (u_sprite_window != 0 && all(fb.rgb == float3(0.0,0.0,0.0))) discard;
+    color = fb;
+  }
+  color += u_coloroffset;
+  color.a = m.g;
+  fragment_depth = (depth+1.0)*0.5;
+}
+#else
+void main(float2 v_texcoord : TEXCOORD0, float4 pixel : WPOS,
+          out float4 color : COLOR, out float fragment_depth : DEPTH) {
+  float4 fb = tex2D(s_vdp1FrameBuffer, v_texcoord);
+  float metadata = floor(fb.a * 255.0f + 0.5f);
+  if (metadata < 128.0) discard;
+  float upper = floor(metadata * 0.125);          // metadata >> 3
+  float priority_index = metadata - upper * 8.0;  // metadata & 7
+  float flags = floor(upper * 0.125);             // metadata >> 6: 2 or 3
+  float alpha_index = upper - flags * 8.0;        // (metadata >> 3) & 7
+  float depth = select8(u_pri[0], u_pri[1], priority_index);
+  if (depth < u_from || depth > u_to) discard;
+  float4 palette_color = float4(0.0,0.0,0.0,1.0);
+  if (flags == 3.0) {
+    if (fb.b != 0.0) discard;
+    float index = floor(fb.r * 255.0f + 0.5f) + floor(fb.g * 255.0f + 0.5f) * 256.0;
+    if (index == 0.0 && (u_sprite_window != 0 || priority_index == 0.0)) discard;
+    index += (float)u_color_ram_offset;
+    palette_color = tex2D(s_color,float2((index+0.5)/2048.0,0.5),float2(0.0,0.0),float2(0.0,0.0));
+    color = palette_color;
+  } else {
+    if (u_sprite_window != 0 && all(fb.rgb == float3(0.0,0.0,0.0))) discard;
+    color = fb;
+  }
+  color += u_coloroffset;
+#if FB_CONDITION == 0
+  bool enabled = depth <= u_cctl;
+#elif FB_CONDITION == 1
+  bool enabled = depth == u_cctl;
+#elif FB_CONDITION == 2
+  bool enabled = depth >= u_cctl;
+#else
+  bool enabled = palette_color.a != 0.0;
+#endif
+  float alpha = select8(u_alpha[0], u_alpha[1], alpha_index);
+#if FB_LINE == 3
+  float4 lc = lineFetch(int((u_vheight - pixel.y - u_viewport_offset) * u_emu_height),0);
+  if (enabled) {
+#if FB_CONDITION == 1
+    color = lc * lc.a + color * (1.0-lc.a);
+#else
+    color = color * lc.a + lc * (1.0-lc.a);
+#endif
+  }
+#endif
+#if FB_MODE == 0
+  color.a = 1.0;
+#elif FB_MODE == 1
+  color.a = alpha;
+#elif FB_MODE == 2
+  color.a = enabled ? alpha : 1.0;
+#else
+  color.a = enabled ? 1.0 : 0.0;
+#endif
+#if FB_LINE == 1
+  color = color * color.a + lineFetch(int((u_vheight - pixel.y - u_viewport_offset) * u_emu_height),0) * (1.0-color.a);
+#elif FB_LINE == 2
+  color += lineFetch(int((u_vheight - pixel.y - u_viewport_offset) * u_emu_height),0) * color.a;
+#endif
+  fragment_depth = (depth+1.0)*0.5;
+}
+#endif
+#else
 void main(float2 v_texcoord : TEXCOORD0, float4 pixel : WPOS,
           out float4 color : COLOR, out float fragment_depth : DEPTH) {
   float4 fb = tex2D(s_vdp1FrameBuffer, v_texcoord);
@@ -130,3 +224,4 @@ void main(float2 v_texcoord : TEXCOORD0, float4 pixel : WPOS,
 #endif
   fragment_depth = (depth+1.0)*0.5;
 }
+#endif

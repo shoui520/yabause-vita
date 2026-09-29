@@ -6,6 +6,9 @@ void main(float4 a_position : POSITION, float4 a_texcoord : TEXCOORD0,
           float4 a_grcolor : COLOR0, out float4 position : POSITION,
           out float4 v_texcoord : TEXCOORD0, out float4 v_vtxcolor : COLOR0) {
   position = mul(a_position, u_mvpMatrix);
+#ifdef FB_FETCH
+  position.z = a_texcoord.z; // per-primitive depth of destination-reading sprites, else 0
+#endif
   v_texcoord = a_texcoord;
   v_texcoord.xy /= u_texsize;
   v_vtxcolor = a_grcolor;

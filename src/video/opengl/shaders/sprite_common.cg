@@ -9,22 +9,37 @@ uniform sampler2D s_texture;
 uniform sampler2D u_sprite;
 #define SPRITE_TEXTURE u_sprite
 #endif
-#if defined(SPRITE_HALF) || defined(SPRITE_SHADOW)
+#if (defined(SPRITE_HALF) || defined(SPRITE_SHADOW)) && defined(FB_FETCH)
+// The destination comes from the tile being drawn (programmable blending), so
+// no snapshot of the target is needed; the result is packed as the output
+// register would have converted it.
+#define SPRITE_FETCH 1
+#elif defined(SPRITE_HALF) || defined(SPRITE_SHADOW)
 uniform sampler2D u_fbo;
 uniform int u_fbowidth;
 uniform int u_fbohegiht; // Preserve upstream uniform spelling.
 #endif
+#ifdef SPRITE_FETCH
+float4 YglSprite(float4 v_texcoord, float4 v_vtxcolor, float4 destination) {
+#else
 float4 main(float4 v_texcoord : TEXCOORD0, float4 v_vtxcolor : COLOR0,
             float4 pixel : WPOS) : COLOR {
+#endif
   float4 color = tex2D(SPRITE_TEXTURE, v_texcoord.xy / v_texcoord.w);
-#if !defined(SPRITE_NORMAL) && !defined(SPRITE_SPD)
+#if defined(SPRITE_GOURAUD) && defined(SPD_FLAG) && !defined(SPRITE_HALF)
+  // Gouraud with and without SPD in one program: vertex alpha 1 marks SPD
+  // (constant over each primitive, so interpolation keeps it at 0 or 1).
+  if (color.a == 0.0 && v_vtxcolor.a < 0.5) discard;
+#elif !defined(SPRITE_NORMAL) && !defined(SPRITE_SPD)
   if (color.a == 0.0) discard;
 #endif
 #if defined(SPRITE_MESH)
   if (((int(pixel.x) ^ int(pixel.y)) & 1) == 0) discard;
   color.rgb += v_vtxcolor.rgb;
 #elif defined(SPRITE_HALF) || defined(SPRITE_SHADOW)
+#ifndef SPRITE_FETCH
   float4 destination = tex2D(u_fbo, pixel.xy / float2(u_fbowidth, u_fbohegiht));
+#endif
   int metadata = YglUnorm8(destination.a);
 #if defined(SPRITE_SHADOW)
   if ((metadata & 0xc0) != 0x80) discard;
@@ -47,3 +62,14 @@ float4 main(float4 v_texcoord : TEXCOORD0, float4 v_vtxcolor : COLOR0,
 #endif
   return color;
 }
+#ifdef SPRITE_FETCH
+__nativecolor __regformat unsigned char4 main(float4 v_texcoord : TEXCOORD0, float4 v_vtxcolor : COLOR0,
+                                              __regformat unsigned char4 target : FRAGCOLOR) {
+  float4 color = YglSprite(v_texcoord, v_vtxcolor, float4(target) / 255.0f);
+  // The snapshot path stored its float result through a half register before
+  // the UCHAR4 conversion. A plain half cast is folded away by the compiler;
+  // the bit_cast round trip keeps the real f16 pack so both paths agree.
+  half4 h = bit_cast<half4>(bit_cast<unsigned short4>((half4)saturate(color)));
+  return (unsigned char4)floor((float4)h * 255.0f + 0.5f);
+}
+#endif

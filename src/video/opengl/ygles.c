@@ -1021,6 +1021,82 @@ extern void YglOpaqueDeInit(void);
 #ifdef VITA_VDP2_INDEXED_QUADS
 #include "quad_indices_vita.inc"
 #endif
+#ifdef VITA_FB_REGION
+/* Composition discards every fragment outside what VDP1 drew since the last
+ * erase when that erase left non-displayable pixels, so it can be scissored. */
+#include "vdp1_fb_tiles.h"
+/* Drawn tiles of each framebuffer, kept with the region (vdp1_fb_tiles.h). */
+static Vdp1FbTiles fb_tiles[2];
+
+static void YglFbRegionWhole(int target) {
+  _Ygl->vdp1_region_tracked[target] = 0;
+  fb_tiles[target].valid = 0;
+}
+
+static void YglFbRegionEmpty(int target) {
+  float *r = _Ygl->vdp1_region[target];
+  _Ygl->vdp1_region_tracked[target] = 1;
+  r[0] = r[1] = 1e30f;
+  r[2] = r[3] = -1e30f;
+  Vdp1FbTilesEmpty(&fb_tiles[target]);
+}
+
+#ifndef FB_REGION_MAX_FLOATS
+/* Scanning costs more than composing the whole framebuffer past this. */
+#define FB_REGION_MAX_FLOATS 12288
+#endif
+static void YglFbRegionAddQuads(int target, const float *xy, int count) {
+  float *r = _Ygl->vdp1_region[target];
+  float x0 = r[0], y0 = r[1], x1 = r[2], y1 = r[3];
+  int i;
+  if (!_Ygl->vdp1_region_tracked[target]) return;
+  if (count > FB_REGION_MAX_FLOATS) { YglFbRegionWhole(target); return; }
+  Vdp1FbTilesAdd(&fb_tiles[target], xy, count);
+  for (i = 0; i < count; i += 2) {
+    float x = xy[i], y = xy[i + 1];
+    if (x < x0) x0 = x;
+    if (x > x1) x1 = x;
+    if (y < y0) y0 = y;
+    if (y > y1) y1 = y;
+  }
+  r[0] = x0; r[1] = y0; r[2] = x1; r[3] = y1;
+}
+
+#else
+#define YglFbRegionWhole(target) ((void)0)
+#define YglFbRegionEmpty(target) ((void)0)
+#endif
+
+#ifdef VITA_FB_LAZY_READ
+/* The read-back pixels are copied from the blit target on first use, in
+ * 128-byte pieces of a row: pfb_src is its texel memory (rows bottom-up, as
+ * glReadPixels stores them), pfb_have the pieces already in pFrameBuffer. */
+#define PFB_PIECE 128u
+static const u8 *pfb_src;
+static u32 pfb_stride, pfb_pieces;
+static u8 *pfb_have;
+static inline void YglPfbNeed(u32 row, u32 at) {
+  u8 *have = &pfb_have[row * pfb_pieces + (at / PFB_PIECE)];
+  if (*have) return;
+  const u32 row_bytes = (u32)_Ygl->rwidth * 4u;
+  at &= ~(PFB_PIECE - 1u);
+  const u32 n = row_bytes - at < PFB_PIECE ? row_bytes - at : PFB_PIECE;
+  memcpy((u8 *)_Ygl->pFrameBuffer + row * row_bytes + at, pfb_src + row * pfb_stride + at, n);
+  *have = 1;
+}
+/* Completes pFrameBuffer before the blit target is overwritten. */
+static void YglPfbFlush(void) {
+  if (!pfb_src) return;
+  if (_Ygl->pFrameBuffer) {
+    const u32 row_bytes = (u32)_Ygl->rwidth * 4u;
+    for (u32 r = 0; r < (u32)_Ygl->rheight; ++r)
+      for (u32 at = 0; at < row_bytes; at += PFB_PIECE)
+        YglPfbNeed(r, at);
+  }
+  pfb_src = NULL;
+}
+#endif
+
 void YglDrawCpuFramebufferWrite(int target) {
   if (_Ygl->cpu_framebuffer_write[target] == 0) return;
 
@@ -1032,6 +1108,7 @@ void YglDrawCpuFramebufferWrite(int target) {
   glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->vdp1fbo);
   YglVdp1AttachColor(_Ygl->vdp1fbo,_Ygl->vdp1FrameBuff[target],0);
   YglVdp1AttachDepth(_Ygl->rboid_depth,_Ygl->rboid_stencil,0);
+  YglFbRegionWhole(target);
   _Ygl->cpu_framebuffer_write[0] = 0;
   _Ygl->cpu_framebuffer_write[1] = 0;
 
@@ -1050,6 +1127,9 @@ void YglDrawCpuFramebufferWrite(int target) {
     }
   }
   if (_Ygl->smallfbotex != 0) {
+#ifdef VITA_FB_LAZY_READ
+    YglPfbFlush();
+#endif
     glBindTexture(GL_TEXTURE_2D, _Ygl->smallfbotex);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, _Ygl->rwidth, _Ygl->rheight, GL_RGBA, GL_UNSIGNED_BYTE, _Ygl->CpuWriteFrameBuffer);
     glDisable(GL_SCISSOR_TEST);
@@ -1855,6 +1935,23 @@ int YglCheckTriangle( const float * point ){
 }
 
 static int YglQuadGrowShading_in(YglSprite * input, YglTexture * output, float * colors, YglCache * c, int cash_flg);
+#ifdef VITA_VDP1_FB_FETCH
+/* Destination-reading primitives write a depth that increases per primitive
+ * and test GREATER, so a primitive whose triangles overlap (lines, twisted
+ * quads) still modifies each pixel once, as when it read a snapshot. */
+static unsigned vita_fetch_seq;
+static int YglIsFetchProgram(int prg) {
+  return prg == PG_VFP1_HALFTRANS || prg == PG_VFP1_SHADOW ||
+         prg == PG_VFP1_GOURAUDSAHDING_HALFTRANS;
+}
+static float YglFetchDepth(int prg) {
+  if (!YglIsFetchProgram(prg)) return 0.0f;
+  if (vita_fetch_seq < (1u << 18) - 2u) ++vita_fetch_seq;
+  return -1.0f + (float)vita_fetch_seq * (1.0f / 262144.0f);
+}
+#else
+#define YglFetchDepth(prg) 0.0f
+#endif
 static int YglTriangleGrowShading_in(YglSprite * input, YglTexture * output, float * colors, YglCache * c, int cash_flg);
 static int YglQuadGrowShading_tesselation_in(YglSprite * input, YglTexture * output, float * colors, YglCache * c, int cash_flg);
 
@@ -1973,7 +2070,8 @@ int YglTriangleGrowShading_in(YglSprite * input, YglTexture * output, float * co
     y = c->y;
   }
 
-  texv[0].r = texv[1].r = texv[2].r = texv[3].r = texv[4].r = texv[5].r = 0; // these can stay at 0
+  const float fetch_z = YglFetchDepth(prg);
+  texv[0].r = texv[1].r = texv[2].r = texv[3].r = texv[4].r = texv[5].r = fetch_z; // these can stay at 0
   texv[0].q = texv[1].q = texv[2].q = texv[3].q = texv[4].q = texv[5].q = 1.0f; // these can stay at 0
 
   if (input->flip & 0x1) {
@@ -2288,7 +2386,7 @@ int YglQuadGrowShading_in(YglSprite * input, YglTexture * output, float * colors
 
    program->currentQuad += 12;
 
-   tmp[0].r = tmp[1].r = tmp[2].r = tmp[3].r = tmp[4].r = tmp[5].r = 0; // these can stay at 0
+   tmp[0].r = tmp[1].r = tmp[2].r = tmp[3].r = tmp[4].r = tmp[5].r = YglFetchDepth(prg); // these can stay at 0
    if (input->flip & 0x1) {
      tmp[0].s = tmp[3].s = tmp[5].s = (float)((x + input->w) - ATLAS_BIAS) ;
      tmp[1].s = tmp[2].s = tmp[4].s = (float)((x)+ATLAS_BIAS) ;
@@ -3129,6 +3227,16 @@ void YglEraseWriteVDP1(void) {
   }
   //alpha |= priority;
 
+#ifdef VITA_FB_REGION
+  /* Metadata below 0x80, a nonzero blue palette channel, or palette index 0
+   * at priority index 0 is discarded by every composition variant. */
+  if (!(alpha & 0x80) ||
+      ((alpha & 0x40) && (((color >> 10) & 0x1F) != 0 ||
+                          ((color & 0x3FF) == 0 && (alpha & 7) == 0))))
+    YglFbRegionEmpty(_Ygl->readframe);
+  else
+    YglFbRegionWhole(_Ygl->readframe);
+#endif
   glClearColor((color & 0x1F) / 31.0f, ((color >> 5) & 0x1F) / 31.0f, ((color >> 10) & 0x1F) / 31.0f, alpha / 255.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
   FRAMELOG("YglEraseWriteVDP1xx: clear %d\n", _Ygl->readframe);
@@ -3232,6 +3340,17 @@ void YglRenderVDP1(void) {
 
   glViewport(0,0,_Ygl->width,_Ygl->height);
   glScissor(0, 0, _Ygl->width, _Ygl->height);
+#ifdef VITA_VDP1_FB_FETCH
+  const int fetch_depth = vita_fetch_seq != 0;
+  int fetch_on = 0;
+  if (fetch_depth) {
+    glDepthMask(GL_TRUE);
+    glClearDepthf(0.0f);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glDepthMask(GL_FALSE);
+    glDepthFunc(GL_GREATER);
+  }
+#endif
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, YglTM->textureID_in[YglTM->current] );
 
@@ -3240,6 +3359,14 @@ void YglRenderVDP1(void) {
       cprg = level->prg[j].prgid;
       glUseProgram(level->prg[j].prg);
     }
+#ifdef VITA_VDP1_FB_FETCH
+    if (fetch_depth && level->prg[j].currentQuad != 0 &&
+        YglIsFetchProgram(level->prg[j].prgid) != fetch_on) {
+      fetch_on = !fetch_on;
+      if (fetch_on) { glEnable(GL_DEPTH_TEST); glDepthMask(GL_TRUE); }
+      else { glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); }
+    }
+#endif
     
     if(level->prg[j].setupUniform) {
       level->prg[j].setupUniform((void*)&level->prg[j]);
@@ -3275,6 +3402,10 @@ void YglRenderVDP1(void) {
 #endif
 #ifdef VITA_STACK_PROFILE
         uint64_t tr0_ = sceKernelGetProcessTimeWide();
+#endif
+#ifdef VITA_FB_REGION
+        if (Vdp1Regs->TVMR & 0x02) YglFbRegionWhole(_Ygl->drawframe);
+        else YglFbRegionAddQuads(_Ygl->drawframe, level->prg[j].quads, level->prg[j].currentQuad);
 #endif
 #ifdef VITA_STACK_PROFILE
         uint64_t tr1_ = sceKernelGetProcessTimeWide();
@@ -3316,6 +3447,14 @@ void YglRenderVDP1(void) {
       rbt_, rb_[0], rb_[1], rb_[2], rb_[3], _Ygl->vdp1_region_tracked[_Ygl->drawframe], r_[0], r_[1], r_[2], r_[3]); }
 #endif
   level->prgcurrent = 0;
+#ifdef VITA_VDP1_FB_FETCH
+  if (fetch_depth) {
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glDepthFunc(GL_GEQUAL);
+  }
+  vita_fetch_seq = 0;
+#endif
 
 #ifdef YABAUSE_VITAGL
   /* Same-context GPU consumers retain order; only CPU observation waits. */
@@ -3643,8 +3782,116 @@ void YglRenderFrameBuffer(int from, int to) {
     cwidth = _Ygl->rwidth;
     cheight = _Ygl->rheight;
   }
+#ifdef VITA_FB_REGION
+  int fb_skip = 0, fb_scissor = 0, fb_scissor_was_on = 0;
+  GLint fb_box[4];
+  /* Scissor rectangles of the drawn tiles (fb_tiled): the same quad is drawn
+   * once per rectangle, so rasterization and sampling are unchanged. */
+  enum { FB_RECT_MAX = 48 };
+  int fb_tiled = 0, fb_nrect = 0;
+  GLint fb_rect[FB_RECT_MAX][4];
+  if (_Ygl->vdp1_region_tracked[_Ygl->readframe] && !(Vdp1Regs->TVMR & 0x02) &&
+      result.m[3][0] == 0.0f && result.m[3][1] == 0.0f &&
+      result.m[3][2] == 0.0f && result.m[3][3] == 1.0f) {
+    const float *r = _Ygl->vdp1_region[_Ygl->readframe];
+    if (r[0] > r[2] || r[1] > r[3]) {
+      fb_skip = 1;
+    } else {
+      /* Framebuffer coordinate x samples at vertex x*(cwidth+1)/rwidth-0.5. */
+      float sx = (float)(cwidth + 1) / (float)_Ygl->rwidth;
+      float sy = (float)(cheight + 1) / (float)_Ygl->rheight;
+      float cx[2] = { (r[0] - 1.0f) * sx - 0.5f, (r[2] + 1.0f) * sx - 0.5f };
+      float cy[2] = { (r[1] - 1.0f) * sy - 0.5f, (r[3] + 1.0f) * sy - 0.5f };
+      float wx0 = 1e30f, wy0 = 1e30f, wx1 = -1e30f, wy1 = -1e30f;
+      GLint vp[4];
+      int k;
+      glGetIntegerv(GL_VIEWPORT, vp);
+      for (k = 0; k < 4; ++k) {
+        float x = cx[k & 1], y = cy[k >> 1];
+        float nx = result.m[0][0] * x + result.m[0][1] * y + result.m[0][3];
+        float ny = result.m[1][0] * x + result.m[1][1] * y + result.m[1][3];
+        float wx = vp[0] + (nx + 1.0f) * 0.5f * vp[2];
+        float wy = vp[1] + (ny + 1.0f) * 0.5f * vp[3];
+        if (wx < wx0) wx0 = wx;
+        if (wx > wx1) wx1 = wx;
+        if (wy < wy0) wy0 = wy;
+        if (wy > wy1) wy1 = wy;
+      }
+      fb_scissor_was_on = glIsEnabled(GL_SCISSOR_TEST);
+      if (fb_scissor_was_on) {
+        glGetIntegerv(GL_SCISSOR_BOX, fb_box);
+      } else {
+        fb_box[0] = vp[0]; fb_box[1] = vp[1]; fb_box[2] = vp[2]; fb_box[3] = vp[3];
+      }
+      {
+        int x0 = (int)floorf(wx0) - 1, y0 = (int)floorf(wy0) - 1;
+        int x1 = (int)ceilf(wx1) + 1, y1 = (int)ceilf(wy1) + 1;
+        if (x0 < fb_box[0]) x0 = fb_box[0];
+        if (y0 < fb_box[1]) y0 = fb_box[1];
+        if (x1 > fb_box[0] + fb_box[2]) x1 = fb_box[0] + fb_box[2];
+        if (y1 > fb_box[1] + fb_box[3]) y1 = fb_box[1] + fb_box[3];
+        if (x1 <= x0 || y1 <= y0) {
+          fb_skip = 1;
+        } else {
+          const Vdp1FbTiles *tl = &fb_tiles[_Ygl->readframe];
+          Vdp1FbTileRect tr[FB_RECT_MAX];
+          const int nt = tl->valid && result.m[0][1] == 0.0f && result.m[1][0] == 0.0f ?
+                         Vdp1FbTilesRects(tl, tr, FB_RECT_MAX) : -1;
+          if (nt >= 0) {
+            /* Tile edge k in window pixels, as the region above maps
+             * coordinates; adjacent rectangles share edges. */
+            #define FB_EDGE_X(k) ((int)floorf(vp[0] + (result.m[0][0] * ((float)((k) * FB_TILE) * sx - 0.5f) + result.m[0][3] + 1.0f) * 0.5f * vp[2] + 0.5f))
+            #define FB_EDGE_Y(k) ((int)floorf(vp[1] + (result.m[1][1] * ((float)((k) * FB_TILE) * sy - 0.5f) + result.m[1][3] + 1.0f) * 0.5f * vp[3] + 0.5f))
+            for (k = 0; k < nt; ++k) {
+              int ax = FB_EDGE_X(tr[k].c0), bx = FB_EDGE_X(tr[k].c1);
+              int ay = FB_EDGE_Y(tr[k].r0), by = FB_EDGE_Y(tr[k].r1);
+              if (ax > bx) { int s_ = ax; ax = bx; bx = s_; }
+              if (ay > by) { int s_ = ay; ay = by; by = s_; }
+              if (ax < x0) ax = x0;
+              if (ay < y0) ay = y0;
+              if (bx > x1) bx = x1;
+              if (by > y1) by = y1;
+              if (bx <= ax || by <= ay) continue;
+              fb_rect[fb_nrect][0] = ax; fb_rect[fb_nrect][1] = ay;
+              fb_rect[fb_nrect][2] = bx - ax; fb_rect[fb_nrect][3] = by - ay;
+              ++fb_nrect;
+            }
+            #undef FB_EDGE_X
+            #undef FB_EDGE_Y
+            fb_tiled = 1;
+            fb_scissor = 1;
+            if (!fb_scissor_was_on) glEnable(GL_SCISSOR_TEST);
+          } else if (x0 > fb_box[0] || y0 > fb_box[1] ||
+                     x1 < fb_box[0] + fb_box[2] || y1 < fb_box[1] + fb_box[3]) {
+            fb_scissor = 1;
+            glScissor(x0, y0, x1 - x0, y1 - y0);
+            if (!fb_scissor_was_on) glEnable(GL_SCISSOR_TEST);
+          }
+        }
+      }
+    }
+  }
+#define FB_DRAW() do { if (fb_skip) break; \
+    if (!fb_tiled) { glDrawArrays(GL_TRIANGLES, 0, 6); break; } \
+    for (int q_ = 0; q_ < fb_nrect; ++q_) { \
+      glScissor(fb_rect[q_][0], fb_rect[q_][1], fb_rect[q_][2], fb_rect[q_][3]); \
+      glDrawArrays(GL_TRIANGLES, 0, 6); } } while (0)
+#ifdef VITA_DIAG_ABLATE
+  { static unsigned n; if ((n++ & 63) == 0) {
+      GLint sb[4] = {0}; glGetIntegerv(GL_SCISSOR_BOX, sb);
+      YuiMsg("fbcomp from=%d to=%d minpri=%d maxpri=%d r=%dx%d w=%dx%d tracked=%d skip=%d scissor=%d box=%d,%d,%d,%d line=%d tvmr=%x ccctl=%x tiled=%d rects=%d area=%d",
+        from, to, _Ygl->vdp1_minpri, _Ygl->vdp1_maxpri, _Ygl->rwidth, _Ygl->rheight, _Ygl->width, _Ygl->height,
+        _Ygl->vdp1_region_tracked[_Ygl->readframe], fb_skip, fb_scissor, sb[0], sb[1], sb[2], sb[3],
+        _Ygl->vdp1_lineTexture != 0, Vdp1Regs->TVMR, Vdp2Regs->CCCTL, fb_tiled, fb_nrect,
+        ({ int a_ = 0; for (int q_ = 0; q_ < fb_nrect; ++q_) a_ += fb_rect[q_][2] * fb_rect[q_][3]; a_; })); } }
+#endif
+#define FB_RESTORE() do { if (fb_scissor) { \
+    glScissor(fb_box[0], fb_box[1], fb_box[2], fb_box[3]); \
+    if (!fb_scissor_was_on) glDisable(GL_SCISSOR_TEST); } } while (0)
+#else
 #define FB_DRAW() glDrawArrays(GL_TRIANGLES, 0, 6)
 #define FB_RESTORE() ((void)0)
+#endif
 
 
 
@@ -3753,7 +4000,7 @@ void YglRenderFrameBuffer(int from, int to) {
      glUniformMatrix4fv(_Ygl->renderfb.mtxModelView, 1, GL_FALSE, (GLfloat*)result.m);
      glVertexAttribPointer(_Ygl->renderfb.vertexp, 2, YGL_WINDOW_COORD_FORMAT, GL_FALSE, 0, (GLvoid *)vertices);
      glVertexAttribPointer(_Ygl->renderfb.texcoordp, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid *)texcord);
-     glDrawArrays(GL_TRIANGLES, 0, 6);
+     FB_DRAW();
 
      glDepthFunc(GL_GREATER);
      glDisable(GL_BLEND);
@@ -3784,7 +4031,7 @@ void YglRenderFrameBuffer(int from, int to) {
      }
 
      Ygl_uniformVDP2DrawFramebuffer(&_Ygl->renderfb, (float)(from) / 10.0f, (float)(to) / 10.0f, offsetcol, 0 );
-     glDrawArrays(GL_TRIANGLES, 0, 6);
+     FB_DRAW();
 
      glDepthFunc(GL_GEQUAL);
      glEnable(GL_BLEND);
@@ -3793,6 +4040,7 @@ void YglRenderFrameBuffer(int from, int to) {
        glDisable(GL_STENCIL_TEST);
        glStencilFunc(GL_ALWAYS, 0, 0xFF);
      }
+     FB_RESTORE();
      return;
    }
 
@@ -3822,7 +4070,7 @@ void YglRenderFrameBuffer(int from, int to) {
    glUniformMatrix4fv(_Ygl->renderfb.mtxModelView, 1, GL_FALSE, (GLfloat*)result.m);
    glVertexAttribPointer(_Ygl->renderfb.vertexp,2,YGL_WINDOW_COORD_FORMAT, GL_FALSE,0,(GLvoid *)vertices );
    glVertexAttribPointer(_Ygl->renderfb.texcoordp,2,GL_FLOAT,GL_FALSE,0,(GLvoid *)texcord );
-   glDrawArrays(GL_TRIANGLES, 0, 6);
+   FB_DRAW();
 
 #if 0
    if (is_addcolor == 1){
@@ -3830,7 +4078,7 @@ void YglRenderFrameBuffer(int from, int to) {
      glUniformMatrix4fv(_Ygl->renderfb.mtxModelView, 1, GL_FALSE, (GLfloat*)result.m);
      glVertexAttribPointer(_Ygl->renderfb.vertexp, 2, YGL_WINDOW_COORD_FORMAT, GL_FALSE, 0, (GLvoid *)vertices);
      glVertexAttribPointer(_Ygl->renderfb.texcoordp, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid *)texcord);
-     glDrawArrays(GL_TRIANGLES, 0, 6);
+     FB_DRAW();
    }
 #endif
 
@@ -3840,6 +4088,9 @@ void YglRenderFrameBuffer(int from, int to) {
       glStencilFunc(GL_ALWAYS,0,0xFF);
    }
    glEnable(GL_BLEND);
+   FB_RESTORE();
+#undef FB_DRAW
+#undef FB_RESTORE
 }
 
 

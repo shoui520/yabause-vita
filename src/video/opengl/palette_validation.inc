@@ -153,8 +153,7 @@ int YglVitaValidatePalette(void) {
     unsigned fb_errors=0;
     for(unsigned k=0;k<8;++k) {
       glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
-      glUniform1f(glGetUniformLocation(fb_program,"u_from"),(float)k/10.0f);
-      glUniform1f(glGetUniformLocation(fb_program,"u_to"),(float)(k+1)/10.0f);
+      YglVitaFramebufferRange(PG_VDP2_DRAWFRAMEBUFF_DESTALPHA,(float)k/10.0f,(float)(k+1)/10.0f);
       glDrawArrays(GL_TRIANGLES,0,6);
       glReadPixels(0,0,64,32,GL_RGBA,GL_UNSIGNED_BYTE,output);
       unsigned errors=0;
