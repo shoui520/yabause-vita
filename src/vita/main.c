@@ -124,6 +124,7 @@ void VitaDiagTimersReport(void) {
 #include "present.h"
 #include "frame_capture.h"
 #include "input_replay.h"
+#include "log_writer.h"
 #include "vdp2.h"
 static unsigned capture_frame, presented_frames;
 int YuiCapturePending(void) {
@@ -185,13 +186,51 @@ extern void VitaSh2ReportExecution(void);
 extern int VitaC68kReadTest(void);
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Log file writes and flushes run on a writer thread: a synchronous
+ * fflush to ux0 on the emulation thread measured 3.7% of its wall time in
+ * gameplay. Text is never dropped; fatal/error lines and abort() drain first,
+ * so the last line before a crash is still on the card. */
+static VitaLogWriter log_writer;
+static int log_async;
+/* The render core, above the render thread (as the disc prefetch worker): the
+ * writer is almost always blocked, and a render thread that never blocks
+ * would otherwise starve it until the ring fills and producers stall. */
+static void log_writer_setup(void) {
+  YabThreadSetCurrentThreadAffinityMask(4);
+  sceKernelChangeThreadPriority(0, 96);
+}
 void YuiMsg(const char *fmt, ...) {
   if (!logfile) return;
   VT_SCOPE(VT_LOGGING);
-  pthread_mutex_lock(&log_mutex);
-  va_list ap; va_start(ap, fmt); vfprintf(logfile, fmt, ap); va_end(ap);
-  fputc('\n', logfile); fflush(logfile);
-  pthread_mutex_unlock(&log_mutex);
+  char small[1024];
+  va_list ap; va_start(ap, fmt);
+  int n = vsnprintf(small, sizeof(small) - 1, fmt, ap);
+  va_end(ap);
+  if (n < 0) return;
+  char *text = small;
+  if ((size_t)n >= sizeof(small) - 1) {
+    if (!(text = malloc((size_t)n + 2))) return;
+    va_start(ap, fmt); vsnprintf(text, (size_t)n + 1, fmt, ap); va_end(ap);
+  }
+  text[n] = '\n';
+  if (log_async) {
+    VitaLogWriterAppend(&log_writer, text, (size_t)n + 1);
+    if (!strncmp(text, "fatal", 5) || !strncmp(text, "error", 5)) VitaLogWriterDrain(&log_writer);
+  } else {
+    pthread_mutex_lock(&log_mutex);
+    fwrite(text, 1, (size_t)n + 1, logfile); fflush(logfile);
+    pthread_mutex_unlock(&log_mutex);
+  }
+  if (text != small) free(text);
+}
+void __real_abort(void) __attribute__((noreturn));
+void __wrap_abort(void) {
+  if (log_async && !pthread_equal(pthread_self(), log_writer.thread)) VitaLogWriterDrain(&log_writer);
+  __real_abort();
+}
+static void log_close(void) {
+  if (log_async) { VitaLogWriterStop(&log_writer); log_async = 0; }
+  if (logfile) { fclose(logfile); logfile = NULL; }
 }
 void YuiErrorMsg(const char *s) { YuiMsg("error=%s", s); }
 int YuiUseOGLOnThisThread(void) {
@@ -505,6 +544,7 @@ int main(void) {
   sceAppUtilInit(&ap, &bp);
   sceIoMkdir(DATA, 0777);
   logfile = fopen(DATA "run.log", "w");
+  if (logfile) log_async = VitaLogWriterStart(&log_writer, logfile, log_writer_setup) == 0;
   YuiMsg("start title=YABA00001 build=%s %s", __DATE__, __TIME__);
   YabThreadSetCurrentThreadAffinityMask(1);
   char run_id[80] = {0};
@@ -514,7 +554,7 @@ int main(void) {
   YuiMsg("run_id=%s", run_id);
   if (!VitaTelemetryCheckThreadIsolation()) {
     YuiMsg("thread_isolation_failed: refusing shared thread-local state");
-    fclose(logfile);
+    log_close();
     return 1;
   }
   YuiMsg("thread_isolation_pass");
@@ -570,6 +610,27 @@ int main(void) {
     }
     fclose(input_request); remove(DATA "input-replay.txt");
   }
+  /* One-shot save-state requests (DATA save-state.txt / load-state.txt: "<run id> <frame>"):
+   * consumed (removed) here, so the next launch runs normally. */
+  unsigned save_state_frame = 0, load_state_frame = 0;
+  FILE *save_request = fopen(DATA "save-state.txt", "r");
+  if (save_request) {
+    char requested_run[80] = {0}; unsigned requested_frame = 0;
+    if (fscanf(save_request, "%79s %u", requested_run, &requested_frame) == 2 &&
+        run_id[0] && !strcmp(requested_run, run_id) && requested_frame <= 1000000)
+      save_state_frame = requested_frame;
+    fclose(save_request);
+    remove(DATA "save-state.txt");
+  }
+  FILE *load_request = fopen(DATA "load-state.txt", "r");
+  if (load_request) {
+    char requested_run[80] = {0}; unsigned requested_frame = 0;
+    if (fscanf(load_request, "%79s %u", requested_run, &requested_frame) == 2 &&
+        run_id[0] && !strcmp(requested_run, run_id) && requested_frame <= 1000000)
+      load_state_frame = requested_frame;
+    fclose(load_request);
+    remove(DATA "load-state.txt");
+  }
   FILE *capture_request = fopen(DATA "capture-frame.txt", "r");
   if (capture_request) {
     char requested_run[80] = {0}; unsigned requested_frame = 0;
@@ -579,21 +640,7 @@ int main(void) {
     fclose(capture_request);
     remove(DATA "capture-frame.txt");
   }
-  /* Preserve an existing overclock (nominal 500 / approximately 496 MHz).
-   * The public API's documented ceiling is 444; no plugin is installed here. */
-#ifdef VITA_POWER_MODE_C
-  /* Sony Power Overview ch.6: Mode C = "high" GPU core clock with WLAN kept
-   * (brightness limited, camera unavailable). Value from the SDK power.h:
-   * SCE_POWER_CONFIGURATION_MODE_C 0x00010880U. Logged before/after because
-   * the header describes the ARM clock in this mode as "normal". */
-  {
-    int arm = scePowerGetArmClockFrequency(), gpu = scePowerGetGpuClockFrequency();
-    int rc = scePowerSetConfigurationMode(0x00010880);
-    YuiMsg("power_mode_c rc=%d arm_mhz=%d->%d gpu_mhz=%d->%d", rc, arm,
-           scePowerGetArmClockFrequency(), gpu, scePowerGetGpuClockFrequency());
-  }
-#endif
-  if (scePowerGetArmClockFrequency() < 444) scePowerSetArmClockFrequency(444);
+  /* Clocks are the user's choice (e.g. PSVshell); only report them. */
   YuiMsg("cpu_mhz=%d gpu_mhz=%d", scePowerGetArmClockFrequency(), scePowerGetGpuClockFrequency());
 #ifdef VITA_SH2_DYNAREC
   if (VitaSh2CodeSmokeTest() != 0) goto done;
@@ -601,10 +648,20 @@ int main(void) {
 #endif
 #ifdef YABAUSE_VITAGL
   graphics_owner = sceKernelGetThreadId();
+#ifdef VITA_TRIPLE_BUFFER
+  /* A third display buffer lets the render thread start the next frame while
+   * a finished one waits for its vblank. */
+  vglUseTripleBuffering(GL_TRUE);
+#else
   vglUseTripleBuffering(GL_FALSE);
+#endif
   /* Keep transient vertex storage bounded without disabling retirement checks.
    * 8 MiB leaves 24 MiB of the RAM pool for indices, rings and shader state. */
+#ifdef VITA_TRIPLE_BUFFER
+  vglSetCircularPoolSize(12*1024*1024);  /* the same 4 MiB per display buffer */
+#else
   vglSetCircularPoolSize(8*1024*1024);
+#endif
   /* Pinned vitaGL returns resolution-fallback, NOT success/failure. */
   GLboolean resolution_fallback = vglInitWithCustomSizes(0, 960, 544,
     32*1024*1024, 48*1024*1024, 0, 0, SCE_GXM_MULTISAMPLE_NONE);
@@ -644,7 +701,12 @@ int main(void) {
   init.percoretype = 0; init.m68kcoretype = M68KCORE_C68K;
   init.cdcoretype = disc[0] ? CDCORE_ISO : CDCORE_DUMMY;
   init.biospath = DATA "bios.bin"; init.cdpath = disc[0] ? disc : NULL;
-  init.buppath = DATA "backup.bin"; init.carttype = 0;
+  /* A YabaSanshiro internal backup image (bkram.bin, 8 MiB extended format:
+   * the standard interleaved layout, grown) is used when present. Its first
+   * 64 KiB are the standard 32 KiB internal backup RAM, which T123Load reads. */
+  FILE *bkram = fopen(DATA "bkram.bin", "rb");
+  if (bkram) fclose(bkram);
+  init.buppath = bkram ? DATA "bkram.bin" : DATA "backup.bin"; init.carttype = 0;
   init.regionid = 1; init.videoformattype = VIDEOFORMATTYPE_NTSC;
   init.clocksync = 1; init.basetime = 946684800; init.numthreads = 1;
   init.scsp_sync_count_per_frame = 1;
@@ -700,9 +762,18 @@ int main(void) {
     PERPAD_RIGHT_TRIGGER,PERPAD_C,PERPAD_B,PERPAD_A,PERPAD_Y,PERPAD_Z,
     PERPAD_LEFT_TRIGGER,PERPAD_START,PERPAD_X};
   for (unsigned i=0;i<sizeof(keys)/sizeof(keys[0]);++i) PerSetKey(i, keys[i], pad);
+  unsigned frames = 0, batch = 0;
+  if (load_state_frame) {
+    /* Frame numbering (input replay, benchmark, capture) continues from the
+     * frame the state was saved after. */
+    const int rc = YabLoadState(DATA "resume.yss");
+    YuiMsg("state_loaded frame=%u rc=%d", load_state_frame, rc);
+    if (rc != 0) { YabauseDeInit(); goto done; }
+    frames = load_state_frame;
+    presented_frames = load_state_frame;               /* --capture-frame counts from 0 */
+  }
   uint64_t start = sceKernelGetProcessTimeWide(), last = start;
   uint64_t benchmark_start = start;
-  unsigned frames = 0, batch = 0;
   VitaTelemetryThread("emulation");
   VitaTelemetryEnter(VT_FRONTEND);
   while (1) {
@@ -719,6 +790,30 @@ int main(void) {
     VitaTelemetryLeave(VT_SCHEDULER);
     if (exec_result < 0) { YuiMsg("execution_failed"); break; }
     ++frames; ++batch;
+    if (save_state_frame && frames == save_state_frame) {
+      const int rc = YabSaveState(DATA "state.yss");
+      YuiMsg("state_saved frame=%u rc=%d", frames, rc);
+      save_state_frame = 0;
+    }
+    /* SELECT on its own (not the exit chord): save a state after this frame
+     * as states/<disc name>-<frame>.yss, once per press. */
+    {
+      static int select_held;
+      const unsigned others = SCE_CTRL_START | SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER;
+      const int select = (exit_input.buttons & SCE_CTRL_SELECT) && !(exit_input.buttons & others);
+      if (select && !select_held) {
+        const char *base = strrchr(disc, '/');
+        base = base ? base + 1 : disc[0] ? disc : "bios";
+        char name[160];
+        snprintf(name, sizeof(name), "%.*s", (int)strcspn(base, "."), base);
+        char path[256];
+        snprintf(path, sizeof(path), DATA "states/%s-%u.yss", name, frames);
+        sceIoMkdir(DATA "states", 0777);
+        const int rc = YabSaveState(path);
+        YuiMsg("select_state_saved frame=%u rc=%d path=%s", frames, rc, path);
+      }
+      select_held = (exit_input.buttons & SCE_CTRL_SELECT) != 0;
+    }
     uint64_t now = sceKernelGetProcessTimeWide();
 #ifdef VITA_ROTATION_ROUTE
     {
@@ -833,6 +928,6 @@ done:
   if (VitaGxmDeviceDestroy(&gxm) < 0) YuiMsg("gxm_cleanup_failed_at_exit");
 #endif
   YuiMsg("exit");
-  if (logfile) fclose(logfile);
+  log_close();
   sceAppUtilShutdown(); sceKernelExitProcess(0); return 0;
 }

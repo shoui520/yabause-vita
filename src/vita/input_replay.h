@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <ctype.h>
-enum { VITA_REPLAY_EVENTS = 256 };
+enum { VITA_REPLAY_EVENTS = 4096 };
 typedef struct { unsigned frame, mask; } VitaInputEvent;
 typedef struct {
   VitaInputEvent events[VITA_REPLAY_EVENTS];

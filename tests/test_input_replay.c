@@ -26,7 +26,7 @@ int main(void) {
     assert(replay.count == 0 && !VitaInputReplayMask(&replay, 0, &mask));
   }
   FILE *file = tmpfile(); assert(file);
-  for (unsigned i = 0; i < 257; ++i) fprintf(file, "%u 0\n", i);
+  for (unsigned i = 0; i < VITA_REPLAY_EVENTS + 1; ++i) fprintf(file, "%u 0\n", i);
   rewind(file); assert(VitaInputReplayRead(file, &replay) == -1); fclose(file);
   puts("input replay: frame boundaries, release, strict parsing and bounded events passed");
 }
