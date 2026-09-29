@@ -567,6 +567,8 @@ static u32 FASTCALL Vdp1ReadPolygonColor(vdp1cmd_struct *cmd)
   return color;
 }
 
+#include <arm_neon.h>
+#include "vdp1_sprite_decode.h"
 #include "../../vita/telemetry.h"
 #include "../../vita/diag_timers.h"
 #ifdef VITA_STACK_PROFILE
@@ -588,6 +590,9 @@ static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, Ygl
   u32 shadow_alpha = (u8)0xF8 - (u8)0x80;
   u32 charAddr = cmd->CMDSRCA * 8;
   u32 dot;
+#ifdef VITA_VDP1_FAST_SPRITE_VERIFY
+  u32 *vf_kept = NULL, *vf_dst = NULL;
+#endif
   u8 SPD = ((cmd->CMDPMOD & 0x40) != 0);
   u8 END = ((cmd->CMDPMOD & 0x80) != 0);
   u8 MSB = ((cmd->CMDPMOD & 0x8000) != 0);
@@ -621,6 +626,317 @@ static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, Ygl
       YuiMsg("vdp1_modes sprites=%u texels bank4=%u lut4=%u bank64=%u bank128=%u bank256=%u rgb16=%u m6=%u m7=%u msb=%u spd=%u end=%u spctl=%x",
         total, texels[0], texels[1], texels[2], texels[3], texels[4], texels[5], texels[6], texels[7], msb, spd, end, fixVdp2Regs->SPCTL);
       memset(texels, 0, sizeof(texels)); msb = spd = end = total = 0;
+    }
+  }
+#endif
+#ifdef VITA_VDP1_FAST_SPRITE
+  { /* Per-sprite constant cases (vdp1_sprite_decode.h); bit-identical. */
+    const int mode = (cmd->CMDPMOD >> 3) & 0x7;
+    const int rgb_sprites = (fixVdp2Regs->SPCTL & 0x20) != 0;
+    if (mode == 5 && END && !MSB_SHADOW && !SPD && rgb_sprites) {
+      for (u16 i = 0; i < sprite->h; i++) {
+        texture->textdata = Vdp1DecodeRgb16Row(Vdp1Ram, charAddr, sprite->w, texture->textdata,
+          (u32)colorcl, (u32)priority, (u32)nromal_shadow);
+        charAddr += 2 * sprite->w;
+        texture->textdata += texture->w;
+      }
+      return;
+    }
+    if (mode == 5 && END && !MSB_SHADOW && SPD && rgb_sprites) {
+      /* With SPD, dots without MSB take the palette branch, whose colour
+       * calculation bits carry to the following dots (Vdp1MaskSpritePixel);
+       * end codes are off, so the loop's other branches are unreachable. */
+      ((u8 *)&fixVdp2Regs->CCRSA)[0] &= 0x1F;
+      const u32 shadow_texel = VDP1COLOR(0, 1, priority, 1, 0);
+      const int type = fixVdp2Regs->SPCTL & 0xF;
+#ifdef VITA_VDP1_FAST_SPRITE_VERIFY
+      u32 *const vf_start = texture->textdata;
+      const u32 vf_addr = charAddr;
+      const int vf_colorcl = colorcl;
+#endif
+      u32 *out = texture->textdata;
+#define SPD_RGB16_DOT() do { \
+          u16 d = T1ReadWord(Vdp1Ram, charAddr & 0x7FFFF); charAddr += 2; \
+          if (nromal_shadow != 0 && d == nromal_shadow) *out++ = shadow_texel; \
+          else if (d & 0x8000) *out++ = VDP1COLOR(0, colorcl, priority, 0, VDP1COLOR16TO24(d)); \
+          else { Vdp1MaskSpritePixel(type, &d, &colorcl); *out++ = VDP1COLOR(1, colorcl, priority, 0, d); } \
+        } while (0)
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+      /* Eight dots that all have MSB set and none equal to the shadow code
+       * are RGB texels with the current colorcl: converted together. */
+      const int shadow_ok = nromal_shadow > 0 && nromal_shadow <= 0xFFFF;
+      const uint16x8_t shadow8 = vdupq_n_u16(shadow_ok ? (u16)nromal_shadow : 0);
+      const uint32x4_t m_r = vdupq_n_u32(0x1F), m_g = vdupq_n_u32(0x3E0), m_b = vdupq_n_u32(0x7C00);
+#endif
+      for (u16 i = 0; i < sprite->h; i++, out += texture->w) {
+        u16 j = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        for (; j + 8 <= sprite->w; j += 8) {
+          const u32 a = charAddr & 0x7FFFF;
+          if (a <= 0x80000 - 16) {
+            const uint16x8_t d8 = vreinterpretq_u16_u8(vrev16q_u8(vld1q_u8(Vdp1Ram + a)));
+            uint16x4_t lo = vmin_u16(vget_low_u16(d8), vget_high_u16(d8));
+            lo = vpmin_u16(lo, lo); lo = vpmin_u16(lo, lo);
+            uint16x4_t eq = vdup_n_u16(0);
+            if (shadow_ok) {
+              const uint16x8_t e = vceqq_u16(d8, shadow8);
+              eq = vorr_u16(vget_low_u16(e), vget_high_u16(e));
+              eq = vpmax_u16(eq, eq); eq = vpmax_u16(eq, eq);
+            }
+            if (vget_lane_u16(lo, 0) >= 0x8000 && vget_lane_u16(eq, 0) == 0) {
+              const uint32x4_t base = vdupq_n_u32(VDP1COLOR(0, colorcl, priority, 0, 0));
+              const uint32x4_t x0 = vmovl_u16(vget_low_u16(d8)), x1 = vmovl_u16(vget_high_u16(d8));
+              uint32x4_t y0 = vorrq_u32(base, vshlq_n_u32(vandq_u32(x0, m_r), 3));
+              uint32x4_t y1 = vorrq_u32(base, vshlq_n_u32(vandq_u32(x1, m_r), 3));
+              y0 = vorrq_u32(y0, vshlq_n_u32(vandq_u32(x0, m_g), 6)); y1 = vorrq_u32(y1, vshlq_n_u32(vandq_u32(x1, m_g), 6));
+              y0 = vorrq_u32(y0, vshlq_n_u32(vandq_u32(x0, m_b), 9)); y1 = vorrq_u32(y1, vshlq_n_u32(vandq_u32(x1, m_b), 9));
+              vst1q_u32(out, y0); vst1q_u32(out + 4, y1);
+              out += 8; charAddr += 16;
+              continue;
+            }
+          }
+          for (int k = 0; k < 8; k++) SPD_RGB16_DOT();
+        }
+#endif
+        for (; j < sprite->w; j++) SPD_RGB16_DOT();
+      }
+#undef SPD_RGB16_DOT
+      texture->textdata = out;
+#ifndef VITA_VDP1_FAST_SPRITE_VERIFY
+      return;
+#else
+      /* Keep this output, decode again by the loop below, and compare. */
+      const u32 pitch = sprite->w + texture->w;
+      vf_kept = malloc((size_t)sprite->w * sprite->h * 4 + 4);
+      if (vf_kept) {
+        for (u16 i = 0; i < sprite->h; i++) memcpy(vf_kept + i * sprite->w, vf_start + i * pitch, sprite->w * 4);
+        vf_kept[sprite->w * sprite->h] = (u32)colorcl;
+      }
+      vf_dst = vf_start; texture->textdata = vf_start; charAddr = vf_addr; colorcl = vf_colorcl;
+#endif
+    }
+    if (mode == 0) {
+      const u32 colorBank = cmd->CMDCOLR & 0xFFF0;
+      u32 table[16];
+      for (unsigned n = 0; n < 16; ++n) {
+        const int colorindex = (int)(n | colorBank);
+        if (n == 0 && !SPD) table[n] = 0;
+        else if (n == 0xF && !END) table[n] = 0; /* end code: the decoder's counter */
+        else if (MSB_SHADOW || colorindex == nromal_shadow) table[n] = VDP1COLOR(1, 0, priority, 1, 0);
+        else if ((colorindex & 0x8000) && (fixVdp2Regs->SPCTL & 0x20))
+          table[n] = VDP1COLOR(0, colorcl, priority, 0, VDP1COLOR16TO24(colorindex));
+        else table[n] = VDP1COLOR(1, colorcl, priority, 0, colorindex);
+      }
+      Vdp1DecodeBank4Sprite(Vdp1Ram, charAddr, sprite->w, sprite->h, &texture->textdata, texture->w, table, END);
+      return;
+    }
+    if (mode == 1) {
+      /* Each LUT word classified exactly as the original loop's branches;
+       * palette words through the same Vdp1ProcessSpritePixel. */
+      const u32 colorLut = cmd->CMDCOLR * 8;
+      Vdp1Lut4Entry lut[16];
+      for (unsigned v = 0; v < 16; ++v) {
+        const int colorindex = T1ReadWord(Vdp1Ram, (v * 2 + colorLut) & 0x7FFFF);
+        if ((colorindex & 0x8000) && MSB_SHADOW) lut[v].kind = VDP1_LUT4_MSB;
+        else if (colorindex == 0) lut[v].kind = VDP1_LUT4_ZERO;
+        else if ((colorindex & 0x8000) && rgb_sprites) {
+          lut[v].kind = VDP1_LUT4_RGB; lut[v].value = VDP1COLOR16TO24(colorindex);
+        } else {
+          u16 temp = colorindex;
+          int sh, nsh, pr, cc;
+          Vdp1ProcessSpritePixel(fixVdp2Regs->SPCTL & 0xF, &temp, &sh, &nsh, &pr, &cc);
+          lut[v].kind = VDP1_LUT4_PALETTE;
+          lut[v].priority = pr; lut[v].colorcl = cc; lut[v].shadow = sh; lut[v].normalshadow = nsh;
+          lut[v].value = (sh || nsh) ? VDP1COLOR(1, 0, pr, 1, 0) : VDP1COLOR(1, cc, pr, 0, temp);
+        }
+      }
+      Vdp1Lut4State state = {priority, colorcl, shadow, normalshadow};
+      u32 addr = charAddr;
+#ifdef VITA_VDP1_LUT4_TABLE
+      Vdp1DecodeLut4Sprite(Vdp1Ram, &addr, sprite->w, sprite->h, &texture->textdata, texture->w, lut,
+                           &state, SPD, END);
+#else
+      for (u16 i = 0; i < sprite->h; i++) {
+        texture->textdata = Vdp1DecodeLut4Row(Vdp1Ram, &addr, sprite->w, texture->textdata, lut,
+                                              &state, SPD, END);
+        texture->textdata += texture->w;
+      }
+#endif
+      return;
+    }
+#ifdef VITA_VDP1_FAST_BANK256
+    /* BANK256_BEGIN (extracted by tools/test_vdp1_bank256.sh) */
+    if (mode == 4 && !MSB_SHADOW) {
+      /* 8 bpp 256-color bank: the original per-pixel branch chain,
+       * classified once per dot value. Palette pixels go through the same
+       * Vdp1MaskSpritePixel, whose carried colorcl is either the initial value
+       * or 0..7 afterwards (every mask type), so its results are memoized per
+       * (state, dot): state 0 = initial colorcl, 1 + v = colorcl v. */
+      const u32 colorBank = cmd->CMDCOLR & 0xFF00;
+      const int type = fixVdp2Regs->SPCTL & 0xF;
+      enum { K_ZERO, K_END, K_SHADOW, K_RGB, K_MASK };
+      u8 kind[256];
+      for (unsigned d = 0; d < 256; ++d) {
+        const int ci = (int)(d | colorBank);
+        kind[d] = (d == 0 && !SPD) ? K_ZERO : (d == 0xFF && !END) ? K_END :
+                  ci == nromal_shadow ? K_SHADOW : ((ci & 0x8000) && rgb_sprites) ? K_RGB : K_MASK;
+      }
+      u32 memo_val[9][256];
+      u8 memo_next[9][256];
+      u16 memo_done[9][16] = {{0}};
+      const int initial = colorcl;
+      int state = 0;                       /* colorcl == initial */
+      const u32 shadow_px = VDP1COLOR(1, 0, priority, 1, 0);
+#ifdef VITA_DIAG_TIMERS
+      uint64_t loop0 = sceKernelGetProcessTimeWide();
+#endif
+      /* Exact stateful decode until the carried colorcl reaches a sink: a
+       * state s with next(s, d) == s for every palette dot d (checked by the
+       * real Vdp1MaskSpritePixel on all 256 dots). From then on, with end
+       * codes disabled (END), every output is a pure function of the dot and
+       * the rest of the sprite is a branch-free table lookup. */
+      u32 lut[256];
+      int lut_state = -1;                 /* state lut[] was built for */
+      /* Affine table: lut[d] == aff_c | d for every dot except dot 0 when it
+       * is transparent (0) and the single normal-shadow dot (aff_sh). */
+      int affine = 0, aff_zero = 0, aff_sh = -1;
+      u32 aff_c = 0;
+      unsigned sink_checked = 0;          /* bit s: state s tested */
+      unsigned sink_found = 0;            /* bit s: state s is a sink */
+      u32 *out_row = texture->textdata;
+      const unsigned w = sprite->w;
+      const u8 *src = Vdp1Ram;
+      for (u16 i = 0; i < sprite->h; i++) {
+        int ends = 0;
+        unsigned j = 0;
+        u32 *o = out_row;
+        while (j < w) {
+          if (END && !(sink_checked & (1u << state))) {
+            /* Test the new state once: complete its memo row and see
+             * whether every palette dot keeps it. */
+            sink_checked |= 1u << state;
+            int sink = 1;
+            for (unsigned e = 0; e < 256; ++e) {
+              if (kind[e] != K_MASK) continue;
+              if (!(memo_done[state][e >> 4] & (1u << (e & 15)))) {
+                int colorindex = (int)(e | colorBank);
+                int cc = state ? state - 1 : initial;
+                Vdp1MaskSpritePixel(type, (u16 *)&colorindex, &cc);
+                memo_val[state][e] = VDP1COLOR(1, cc, priority, 0, colorindex);
+                memo_next[state][e] = (u8)(1 + cc);
+                memo_done[state][e >> 4] |= (u16)(1u << (e & 15));
+              }
+              if (memo_next[state][e] != state) { sink = 0; break; }
+            }
+            if (sink) {
+              sink_found |= 1u << state;
+              const int cc = state ? state - 1 : initial;
+              for (unsigned e = 0; e < 256; ++e)
+                lut[e] = kind[e] == K_MASK ? memo_val[state][e] : kind[e] == K_SHADOW ? shadow_px :
+                         kind[e] == K_RGB ? VDP1COLOR(0, cc, priority, 0, VDP1COLOR16TO24((int)(e | colorBank))) : 0;
+              lut_state = state;
+              affine = 1; aff_zero = kind[0] == K_ZERO; aff_sh = -1;
+              int have_c = 0;
+              for (unsigned e = 0; e < 256 && affine; ++e) {
+                if (e == 0 && aff_zero) continue;
+                if (kind[e] == K_SHADOW) { if (aff_sh >= 0) affine = 0; aff_sh = (int)e; continue; }
+                if ((lut[e] & 0xFFu) != e) { affine = 0; break; }
+                const u32 c = lut[e] & ~0xFFu;
+                if (!have_c) { aff_c = c; have_c = 1; } else if (c != aff_c) affine = 0;
+              }
+              if (!have_c) affine = 0;
+            }
+          }
+          if (END && lut_state == state) {
+            /* Branch-free: no end codes, state fixed. */
+            if ((charAddr & 0x7FFFF) + (w - j) <= 0x80000) {
+              const u8 *p8 = src + (charAddr & 0x7FFFF);
+              const unsigned m = w - j;
+              unsigned k = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+              if (affine) {
+                /* 16 dots per step, no table: C | d, then the two special dots. */
+                const uint32x4_t cv = vdupq_n_u32(aff_c), zero = vdupq_n_u32(0);
+                const uint32x4_t shv = vdupq_n_u32(shadow_px), shd = vdupq_n_u32((u32)(aff_sh & 0xFF));
+                const int use_sh = aff_sh >= 0;
+                for (; k + 16 <= m; k += 16) {
+                  const uint8x16_t d8 = vld1q_u8(p8 + k);
+                  const uint16x8_t lo = vmovl_u8(vget_low_u8(d8)), hi = vmovl_u8(vget_high_u8(d8));
+                  uint32x4_t q[4] = {vmovl_u16(vget_low_u16(lo)), vmovl_u16(vget_high_u16(lo)),
+                                     vmovl_u16(vget_low_u16(hi)), vmovl_u16(vget_high_u16(hi))};
+                  for (int t = 0; t < 4; ++t) {
+                    uint32x4_t out = vorrq_u32(q[t], cv);
+                    if (aff_zero) out = vbicq_u32(out, vceqq_u32(q[t], zero));
+                    if (use_sh) out = vbslq_u32(vceqq_u32(q[t], shd), shv, out);
+                    vst1q_u32(o + k + 4 * t, out);
+                  }
+                }
+              }
+              /* Four texels per 16-byte store: scalar stores into atlas
+               * lines not in cache measured ~2x slower on the Vita. */
+              for (; k + 4 <= m; k += 4) {
+                uint32x4_t v = vdupq_n_u32(lut[p8[k]]);
+                v = vsetq_lane_u32(lut[p8[k + 1]], v, 1);
+                v = vsetq_lane_u32(lut[p8[k + 2]], v, 2);
+                v = vsetq_lane_u32(lut[p8[k + 3]], v, 3);
+                vst1q_u32(o + k, v);
+              }
+#endif
+              for (; k < m; ++k) o[k] = lut[p8[k]];
+            } else {
+              for (unsigned k = 0, m = w - j; k < m; ++k) o[k] = lut[src[(charAddr + k) & 0x7FFFF]];
+            }
+            charAddr += w - j; o += w - j; j = w;
+            break;
+          }
+          const u32 d = src[charAddr & 0x7FFFF];
+          charAddr++; j++;
+          if (ends >= 2) { *o++ = 0; continue; }
+          switch (kind[d]) {
+            case K_ZERO: *o++ = 0; break;
+            case K_END: *o++ = 0; ends++; break;
+            case K_SHADOW: *o++ = shadow_px; break;
+            case K_RGB: {
+              const int cc = state ? state - 1 : initial;
+              *o++ = VDP1COLOR(0, cc, priority, 0, VDP1COLOR16TO24((int)(d | colorBank)));
+              break;
+            }
+            default: {
+              if (!(memo_done[state][d >> 4] & (1u << (d & 15)))) {
+                int colorindex = (int)(d | colorBank);
+                int cc = state ? state - 1 : initial;
+                Vdp1MaskSpritePixel(type, (u16 *)&colorindex, &cc);
+                memo_val[state][d] = VDP1COLOR(1, cc, priority, 0, colorindex);
+                memo_next[state][d] = (u8)(1 + cc);   /* cc in 0..7 */
+                memo_done[state][d >> 4] |= (u16)(1u << (d & 15));
+              }
+              *o++ = memo_val[state][d];
+              state = memo_next[state][d];
+              break;
+            }
+          }
+        }
+        out_row += w + texture->w;
+      }
+      (void)sink_found;
+      texture->textdata = out_row;
+#ifdef VITA_DIAG_TIMERS
+      vita_diag_sprite_us[7] += sceKernelGetProcessTimeWide() - loop0; ++vita_diag_sprite_calls[7];
+      vita_diag_sprite_texels[7] += (uint64_t)sprite->w * sprite->h;
+#endif
+      return;
+    }
+    /* BANK256_END */
+#endif
+    if (mode == 2 && END && !MSB_SHADOW) {
+      const u32 colorBank = cmd->CMDCOLR & 0xFFC0;
+      for (u16 i = 0; i < sprite->h; i++) {
+        texture->textdata = Vdp1DecodeBank64Row(Vdp1Ram, charAddr, sprite->w, texture->textdata,
+          colorBank, (u32)colorcl, (u32)priority, (u32)nromal_shadow, SPD, rgb_sprites);
+        charAddr += sprite->w;
+        texture->textdata += texture->w;
+      }
+      return;
     }
   }
 #endif
@@ -951,6 +1267,16 @@ static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, Ygl
     VDP1LOG("Unimplemented sprite color mode: %X\n", (cmd->CMDPMOD >> 3) & 0x7);
     break;
    }
+#ifdef VITA_VDP1_FAST_SPRITE_VERIFY
+  if (vf_kept) {
+    static unsigned calls, bad;
+    const u32 pitch = sprite->w + texture->w;
+    int diff = vf_kept[sprite->w * sprite->h] != (u32)colorcl;
+    for (u16 i = 0; i < sprite->h && !diff; i++) diff = memcmp(vf_kept + i * sprite->w, vf_dst + i * pitch, sprite->w * 4) != 0;
+    bad += diff; free(vf_kept);
+    if ((++calls & 1023) == 0 || (diff && bad < 4)) YuiMsg("vdp1_spd_verify calls=%u mismatch=%u", calls, bad);
+  }
+#endif
 }
 
 //////////////////////////////////////////////////////////////////////////////
