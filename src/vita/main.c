@@ -546,6 +546,11 @@ int main(void) {
   logfile = fopen(DATA "run.log", "w");
   if (logfile) log_async = VitaLogWriterStart(&log_writer, logfile, log_writer_setup) == 0;
   YuiMsg("start title=YABA00001 build=%s %s", __DATE__, __TIME__);
+#ifdef YABAUSE_RUNTIME_SHADERS
+  YuiMsg("shader_delivery=runtime_cg precision=best fastmath=off compilation_events=logged");
+#else
+  YuiMsg("shader_delivery=offline_gxp");
+#endif
   YabThreadSetCurrentThreadAffinityMask(1);
   char run_id[80] = {0};
   FILE *receipt = fopen(DATA "run-id.txt", "r");

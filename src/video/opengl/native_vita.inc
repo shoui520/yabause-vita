@@ -60,8 +60,17 @@
 
 static GLint vita_atlas_size[PG_MAX];
 
+#ifdef YABAUSE_RUNTIME_SHADERS
+#include "runtime_shader_vita.inc"
+#endif
+
 static void YglVitaLoadGxp(GLuint shader, const unsigned char *gxp,
                           size_t size, const char *matrix_name) {
+#ifdef YABAUSE_RUNTIME_SHADERS
+  /* The runtime compiler supplies matrix metadata through Cg reflection. */
+  (void)matrix_name;
+  YglVitaCompileCg(shader, gxp, size);
+#else
   /* Pinned vitaGL glShaderBinary expects its serialized prefix, not raw GXP.
    * Matrix indices let glUniformMatrix4fv preserve vitaGL's transpose rules.
    * This format requires HAVE_GLSL_TEXTURE_SIZE=0 in the pinned library build;
@@ -87,6 +96,7 @@ static void YglVitaLoadGxp(GLuint shader, const unsigned char *gxp,
   memcpy(serialized + prefix_size, gxp, size);
   glShaderBinary(1, &shader, 0, serialized, prefix_size + size);
   free(serialized);
+#endif
 }
 
 static int YglVitaLoadNativePair(int id, GLuint vertex, GLuint fragment) {

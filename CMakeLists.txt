@@ -371,16 +371,31 @@ set_source_files_properties(third_party/libchdr/deps/lzma-19.00/src/LzmaEnc.c
 add_dependencies(yabause-vita c68k_tables)
 add_dependencies(yabause-c68kexec c68k_tables)
 set(YABAUSE_PSP2CGC "$ENV{YABAUSE_PSP2CGC}" CACHE FILEPATH "User-supplied PSP2 shader compiler")
+option(YABAUSE_RUNTIME_SHADERS "Embed Cg and compile with VitaGL/VitaShaRK on Vita" OFF)
 option(YABAUSE_GXM_PROBE "Validate GXM resource setup before starting emulation" OFF)
 option(YABAUSE_GXM_COMPOSITOR "Development integration: GPU composition/presentation, CPU rasterization" OFF)
+if(YABAUSE_RUNTIME_SHADERS AND (YABAUSE_GXM_PROBE OR YABAUSE_GXM_COMPOSITOR))
+  message(FATAL_ERROR "Runtime shaders require the VitaGL renderer, not the native GXM prototypes")
+endif()
 if((YABAUSE_GXM_PROBE OR YABAUSE_GXM_COMPOSITOR) AND NOT YABAUSE_PSP2CGC)
   message(FATAL_ERROR "GXM probing requires YABAUSE_PSP2CGC")
 endif()
-if(YABAUSE_PSP2CGC)
-  if(NOT EXISTS "${YABAUSE_PSP2CGC}")
+if(YABAUSE_PSP2CGC OR YABAUSE_RUNTIME_SHADERS)
+  if(NOT YABAUSE_RUNTIME_SHADERS AND NOT EXISTS "${YABAUSE_PSP2CGC}")
     message(FATAL_ERROR "YABAUSE_PSP2CGC must name an existing shader compiler")
   endif()
   find_program(HOST_PYTHON NAMES python3 REQUIRED NO_CMAKE_FIND_ROOT_PATH)
+  set(shader_mode_args --compiler "${YABAUSE_PSP2CGC}")
+  set(shader_product_extension gxp)
+  set(runtime_shader_deps)
+  if(YABAUSE_RUNTIME_SHADERS)
+    set(shader_mode_args --runtime-source)
+    set(shader_product_extension source.cg)
+    file(GLOB runtime_shader_deps CONFIGURE_DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/video/opengl/shaders/*.cg"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/video/opengl/shaders/*.h")
+  endif()
+  if(NOT YABAUSE_RUNTIME_SHADERS)
   foreach(shader_name IN ITEMS tile_v tile_f compose_f present_f)
     if(shader_name MATCHES "_v$")
       set(profile sce_vp_psp2)
@@ -399,6 +414,7 @@ if(YABAUSE_PSP2CGC)
     list(APPEND YABAUSE_GXM_HEADERS "${shader}")
   endforeach()
   add_custom_target(yabause-gxm-shaders DEPENDS ${YABAUSE_GXM_HEADERS})
+  endif()
   # Native program families for the in-progress vitaGL renderer. Kept separate
   # from the currently selected renderer until complete integration is ready.
   option(VITA_NORMAL_DIRECT_UV "Experimental vertex-normalized nearest atlas sampling" OFF)
@@ -499,18 +515,18 @@ if(YABAUSE_PSP2CGC)
       list(APPEND normal_defines --define "NORMAL_DIRECT_UV=1")
     endif()
     add_custom_command(OUTPUT "${shader}"
-      BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/vitagl/${shader_name}.gxp"
+      BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/vitagl/${shader_name}.${shader_product_extension}"
       COMMAND "${HOST_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/compile_shader.py"
-        --compiler "${YABAUSE_PSP2CGC}" --profile "${profile}"
+        ${shader_mode_args} --profile "${profile}"
         --source "${CMAKE_CURRENT_SOURCE_DIR}/src/video/opengl/shaders/${shader_name}.cg"
         --output "${shader}" --symbol "ygl_vita_${shader_name}" ${normal_defines}
       DEPENDS "src/video/opengl/shaders/${shader_name}.cg"
-        ${shader_deps} tools/compile_shader.py
+        ${shader_deps} ${runtime_shader_deps} tools/compile_shader.py
       VERBATIM)
     list(APPEND YABAUSE_VITAGL_HEADERS "${shader}")
   endforeach()
   # Bounded native specializations: four formats x (bitmap + six tile layouts).
-  # All are compiled offline; only used programs are registered on the Vita.
+  # Offline GXP or embedded Cg; only used programs are created on the Vita.
   set(rotation_variant_defines)
   set(rotation_pair_defines)
   if(VITA_ROTATION_COEFF_VARYING)
@@ -561,16 +577,16 @@ if(YABAUSE_PSP2CGC)
       endif()
       set(header "${CMAKE_CURRENT_BINARY_DIR}/vitagl/${name}.h")
       add_custom_command(OUTPUT "${header}"
-        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/vitagl/${name}.gxp"
+        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/vitagl/${name}.${shader_product_extension}"
         COMMAND "${HOST_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/compile_shader.py"
-          --compiler "${YABAUSE_PSP2CGC}" --profile sce_fp_psp2
+          ${shader_mode_args} --profile sce_fp_psp2
           --source "${CMAKE_CURRENT_SOURCE_DIR}/src/video/opengl/shaders/rotation_bitmap_f.cg"
           --output "${header}" --symbol "ygl_vita_${name}"
           --define "ROTATION_FORMAT=${format}" --define "ROTATION_BITMAP=${bitmap}"
           --define "ROTATION_CELLS=${cells}" --define "ROTATION_WORDS=${words}"
           --define "ROTATION_AUX=${aux}" ${rotation_variant_defines}
         DEPENDS src/video/opengl/shaders/rotation_bitmap_f.cg
-          src/video/opengl/shaders/packed_texture.h tools/compile_shader.py VERBATIM)
+          src/video/opengl/shaders/packed_texture.h ${runtime_shader_deps} tools/compile_shader.py VERBATIM)
       list(APPEND YABAUSE_VITAGL_HEADERS "${header}")
       string(APPEND rotation_includes "#include \"${name}.h\"\n")
       string(APPEND rotation_table "{ygl_vita_${name}, sizeof(ygl_vita_${name})},\n")
@@ -578,9 +594,9 @@ if(YABAUSE_PSP2CGC)
         set(pattern_name "rotation_pattern_${format}_${layout}_f")
         set(pattern_header "${CMAKE_CURRENT_BINARY_DIR}/vitagl/${pattern_name}.h")
         add_custom_command(OUTPUT "${pattern_header}"
-          BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/vitagl/${pattern_name}.gxp"
+          BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/vitagl/${pattern_name}.${shader_product_extension}"
           COMMAND "${HOST_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/compile_shader.py"
-            --compiler "${YABAUSE_PSP2CGC}" --profile sce_fp_psp2
+            ${shader_mode_args} --profile sce_fp_psp2
             --source "${CMAKE_CURRENT_SOURCE_DIR}/src/video/opengl/shaders/rotation_bitmap_f.cg"
             --output "${pattern_header}" --symbol "ygl_vita_${pattern_name}"
             --define "ROTATION_PATTERN_CACHE=1"
@@ -588,7 +604,7 @@ if(YABAUSE_PSP2CGC)
             --define "ROTATION_CELLS=${cells}" --define "ROTATION_WORDS=${words}"
             --define "ROTATION_AUX=${aux}" ${rotation_variant_defines}
           DEPENDS src/video/opengl/shaders/rotation_bitmap_f.cg
-            src/video/opengl/shaders/packed_texture.h tools/compile_shader.py VERBATIM)
+            src/video/opengl/shaders/packed_texture.h ${runtime_shader_deps} tools/compile_shader.py VERBATIM)
         list(APPEND YABAUSE_VITAGL_HEADERS "${pattern_header}")
         string(APPEND rotation_includes "#include \"${pattern_name}.h\"\n")
         string(APPEND pattern_table "{ygl_vita_${pattern_name}, sizeof(ygl_vita_${pattern_name})},\n")
@@ -596,9 +612,9 @@ if(YABAUSE_PSP2CGC)
           set(pair_name "rotation_pair_${format}_${layout}_f")
           set(pair_header "${CMAKE_CURRENT_BINARY_DIR}/vitagl/${pair_name}.h")
           add_custom_command(OUTPUT "${pair_header}"
-            BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/vitagl/${pair_name}.gxp"
+            BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/vitagl/${pair_name}.${shader_product_extension}"
             COMMAND "${HOST_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/compile_shader.py"
-              --compiler "${YABAUSE_PSP2CGC}" --profile sce_fp_psp2
+              ${shader_mode_args} --profile sce_fp_psp2
               --source "${CMAKE_CURRENT_SOURCE_DIR}/src/video/opengl/shaders/rotation_bitmap_f.cg"
               --output "${pair_header}" --symbol "ygl_vita_${pair_name}"
               --define "ROTATION_PATTERN_CACHE=1" --define "ROTATION_COEFF_PAIR=1"
@@ -606,7 +622,7 @@ if(YABAUSE_PSP2CGC)
               --define "ROTATION_CELLS=${cells}" --define "ROTATION_WORDS=${words}"
               --define "ROTATION_AUX=${aux}" ${rotation_variant_defines} ${rotation_pair_defines}
             DEPENDS src/video/opengl/shaders/rotation_bitmap_f.cg
-              src/video/opengl/shaders/packed_texture.h tools/compile_shader.py VERBATIM)
+              src/video/opengl/shaders/packed_texture.h ${runtime_shader_deps} tools/compile_shader.py VERBATIM)
           list(APPEND YABAUSE_VITAGL_HEADERS "${pair_header}")
           string(APPEND rotation_includes "#include \"${pair_name}.h\"\n")
           string(APPEND pair_table "{ygl_vita_${pair_name}, sizeof(ygl_vita_${pair_name})},\n")
@@ -623,6 +639,7 @@ if(YABAUSE_PSP2CGC)
   file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/vitagl/rotation_variants.h"
     CONTENT "${rotation_includes}${rotation_table}};\n${pattern_table}${pair_table}")
   add_custom_target(yabause-vitagl-shaders DEPENDS ${YABAUSE_VITAGL_HEADERS})
+  if(NOT YABAUSE_RUNTIME_SHADERS)
   add_library(yabause-gxm OBJECT src/vita/gxm/device.c src/vita/gxm/texture.c ${YABAUSE_GXM_HEADERS})
   target_include_directories(yabause-gxm PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gxm")
   if(YABAUSE_GXM_PROBE OR YABAUSE_GXM_COMPOSITOR)
@@ -635,6 +652,7 @@ if(YABAUSE_PSP2CGC)
   if(YABAUSE_GXM_COMPOSITOR)
     set_property(SOURCE src/vita/main.c src/core/titan/titan.c APPEND PROPERTY
       COMPILE_DEFINITIONS YABAUSE_GXM_COMPOSITOR)
+  endif()
   endif()
 endif()
 include(cmake/VitaGL.cmake)
