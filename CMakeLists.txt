@@ -843,6 +843,12 @@ if(VITA_SH2_MACL_WRAM)
   set_property(SOURCE src/core/sh2_dynarec/dynalib_arm.s APPEND PROPERTY
     COMPILE_OPTIONS "-Wa,-defsym,VITA_SH2_MACL_WRAM=1")
 endif()
+option(VITA_SH2_INTC_VECTOR "SH-2 dynarec pending interrupt table in reserved contiguous storage (same order as std::list)" OFF)
+if(VITA_SH2_INTC_VECTOR)
+  # Changes DynarecSh2's layout: every includer.
+  set_property(SOURCE src/core/sh2_dynarec/DynarecSh2.cpp src/core/sh2_dynarec/DynarecSh2CInterface.cpp
+               src/vita/sh2_compiler_test.cpp APPEND PROPERTY COMPILE_DEFINITIONS VITA_SH2_INTC_VECTOR)
+endif()
 option(VITA_SH2_MACW_WRAM "MAC.W reads cached high work RAM inline (same 42-word template)" OFF)
 if(VITA_SH2_MACW_WRAM)
   set_property(SOURCE src/core/sh2_dynarec/DynarecSh2.cpp APPEND PROPERTY COMPILE_DEFINITIONS VITA_SH2_MACW_WRAM)

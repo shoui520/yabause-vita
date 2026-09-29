@@ -234,7 +234,37 @@ struct dIntcTbl
   u8 Vector;
   u8 level;
 };
+#ifdef VITA_SH2_INTC_VECTOR
+/* std::list's interface and exact results (stable sort by operator<, level
+ * descending; unique drops adjacent equal vectors; order-preserving
+ * remove_if) on reserved contiguous storage: no allocation per interrupt. */
+bool operator < (const dIntcTbl & data1 , const dIntcTbl & data2 );
+bool operator == (const dIntcTbl & data1 , const dIntcTbl & data2 );
+class dlstIntct {
+  std::vector<dIntcTbl> v_;
+public:
+  typedef std::vector<dIntcTbl>::iterator iterator;
+  dlstIntct() { v_.reserve(32); }
+  iterator begin() { return v_.begin(); }
+  iterator end() { return v_.end(); }
+  size_t size() const { return v_.size(); }
+  void clear() { v_.clear(); }
+  void push_back(const dIntcTbl &x) { v_.push_back(x); }
+  void pop_front() { v_.erase(v_.begin()); }
+  template <class Pred> void remove_if(Pred p) { v_.erase(std::remove_if(v_.begin(), v_.end(), p), v_.end()); }
+  void sort() {
+    for (size_t i = 1; i < v_.size(); ++i) {
+      const dIntcTbl x = v_[i];
+      size_t j = i;
+      for (; j > 0 && x < v_[j - 1]; --j) v_[j] = v_[j - 1];
+      v_[j] = x;
+    }
+  }
+  void unique() { v_.erase(std::unique(v_.begin(), v_.end()), v_.end()); }
+};
+#else
 typedef std::list<dIntcTbl> dlstIntct;
+#endif
 
 
 struct x86op_desc
