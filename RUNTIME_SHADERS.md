@@ -40,10 +40,22 @@ available with `YABAUSE_RUNTIME_SHADERS=OFF` and a supplied `YABAUSE_PSP2CGC`.
 
 ## Timing and scope
 
-Program objects retain the existing reuse/lifetime rules. This first runtime
-path does not add a persistent shader cache or claim to deduplicate compilation
-of one vertex source shared by several programs. Rotation variants created
-lazily can compile after startup.
+Program objects retain the existing reuse/lifetime rules. Rotation variants
+created lazily can compile after startup.
+
+`YABAUSE_SHADER_CACHE` (default ON with runtime shaders) uses vitaGL's own
+`HAVE_SHADER_CACHE`: build the private vitaGL with `--shader-cache`. Compiled
+GXP go to `ux0:data/yabause-vita/shader_cache/cg-o3-strict`, keyed by a hash of
+the expanded source, variant definitions included. The first launch compiles
+each distinct source once; a vertex source shared by several programs is read
+back from the cache after its first compilation. Later launches compile nothing.
+The key does not cover compiler options or the shacccg module: the directory
+names the policy, and must be deleted if either changes.
+`vitagl-shader-cache.patch` keeps a failed compilation out of the cache, so
+the next launch still reports it instead of loading an empty program, and
+stores entries in flat `v/` and `f/` directories. Upstream creates 512 hash
+subdirectories on the first launch; on the Vita that stalled `vglInit` before
+the first frame.
 
 Every compilation emits `runtime_shader_begin`/`runtime_shader_complete` with
 source fingerprint, type and process timestamps; diagnostics include line

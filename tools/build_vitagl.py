@@ -52,8 +52,11 @@ def main():
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--single-threaded-gc", action="store_true",
                         help="Run vitaGL's deferred collector on the graphics owner thread")
+    parser.add_argument("--shader-cache", action="store_true",
+                        help="Persist runtime-compiled shaders (HAVE_SHADER_CACHE)")
     args = parser.parse_args()
-    options = dict(OPTIONS, SINGLE_THREADED_GC="1" if args.single_threaded_gc else "0")
+    options = dict(OPTIONS, SINGLE_THREADED_GC="1" if args.single_threaded_gc else "0",
+                   HAVE_SHADER_CACHE="1" if args.shader_cache else "0")
     if args.sdk is None or args.jobs < 1:
         parser.error("Set VITASDK or --sdk, and use at least one job")
     sdk, output, source = args.sdk.resolve(), args.output.resolve(), args.source.resolve()
@@ -80,8 +83,10 @@ def main():
         archive.stdout.close()
         if archive.wait() != 0:
             raise RuntimeError("Could not materialize pinned vitaGL source")
-    patch = Path(__file__).resolve().parent / "patches/vitagl-stencil-retirement.patch"
-    run("patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", str(patch), cwd=patched)
+    patches = [Path(__file__).resolve().parent / "patches" / name for name in
+               ("vitagl-stencil-retirement.patch", "vitagl-shader-cache.patch")]
+    for patch in patches:
+        run("patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", str(patch), cwd=patched)
     shark_checkout = output / "shark-source"
     prepare(shark_source, shark_checkout, SHARK_REVISION)
     # Do not inherit MAKEFLAGS, CFLAGS, or make feature variables from the shell.
@@ -113,7 +118,8 @@ def main():
     compiler = subprocess.check_output([str(cc), "--version"], text=True).splitlines()[0]
     (output / "build.json").write_text(json.dumps({
         "revision": REVISION, "shark_revision": SHARK_REVISION, "options": options,
-        "patches": {patch.name: hashlib.sha256(patch.read_bytes()).hexdigest()},
+        "patches": {patch.name: hashlib.sha256(patch.read_bytes()).hexdigest()
+                    for patch in patches},
         "architecture": "cortex-a9", "float_abi": "hard",
         "compiler": compiler,
     }, indent=2) + "\n", encoding="utf-8")
