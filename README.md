@@ -7,7 +7,7 @@ Based on [libretro/yabause (yabasanshiro)](https://github.com/libretro/yabause/t
 
 ## Running
 
-Place `sega_101.bin` in `ux0:data/yabause-vita/bios/`.    
+Prepare `sega_101.bin` as `ux0:data/yabause-vita/bios.bin`.    
 
 Edit `ux0:data/yabause-vita/boot-path.txt` to a `.cue` file of a Sega Saturn disc. Example:
 ```text
