@@ -295,6 +295,7 @@ typedef struct {
   GLuint textureID_in[2];
   GLuint pixelBufferID_in[2];
   unsigned int * texture_in[2];
+  void *vita_zc; /* VITA_ATLAS_ZERO_COPY ring state (atlas_vita.inc) */
 
 } YglTextureManager;
 

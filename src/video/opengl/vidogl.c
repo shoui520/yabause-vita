@@ -2447,6 +2447,120 @@ static void FASTCALL Vdp2DrawBitmapInner(vdp2draw_struct *info, YglTexture *text
         info->char_bank[info->charaddr >> 17], fixVdp2Regs->CCCTL); }
 #endif
 
+#if defined(VITA_VDP2_FAST_CELL) && defined(VITA_VDP2_FAST_BITMAP)
+  /* Same per-line output as the switch below for 4/8 bpp when only the dot
+   * varies per pixel (vdp2_cell_decode.h, bit-identical to Vdp2GetPixel4/8bpp;
+   * same 512 KiB address mask). Access-denied lines stay transparent. */
+  if ((info->colornumber == 0 || info->colornumber == 1) && info->specialprimode != 2) {
+    uint32_t alpha;
+    if (Vdp2CellConstantAlpha((fixVdp2Regs->CCCTL >> 8) & 1, info->specialcolormode,
+                              info->specialcolorfunction, (uint32_t)info->alpha, &alpha)) {
+      const uint32_t co = (uint32_t)info->coloroffset, pal = (uint32_t)(info->paladdr << 4);
+      const uint32_t abits = alpha << 24;
+      const int transparent = info->transparencyenable != 0;
+      /* Whole words, as the per-word loops below (j += 4 / j += 2). */
+      const unsigned words = info->colornumber == 0 ? (info->cellw + 3) / 4 : (info->cellw + 1) / 2;
+      const unsigned pixels = info->colornumber == 0 ? words * 4 : words * 2;
+#ifdef VITA_VDP2_BITMAP_REUSE
+      /* The staging atlas keeps its texels across frames (reset only rewinds
+       * the bump allocator; every write goes through an allocation). If this
+       * bitmap was decoded into exactly this rectangle in the previous atlas
+       * frame of the same storage, from identical inputs and identical source
+       * bytes, the rectangle already holds this decode's output: skip it,
+       * advancing charaddr/textdata as the decode does. */
+      typedef struct { unsigned frame, gen; u32 *dst; int pitch, cellw, cellh, color;
+                       u32 charaddr, co, pal, abits; int transparent; u8 banks[4];
+                       unsigned bytes; u8 *src; } Vdp2BitmapReuse;
+      static Vdp2BitmapReuse reuse[16];
+      extern unsigned vita_atlas_frame, vita_atlas_gen, vita_atlas_prev_frame;
+      const unsigned total = 2 * words * (unsigned)info->cellh;
+      const u32 start = info->charaddr & 0x7FFFF;
+      const int cacheable = start + total <= 0x80000 && info->charaddr == start;
+      Vdp2BitmapReuse *slot = NULL;
+      if (cacheable) {
+        for (int r = 0; r < 16; ++r) if (reuse[r].dst == texture->textdata) { slot = &reuse[r]; break; }
+        if (!slot) {                          /* least recently used */
+          slot = &reuse[0];
+          for (int r = 1; r < 16; ++r) if (reuse[r].frame < slot->frame) slot = &reuse[r];
+        }
+        /* vita_atlas_prev_frame: the atlas frame whose texels this storage
+         * still holds (the previous frame, or the zero-copy buffer's last). */
+        const int same = slot->dst == texture->textdata && slot->frame == vita_atlas_prev_frame &&
+          slot->gen == vita_atlas_gen && slot->pitch == texture->w && slot->cellw == info->cellw &&
+          slot->cellh == info->cellh && slot->color == info->colornumber && slot->charaddr == info->charaddr &&
+          slot->co == co && slot->pal == pal && slot->abits == abits && slot->transparent == transparent &&
+          slot->bytes == total && slot->src &&
+          slot->banks[0] == info->char_bank[0] && slot->banks[1] == info->char_bank[1] &&
+          slot->banks[2] == info->char_bank[2] && slot->banks[3] == info->char_bank[3] &&
+          !memcmp(slot->src, Vdp2Ram + start, total);
+        if (same) {
+          slot->frame = vita_atlas_frame;
+#ifndef VITA_VDP2_BITMAP_REUSE_VERIFY
+          info->charaddr += total;
+          texture->textdata += (size_t)info->cellh * (pixels + texture->w);
+          return;
+#else
+          /* Keep a copy of the retained texels, decode for real, compare. */
+          static u32 *kept; static size_t kept_n;
+          const size_t need = (size_t)info->cellh * pixels;
+          if (kept_n < need) { free(kept); kept = malloc(need * 4); kept_n = kept ? need : 0; }
+          if (kept) for (i = 0; i < info->cellh; i++)
+            memcpy(kept + (size_t)i * pixels, texture->textdata + (size_t)i * (pixels + texture->w), pixels * 4);
+          u32 *verify_dst = texture->textdata;
+          for (i = 0; i < info->cellh; i++) {
+            if (info->char_bank[info->charaddr >> 17] == 0) {
+              memset(texture->textdata, 0, pixels * sizeof(*texture->textdata));
+              texture->textdata += pixels;
+            } else {
+              texture->textdata = info->colornumber == 0 ?
+                Vdp2DecodeWords4(Vdp2Ram, info->charaddr, words, texture->textdata, co, pal, abits, transparent) :
+                Vdp2DecodeWords8(Vdp2Ram, info->charaddr, words, texture->textdata, co, pal, abits, transparent);
+            }
+            info->charaddr += 2 * words;
+            texture->textdata += texture->w;
+          }
+          { extern unsigned vita_bitmap_verify[2]; int bad = 0;
+            if (kept) for (i = 0; i < info->cellh && !bad; i++)
+              bad = memcmp(kept + (size_t)i * pixels, verify_dst + (size_t)i * (pixels + texture->w), pixels * 4) != 0;
+            ++vita_bitmap_verify[bad];
+            if (((vita_bitmap_verify[0] + vita_bitmap_verify[1]) & 63) == 0)
+              YuiMsg("vdp2_bitmap_reuse_verify match=%u mismatch=%u", vita_bitmap_verify[0], vita_bitmap_verify[1]); }
+          return;
+#endif
+        }
+      }
+#endif
+      for (i = 0; i < info->cellh; i++) {
+        if (info->char_bank[info->charaddr >> 17] == 0) {
+          memset(texture->textdata, 0, pixels * sizeof(*texture->textdata));
+          texture->textdata += pixels;
+        } else {
+          texture->textdata = info->colornumber == 0 ?
+            Vdp2DecodeWords4(Vdp2Ram, info->charaddr, words, texture->textdata, co, pal, abits, transparent) :
+            Vdp2DecodeWords8(Vdp2Ram, info->charaddr, words, texture->textdata, co, pal, abits, transparent);
+        }
+        info->charaddr += 2 * words;
+        texture->textdata += texture->w;
+      }
+#ifdef VITA_VDP2_BITMAP_REUSE
+      if (cacheable && slot) {
+        u32 *dst0 = texture->textdata - (size_t)info->cellh * (pixels + texture->w);
+        if (slot->bytes < total || !slot->src) { free(slot->src); slot->src = malloc(total); }
+        if (slot->src) {
+          memcpy(slot->src, Vdp2Ram + start, total);
+          slot->dst = dst0; slot->frame = vita_atlas_frame; slot->gen = vita_atlas_gen;
+          slot->pitch = texture->w; slot->cellw = info->cellw; slot->cellh = info->cellh;
+          slot->color = info->colornumber; slot->charaddr = info->charaddr - total;
+          slot->co = co; slot->pal = pal; slot->abits = abits; slot->transparent = transparent;
+          slot->bytes = total;
+          for (int b = 0; b < 4; ++b) slot->banks[b] = info->char_bank[b];
+        } else { slot->dst = NULL; slot->bytes = 0; }
+      }
+#endif
+      return;
+    }
+  }
+#endif
   switch (info->colornumber)
   {
   case 0: // 4 BPP
