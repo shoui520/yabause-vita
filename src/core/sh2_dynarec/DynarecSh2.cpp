@@ -2639,6 +2639,8 @@ DynarecSh2::~DynarecSh2(){
 }
 
 void DynarecSh2::ResetCPU(){
+  VITA_LAZY_SYNC();
+  VITA_IDLE_INVALIDATE();
   memset((void*)m_pDynaSh2->GenReg, 0, sizeof(u32) * 16);
   memset((void*)m_pDynaSh2->CtrlReg, 0, sizeof(u32) * 3);
   memset((void*)m_pDynaSh2->SysReg, 0, sizeof(u32) * 6);

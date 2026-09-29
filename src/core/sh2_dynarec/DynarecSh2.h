@@ -637,31 +637,44 @@ public:
   void ShowCompileInfo();
   void ResetCompileInfo();
 
+  /* Deferred spin forward (VITA_SH2_SPIN_LAZY; unconditional for one
+   * layout): while lazy_, the architectural state (the 23 IdleRegs words,
+   * SysReg[4], pre_exe_count_) is not in m_pDynaSh2 but is recorded position
+   * lazy_q_ (shifted by lazy_m_ periods for an affine proof) with carry
+   * lazy_c_, advanced by lazy_debt_ requested cycles
+   * (lazy_last_ of them in the latest slice). Every slice re-checks the
+   * proof's conditions; anything reading or writing the state syncs first. */
+  bool lazy_ = false;
+  unsigned lazy_q_ = 0;
+  u32 lazy_c_ = 0, lazy_debt_ = 0, lazy_last_ = 0;
+  u32 lazy_m_ = 0;   // affine proofs: periods of the entry state past lazy_q_
+  void LazySync();
+#define VITA_LAZY_SYNC() (lazy_ ? LazySync() : (void)0)
   void onFrame(){
     m_pCompiler->self_modify_block.clear();
   }
 
-  tagSH2 * getDynaSh(){ return m_pDynaSh2; }; 
+  tagSH2 * getDynaSh(){ VITA_LAZY_SYNC(); return m_pDynaSh2; }; 
 
-  inline u32 * GetGenRegPtr() { return m_pDynaSh2->GenReg; }
-  inline u32 GET_MACH() { return m_pDynaSh2->SysReg[0]; }
-  inline u32 GET_MACL() { return m_pDynaSh2->SysReg[1]; }
-  inline u32 GET_PR() { return m_pDynaSh2->SysReg[2]; }
-  inline u32 GET_PC() { return m_pDynaSh2->SysReg[3]; }
-  inline u32 GET_COUNT() { return m_pDynaSh2->SysReg[4]; } 
-  inline u32 GET_ICOUNT() { return m_pDynaSh2->SysReg[5]; } 
-  inline u32 GET_SR() { return m_pDynaSh2->CtrlReg[0]; }
-  inline u32 GET_GBR() { return m_pDynaSh2->CtrlReg[1]; }
-  inline u32 GET_VBR() { return m_pDynaSh2->CtrlReg[2]; }
-  inline void SET_MACH( u32 v ) { m_pDynaSh2->SysReg[0] = v; }
-  inline void SET_MACL( u32 v ) { m_pDynaSh2->SysReg[1] = v; }
-  inline void SET_PR( u32 v ) { m_pDynaSh2->SysReg[2] = v; }
-  inline void SET_PC( u32 v ) { m_pDynaSh2->SysReg[3] = v; }
-  inline void SET_COUNT( u32 v ) { m_pDynaSh2->SysReg[4] = v; } 
-  inline void SET_ICOUNT(u32 v ) { m_pDynaSh2->SysReg[5] = v; } 
-  inline void SET_SR(u32 v ) { m_pDynaSh2->CtrlReg[0] = v; }
-  inline void SET_GBR( u32 v ) { m_pDynaSh2->CtrlReg[1] = v; }
-  inline void SET_VBR( u32 v ) { m_pDynaSh2->CtrlReg[2] = v; }  
+  inline u32 * GetGenRegPtr() { VITA_LAZY_SYNC(); VITA_IDLE_INVALIDATE(); return m_pDynaSh2->GenReg; }
+  inline u32 GET_MACH() { VITA_LAZY_SYNC(); return m_pDynaSh2->SysReg[0]; }
+  inline u32 GET_MACL() { VITA_LAZY_SYNC(); return m_pDynaSh2->SysReg[1]; }
+  inline u32 GET_PR() { VITA_LAZY_SYNC(); return m_pDynaSh2->SysReg[2]; }
+  inline u32 GET_PC() { VITA_LAZY_SYNC(); return m_pDynaSh2->SysReg[3]; }
+  inline u32 GET_COUNT() { VITA_LAZY_SYNC(); return m_pDynaSh2->SysReg[4]; } 
+  inline u32 GET_ICOUNT() { VITA_LAZY_SYNC(); return m_pDynaSh2->SysReg[5]; } 
+  inline u32 GET_SR() { VITA_LAZY_SYNC(); return m_pDynaSh2->CtrlReg[0]; }
+  inline u32 GET_GBR() { VITA_LAZY_SYNC(); return m_pDynaSh2->CtrlReg[1]; }
+  inline u32 GET_VBR() { VITA_LAZY_SYNC(); return m_pDynaSh2->CtrlReg[2]; }
+  inline void SET_MACH(u32 v) { VITA_LAZY_SYNC(); VITA_IDLE_INVALIDATE(); m_pDynaSh2->SysReg[0] = v; }
+  inline void SET_MACL(u32 v) { VITA_LAZY_SYNC(); VITA_IDLE_INVALIDATE(); m_pDynaSh2->SysReg[1] = v; }
+  inline void SET_PR(u32 v) { VITA_LAZY_SYNC(); VITA_IDLE_INVALIDATE(); m_pDynaSh2->SysReg[2] = v; }
+  inline void SET_PC(u32 v) { VITA_LAZY_SYNC(); VITA_IDLE_INVALIDATE(); m_pDynaSh2->SysReg[3] = v; }
+  inline void SET_COUNT(u32 v) { VITA_LAZY_SYNC(); m_pDynaSh2->SysReg[4] = v; } 
+  inline void SET_ICOUNT(u32 v) { VITA_LAZY_SYNC(); m_pDynaSh2->SysReg[5] = v; } 
+  inline void SET_SR(u32 v) { VITA_LAZY_SYNC(); VITA_IDLE_INVALIDATE(); m_pDynaSh2->CtrlReg[0] = v; }
+  inline void SET_GBR(u32 v) { VITA_LAZY_SYNC(); VITA_IDLE_INVALIDATE(); m_pDynaSh2->CtrlReg[1] = v; }
+  inline void SET_VBR(u32 v) { VITA_LAZY_SYNC(); VITA_IDLE_INVALIDATE(); m_pDynaSh2->CtrlReg[2] = v; }  
 
   int GetCurrentStatics(MapCompileStatics & buf);
   int Resume();
