@@ -1626,6 +1626,9 @@ void YuiSetVideoAttribute(int type, int val){
 }
 
 //////////////////////////////////////////////////////////////////////////////
+#ifdef VITA_GEOM_ARENA
+static void YglGeomPrepare(void);
+#endif
 int YglInit(int width, int height, unsigned int depth) {
 #ifdef VITA_DIAG_ABLATE
   YglAblateLoad();
@@ -1759,10 +1762,14 @@ int YglInit(int width, int height, unsigned int depth) {
   _Ygl->aamode = AA_NONE;
   //_Ygl->aamode = AA_FXAA;
   //_Ygl->aamode = AA_SCANLINE_FILTER;
+#ifdef VITA_GEOM_ARENA
+  YglGeomPrepare();
+#endif
 
   return 0;
 }
 
+static int YglGeomOwned(const void *p);
 //////////////////////////////////////////////////////////////////////////////
 void YglDeInit(void) {
    unsigned int i,j;
@@ -1783,6 +1790,7 @@ void YglDeInit(void) {
          {
          for (j = 0; j < _Ygl->levels[i].prgcount; j++)
          {
+            if (YglGeomOwned(_Ygl->levels[i].prg[j].quads)) continue;
             if (_Ygl->levels[i].prg[j].quads)
             free(_Ygl->levels[i].prg[j].quads);
             if (_Ygl->levels[i].prg[j].textcoords)
@@ -1823,6 +1831,10 @@ void YglDeInit(void) {
 
 //////////////////////////////////////////////////////////////////////////////
 
+#include <psp2/kernel/processmgr.h>
+#ifdef VITA_TESS_WORKER
+static void YglTessDrain(void);
+#endif
 #include "geometry_buffer.inc"
 
 YglProgram * YglGetProgram( YglSprite * input, int prg, unsigned needed )
@@ -1905,6 +1917,9 @@ YglProgram * YglGetProgram( YglSprite * input, int prg, unsigned needed )
 #endif
    program = &level->prg[level->prgcurrent];
 
+#ifdef VITA_GEOM_ARENA
+   ga_want = level == &_Ygl->levels[_Ygl->depth];
+#endif
    if (YglReserveGeometry(program, needed) != 0) {
      fprintf(stderr, "Cannot reserve draw geometry: used=%d needed=%u capacity=%d\n",
              program->currentQuad, needed, program->maxQuad);
@@ -2007,6 +2022,227 @@ void YglCacheTriangleGrowShading(YglSprite * input, float * colors, YglCache * c
   YglTriangleGrowShading_in(input, NULL, colors, cache, 0);
 }
 
+#ifdef VITA_TESS_NEON
+#include <arm_neon.h>
+static inline float32x4_t YglTessColour(float32x4_t top_ui, float32x4_t bot, int vi) {
+  const float32x4_t e = vdupq_n_f32(0.125f);
+  return vmulq_f32(vaddq_f32(vmulq_n_f32(top_ui, (float)(8 - vi)), vmulq_n_f32(bot, (float)vi)), e);
+}
+#endif
+#ifdef VITA_VDP1_GOURAUD_MERGE
+/* Gouraud primitives with and without SPD share one program and batch: the
+ * vertex colour alpha, otherwise unused by the gouraud program, is 1 for an
+ * SPD primitive (its transparent texels are drawn) and 0 otherwise. Draws
+ * into the VDP1 framebuffer run in order with blending off, so one batch
+ * gives exactly the pixels of the separate draws. */
+static int YglGouraudMerge(YglSprite *input, int *prg, unsigned needed, YglProgram **program) {
+  const int spd = *prg == PG_VFP1_GOURAUDSAHDING_SPD;
+  if (!spd && *prg != PG_VFP1_GOURAUDSAHDING) return -1;
+  const int blendmode = input->blendmode;
+  if (spd) { *prg = PG_VFP1_GOURAUDSAHDING; input->blendmode = VDP1_COLOR_CL_REPLACE; }
+  *program = YglGetProgram(input, *prg, needed);
+  input->blendmode = blendmode;
+  return spd;
+}
+static void YglGouraudFlag(float *colours, unsigned vertices, int spd) {
+  for (unsigned i = 0; i < vertices; ++i) colours[i * 4 + 3] = spd ? 1.0f : 0.0f;
+}
+#endif
+#ifdef VITA_TESS_NEON
+/* One triangle's 8x8 grid, from values captured when it was recorded. */
+typedef struct {
+  float v[8], col[16];
+  float s0, t0, s_step, t_step, fz, alpha;
+  int has_col, flag;
+  float *pos, *tpos, *colv;
+} YglTessJob;
+
+static void YglTessGrid(const YglTessJob *j) {
+  const int tess_count = YGL_TESS_COUNT;
+  const float s_step = j->s_step, t_step = j->t_step;
+  const float vec_ad_xs = (j->v[6] - j->v[0]) / tess_count, vec_ad_ys = (j->v[7] - j->v[1]) / tess_count;
+  const float vec_bc_xs = (j->v[4] - j->v[2]) / tess_count, vec_bc_ys = (j->v[5] - j->v[3]) / tess_count;
+  int u, v;
+  float32x4_t top[9], bot[8][2];
+  if (j->has_col) {
+    const float32x4_t c0 = vld1q_f32(j->col), c4 = vld1q_f32(j->col + 4), c8 = vld1q_f32(j->col + 8), c12 = vld1q_f32(j->col + 12);
+    const float32x4_t e = vdupq_n_f32(0.125f);
+    for (int ui = 0; ui <= 8; ui++) top[ui] = vmulq_f32(vaddq_f32(vmulq_n_f32(c0, (float)(8 - ui)), vmulq_n_f32(c4, (float)ui)), e);
+    for (u = 0; u < 8; u++) for (int k = 0; k < 2; k++)
+      bot[u][k] = vmulq_f32(vaddq_f32(vmulq_n_f32(c12, (float)(8 - u)), vmulq_n_f32(c8, (float)(u + k))), e);
+  }
+  /* Stores that miss the L1 do not allocate a line and drain through the
+   * store buffer one by one, which bounds this function: each array is
+   * written in its own sequential pass with 32-byte stores, and the SPD flag
+   * goes into the colour stores rather than a pass of its own. Four grid
+   * cells at a time, each value by the same operations as the scalar
+   * expressions (separate multiply and add: this FPU has no fused
+   * multiply-add), so the vertices are bit-identical. */
+  {
+    const float32x4_t u4 = {0.0f, 1.0f, 2.0f, 3.0f};
+    float32x2_t pa[8], pb[8], pc[8], pd[8];
+    float *cpos = j->pos;
+    for (v = 0; v < tess_count; v++) {
+      const float ax = j->v[0] + vec_ad_xs * v;
+      const float ay = j->v[1] + vec_ad_ys * v;
+      const float bx = j->v[2] + vec_bc_xs * v;
+      const float by = j->v[3] + vec_bc_ys * v;
+      const float ab_step_x = (bx - ax) / tess_count;
+      const float ab_step_y = (by - ay) / tess_count;
+      const float cx = j->v[2] + vec_bc_xs * (v + 1);
+      const float cy = j->v[3] + vec_bc_ys * (v + 1);
+      const float dx = j->v[0] + vec_ad_xs * (v + 1);
+      const float dy = j->v[1] + vec_ad_ys * (v + 1);
+      const float dc_step_x = (cx - dx) / tess_count;
+      const float dc_step_y = (cy - dy) / tess_count;
+      for (int ug = 0; ug < tess_count; ug += 4) {
+        const float32x4_t uf = vaddq_f32(u4, vdupq_n_f32((float)ug));
+        const float32x4_t dax = vaddq_f32(vdupq_n_f32(ax), vmulq_n_f32(uf, ab_step_x));
+        const float32x4_t day = vaddq_f32(vdupq_n_f32(ay), vmulq_n_f32(uf, ab_step_y));
+        const float32x4_t dbx = vaddq_f32(dax, vdupq_n_f32(ab_step_x));
+        const float32x4_t dby = vaddq_f32(day, vdupq_n_f32(ab_step_y));
+        const float32x4_t ddx = vaddq_f32(vdupq_n_f32(dx), vmulq_n_f32(uf, dc_step_x));
+        const float32x4_t ddy = vaddq_f32(vdupq_n_f32(dy), vmulq_n_f32(uf, dc_step_y));
+        const float32x4_t dcx = vaddq_f32(ddx, vdupq_n_f32(dc_step_x));
+        const float32x4_t dcy = vaddq_f32(ddy, vdupq_n_f32(dc_step_y));
+        const float32x4x2_t A = vzipq_f32(dax, day), B = vzipq_f32(dbx, dby), C = vzipq_f32(dcx, dcy), D = vzipq_f32(ddx, ddy);
+        for (int h = 0; h < 2; h++) {
+          pa[ug + 2 * h] = vget_low_f32(A.val[h]); pa[ug + 2 * h + 1] = vget_high_f32(A.val[h]);
+          pb[ug + 2 * h] = vget_low_f32(B.val[h]); pb[ug + 2 * h + 1] = vget_high_f32(B.val[h]);
+          pc[ug + 2 * h] = vget_low_f32(C.val[h]); pc[ug + 2 * h + 1] = vget_high_f32(C.val[h]);
+          pd[ug + 2 * h] = vget_low_f32(D.val[h]); pd[ug + 2 * h + 1] = vget_high_f32(D.val[h]);
+        }
+      }
+      /* Cell u is A B C A C D; two cells are 24 floats, three 32-byte stores. */
+      for (u = 0; u < tess_count; u += 2, cpos += 24) {
+        float32x4x2_t w;
+        w.val[0] = vcombine_f32(pa[u], pb[u]); w.val[1] = vcombine_f32(pc[u], pa[u]);
+        vst1q_f32_x2(cpos, w);
+        w.val[0] = vcombine_f32(pc[u], pd[u]); w.val[1] = vcombine_f32(pa[u + 1], pb[u + 1]);
+        vst1q_f32_x2(cpos + 8, w);
+        w.val[0] = vcombine_f32(pc[u + 1], pa[u + 1]); w.val[1] = vcombine_f32(pc[u + 1], pd[u + 1]);
+        vst1q_f32_x2(cpos + 16, w);
+      }
+    }
+    /* Cell (u, v) is q00 q10 q11 q00 q11 q01, q = {s, t, j->fz, 1}. */
+    float32x2_t s0t[8], s1t[8];
+    {
+      const float32x4_t s0a = vaddq_f32(vdupq_n_f32(j->s0), vmulq_n_f32(u4, s_step));
+      const float32x4_t s0b = vaddq_f32(vdupq_n_f32(j->s0), vmulq_n_f32(vaddq_f32(u4, vdupq_n_f32(4.0f)), s_step));
+      const float32x4_t s1a = vaddq_f32(s0a, vdupq_n_f32(s_step)), s1b = vaddq_f32(s0b, vdupq_n_f32(s_step));
+      float sv[16];
+      vst1q_f32(sv, s0a); vst1q_f32(sv + 4, s0b); vst1q_f32(sv + 8, s1a); vst1q_f32(sv + 12, s1b);
+      for (u = 0; u < 8; u++) { s0t[u] = vdup_n_f32(sv[u]); s1t[u] = vdup_n_f32(sv[8 + u]); }
+    }
+    const float32x2_t zw = {j->fz, 1.0f};
+    float *tp = j->tpos;
+    for (v = 0; v < tess_count; v++) {
+      const float t0 = j->t0 + t_step * v, t1 = t0 + t_step;
+      for (u = 0; u < tess_count; u++, tp += 24) {
+        const float32x4_t q00 = vcombine_f32(vset_lane_f32(t0, s0t[u], 1), zw);
+        const float32x4_t q10 = vcombine_f32(vset_lane_f32(t0, s1t[u], 1), zw);
+        const float32x4_t q11 = vcombine_f32(vset_lane_f32(t1, s1t[u], 1), zw);
+        const float32x4_t q01 = vcombine_f32(vset_lane_f32(t1, s0t[u], 1), zw);
+        float32x4x2_t w;
+        w.val[0] = q00; w.val[1] = q10; vst1q_f32_x2(tp, w);
+        w.val[0] = q11; w.val[1] = q00; vst1q_f32_x2(tp + 8, w);
+        w.val[0] = q11; w.val[1] = q01; vst1q_f32_x2(tp + 16, w);
+      }
+    }
+    float *vtxa = j->colv;
+    const int flag = j->flag;
+    const float alpha = j->alpha;
+    if (!j->has_col) {
+      float32x4x2_t w;
+      w.val[0] = w.val[1] = vsetq_lane_f32(alpha, vdupq_n_f32(0.0f), 3);
+      for (int i = 0; i < 6 * 64; i += 2, vtxa += 8) vst1q_f32_x2(vtxa, w);
+    } else {
+      for (v = 0; v < tess_count; v++) {
+        for (u = 0; u < tess_count; u++, vtxa += 24) {
+          float32x4_t ca = YglTessColour(top[u], bot[u][0], v), cb = YglTessColour(top[u + 1], bot[u][1], v);
+          float32x4_t cc = YglTessColour(top[u + 1], bot[u][1], v + 1), cd = YglTessColour(top[u], bot[u][0], v + 1);
+          if (flag) {
+            ca = vsetq_lane_f32(alpha, ca, 3); cb = vsetq_lane_f32(alpha, cb, 3);
+            cc = vsetq_lane_f32(alpha, cc, 3); cd = vsetq_lane_f32(alpha, cd, 3);
+          }
+          float32x4x2_t w;
+          w.val[0] = ca; w.val[1] = cb; vst1q_f32_x2(vtxa, w);
+          w.val[0] = cc; w.val[1] = ca; vst1q_f32_x2(vtxa + 8, w);
+          w.val[0] = cc; w.val[1] = cd; vst1q_f32_x2(vtxa + 16, w);
+        }
+      }
+    }
+  }
+}
+
+#ifdef VITA_TESS_WORKER
+/* Grids are filled by a worker on CPU 1, where the sound thread mostly
+ * spins, while the render thread records the following commands. The
+ * destination is reserved when the triangle is recorded; the render thread
+ * drains the queue (helping with unclaimed grids) before anything reads,
+ * moves or reuses geometry buffers. */
+#include <stdatomic.h>
+#include <psp2/kernel/threadmgr.h>
+enum { TESS_SLOTS = 256 };
+static YglTessJob tess_job[TESS_SLOTS];
+static atomic_uint tess_busy[TESS_SLOTS];
+static atomic_uint tess_posted, tess_claimed, tess_done;
+static SceUID tess_sema;
+static int tess_ready;          /* 0 untried, 1 running, -1 unavailable */
+
+static int YglTessRunOne(void) {
+  unsigned c = atomic_load_explicit(&tess_claimed, memory_order_relaxed);
+  do {
+    if (c == atomic_load_explicit(&tess_posted, memory_order_acquire)) return 0;
+  } while (!atomic_compare_exchange_weak_explicit(&tess_claimed, &c, c + 1, memory_order_acquire, memory_order_relaxed));
+  const unsigned slot = c % TESS_SLOTS;
+  YglTessGrid(&tess_job[slot]);
+  atomic_store_explicit(&tess_busy[slot], 0, memory_order_release);
+  atomic_fetch_add_explicit(&tess_done, 1, memory_order_release);
+  return 1;
+}
+static atomic_int tess_sleeping;
+static int YglTessWorker(SceSize args, void *argp) {
+  (void)args; (void)argp;
+  for (;;) {
+    while (YglTessRunOne()) {}
+    /* Announce the sleep, then look again: a grid posted before the flag
+     * was seen is found here, one posted after it signals. */
+    atomic_store(&tess_sleeping, 1);
+    atomic_thread_fence(memory_order_seq_cst);
+    if (YglTessRunOne()) { atomic_store(&tess_sleeping, 0); continue; }
+    if (sceKernelWaitSema(tess_sema, 1, NULL) < 0) return 0;
+  }
+}
+static void YglTessStart(void) {
+  SceUID th = -1;
+  tess_sema = sceKernelCreateSema("yab_tess", 0, 0, 0x7fffffff, NULL);
+  if (tess_sema >= 0) th = sceKernelCreateThread("yab_tess", YglTessWorker, 189, 0x4000, 0, 1 << 17, NULL);
+  tess_ready = th >= 0 && sceKernelStartThread(th, 0, NULL) >= 0 ? 1 : -1;
+  YuiMsg("tess_worker ready=%d sema=%08x thread=%08x", tess_ready, (unsigned)tess_sema, (unsigned)th);
+}
+static void YglTessPost(const YglTessJob *j) {
+  if (!tess_ready) YglTessStart();
+  if (tess_ready < 0) { YglTessGrid(j); return; }
+  const unsigned p = atomic_load_explicit(&tess_posted, memory_order_relaxed);
+  const unsigned slot = p % TESS_SLOTS;
+  while (atomic_load_explicit(&tess_busy[slot], memory_order_acquire)) YglTessRunOne();
+  tess_job[slot] = *j;
+  atomic_store_explicit(&tess_busy[slot], 1, memory_order_relaxed);
+  atomic_store_explicit(&tess_posted, p + 1, memory_order_seq_cst);
+  if (atomic_exchange(&tess_sleeping, 0)) sceKernelSignalSema(tess_sema, 1);
+}
+static void YglTessDrain(void) {
+  if (tess_ready <= 0) return;
+  const unsigned p = atomic_load_explicit(&tess_posted, memory_order_relaxed);
+  if (atomic_load_explicit(&tess_done, memory_order_acquire) == p) return;
+  VT_STACK_BEGIN(VT_THREAD_JOIN);
+  while (atomic_load_explicit(&tess_done, memory_order_acquire) != p) YglTessRunOne();
+  VT_STACK_END();
+}
+#endif
+#endif
+
 int YglTriangleGrowShading_in(YglSprite * input, YglTexture * output, float * colors, YglCache * c, int cash_flg ) {
   unsigned int x, y;
   YglProgram *program;
@@ -2048,6 +2284,10 @@ int YglTriangleGrowShading_in(YglSprite * input, YglTexture * output, float * co
     prg = PG_VDP2_PER_LINE_ALPHA;
   }
 
+#ifdef VITA_VDP1_GOURAUD_MERGE
+  const int merge_spd = YglGouraudMerge(input, &prg, YGL_MAX_NEED_BUFFER, &program);
+  if (merge_spd < 0)
+#endif
   program = YglGetProgram(input, prg, YGL_MAX_NEED_BUFFER);
   if (program == NULL || program->quads == NULL) return -1;
 
@@ -2113,6 +2353,114 @@ int YglTriangleGrowShading_in(YglSprite * input, YglTexture * output, float * co
     }
   }
 
+#ifdef VITA_TESS_NEON
+  const int tess_count = YGL_TESS_COUNT;
+  _Static_assert(YGL_TESS_COUNT == 8, "colour tables are sized for an 8x8 grid");
+  float s_step = (float)(texv[2].s-texv[0].s)/(float)tess_count;
+  float t_step = (float)(texv[2].t-texv[0].t)/(float)tess_count;
+  float vec_ad_x = input->vertices[6] - input->vertices[0];
+  float vec_ad_y = input->vertices[7] - input->vertices[1];
+  float vec_ad_xs = vec_ad_x / tess_count;
+  float vec_ad_ys = vec_ad_y / tess_count;
+  float vec_bc_x = input->vertices[4] - input->vertices[2];
+  float vec_bc_y = input->vertices[5] - input->vertices[3];
+  float vec_bc_xs = vec_bc_x / tess_count;
+  float vec_bc_ys = vec_bc_y / tess_count;
+  /* The same values as the scalar colour expressions below, term by term:
+   * top[ui] = (c0*(T-ui) + c4*ui)/T and bot[u][k] = (c12*(T-u) + c8*(u+k))/T,
+   * a vertex being (top*(T-vi) + bot*vi)/T; dividing by 8 is multiplying by 1/8. */
+  float32x4_t top[9], bot[8][2];
+  if (colors) {
+    const float32x4_t c0 = vld1q_f32(colors), c4 = vld1q_f32(colors + 4), c8 = vld1q_f32(colors + 8), c12 = vld1q_f32(colors + 12);
+    const float32x4_t e = vdupq_n_f32(0.125f);
+    for (int ui = 0; ui <= 8; ui++) top[ui] = vmulq_f32(vaddq_f32(vmulq_n_f32(c0, (float)(8 - ui)), vmulq_n_f32(c4, (float)ui)), e);
+    for (u = 0; u < 8; u++) for (int k = 0; k < 2; k++)
+      bot[u][k] = vmulq_f32(vaddq_f32(vmulq_n_f32(c12, (float)(8 - u)), vmulq_n_f32(c8, (float)(u + k))), e);
+  }
+  {
+    YglTessJob job;
+    memcpy(job.v, input->vertices, sizeof job.v);
+    job.has_col = colors != NULL;
+    if (colors) memcpy(job.col, colors, sizeof job.col);
+    job.s0 = texv[0].s; job.t0 = texv[0].t; job.s_step = s_step; job.t_step = t_step; job.fz = fetch_z;
+#ifdef VITA_VDP1_GOURAUD_MERGE
+    job.flag = merge_spd >= 0; job.alpha = merge_spd > 0 ? 1.0f : 0.0f;
+#else
+    job.flag = 0; job.alpha = 0.0f;
+#endif
+    job.pos = pos; job.tpos = (float *)tpos; job.colv = colv;
+#ifdef VITA_TESS_WORKER
+    {
+      YglTessPost(&job);
+#ifdef VITA_TESS_VERIFY
+      YglTessDrain();
+#endif
+    }
+#else
+    YglTessGrid(&job);
+#endif
+  }
+#ifdef VITA_TESS_VERIFY
+  {
+    /* The previous per-cell loop, into scratch, for comparison. */
+    static float rbuf[YGL_MAX_NEED_BUFFER * 5];
+    float *rpos = rbuf, *rcolv = rbuf + YGL_MAX_NEED_BUFFER;
+    texturecoordinate_struct *rtpos = (texturecoordinate_struct *)(rbuf + YGL_MAX_NEED_BUFFER * 3);
+  for (v = 0; v < tess_count ; v++){
+      float ax = input->vertices[0] + vec_ad_xs * v;
+      float ay = input->vertices[1] + vec_ad_ys * v;
+      float bx = input->vertices[2] + vec_bc_xs * v;
+      float by = input->vertices[3] + vec_bc_ys * v;
+      float ab_step_x = (bx - ax) / tess_count;
+      float ab_step_y = (by - ay) / tess_count;
+      float cx = input->vertices[2] + vec_bc_xs * (v + 1);
+      float cy = input->vertices[3] + vec_bc_ys * (v + 1);
+      float dx = input->vertices[0] + vec_ad_xs * (v + 1);
+      float dy = input->vertices[1] + vec_ad_ys * (v + 1);
+      float dc_step_x = (cx - dx) / tess_count;
+      float dc_step_y = (cy - dy) / tess_count;
+      for (u = 0; u < tess_count ; u++){
+        float * cpos = &rpos[12*(u + tess_count*v) ];
+        texturecoordinate_struct * ctpos = &rtpos[6 * (u + tess_count*v)];
+        float * vtxa = &rcolv[24 * (u + tess_count*v)];
+        float dax = ax + ab_step_x * u;
+        float day = ay + ab_step_y * u;
+        float dbx = dax + ab_step_x;
+        float dby = day + ab_step_y;
+        float ddx = dx + dc_step_x * u;
+        float ddy = dy + dc_step_y * u;
+        float dcx = ddx + dc_step_x;
+        float dcy = ddy + dc_step_y;
+        cpos[0] = dax; cpos[1] = day; cpos[2] = dbx; cpos[3] = dby; cpos[4] = dcx; cpos[5] = dcy;
+        cpos[6] = dax; cpos[7] = day; cpos[8] = dcx; cpos[9] = dcy; cpos[10] = ddx; cpos[11] = ddy;
+        const float s0 = texv[0].s + s_step * u, t0 = texv[0].t + t_step * v;
+        const float s1 = s0 + s_step, t1 = t0 + t_step;
+        const float32x4_t q00 = {s0, t0, fetch_z, 1}, q10 = {s1, t0, fetch_z, 1}, q11 = {s1, t1, fetch_z, 1}, q01 = {s0, t1, fetch_z, 1};
+        float *tp = (float *)ctpos;
+        vst1q_f32(tp, q00); vst1q_f32(tp + 4, q10); vst1q_f32(tp + 8, q11);
+        vst1q_f32(tp + 12, q00); vst1q_f32(tp + 16, q11); vst1q_f32(tp + 20, q01);
+        if (colors == NULL) {
+          memset(vtxa, 0, sizeof(float) * 24);
+        } else {
+          const float32x4_t a = YglTessColour(top[u], bot[u][0], v), b = YglTessColour(top[u + 1], bot[u][1], v);
+          const float32x4_t c = YglTessColour(top[u + 1], bot[u][1], v + 1), d = YglTessColour(top[u], bot[u][0], v + 1);
+          vst1q_f32(vtxa, a); vst1q_f32(vtxa + 4, b); vst1q_f32(vtxa + 8, c);
+          vst1q_f32(vtxa + 12, a); vst1q_f32(vtxa + 16, c); vst1q_f32(vtxa + 20, d);
+        }
+      }
+    }
+#ifdef VITA_VDP1_GOURAUD_MERGE
+    if (merge_spd >= 0) YglGouraudFlag(rcolv, 6 * tess_count * tess_count, merge_spd);
+#endif
+    static unsigned vcalls, vbad;
+    const int bad = memcmp(rpos, pos, sizeof(float) * 12 * 64) != 0 ||
+      memcmp(rcolv, colv, sizeof(float) * 24 * 64) != 0 || memcmp(rtpos, tpos, sizeof(float) * 24 * 64) != 0;
+    vbad += bad;
+    if ((++vcalls & 1023) == 0 || (bad && vbad < 4))
+      YuiMsg("tess_verify calls=%u mismatch=%u", vcalls, vbad);
+  }
+#endif
+#else
   int tess_count = YGL_TESS_COUNT;
   float s_step = (float)(texv[2].s-texv[0].s)/(float)tess_count;
   float t_step = (float)(texv[2].t-texv[0].t)/(float)tess_count;
@@ -2193,7 +2541,7 @@ int YglTriangleGrowShading_in(YglSprite * input, YglTexture * output, float * co
       ctpos[4].t = ctpos[2].t;
       ctpos[5].s = ctpos[0].s;
       ctpos[5].t = ctpos[0].t + t_step;
-      ctpos[0].r = ctpos[1].r = ctpos[2].r = ctpos[3].r = ctpos[4].r = ctpos[5].r = 0; // these can stay at 0
+      ctpos[0].r = ctpos[1].r = ctpos[2].r = ctpos[3].r = ctpos[4].r = ctpos[5].r = fetch_z; // these can stay at 0
       ctpos[0].q = ctpos[1].q = ctpos[2].q = ctpos[3].q = ctpos[4].q = ctpos[5].q = 1.0f; // these can stay at 0
 
       // ToDo: color interpolation
@@ -2259,6 +2607,10 @@ int YglTriangleGrowShading_in(YglSprite * input, YglTexture * output, float * co
 
     }
   }
+#endif
+#if defined(VITA_VDP1_GOURAUD_MERGE) && !defined(VITA_TESS_NEON)
+  if (merge_spd >= 0) YglGouraudFlag(colv, 6 * tess_count * tess_count, merge_spd);
+#endif
   program->currentQuad = program->currentQuad + (12*tess_count*tess_count);
   return 0;
 }
@@ -2308,6 +2660,10 @@ int YglQuadGrowShading_in(YglSprite * input, YglTexture * output, float * colors
 
 
 
+#ifdef VITA_VDP1_GOURAUD_MERGE
+   const int merge_spd = YglGouraudMerge(input, &prg, 12, &program);
+   if (merge_spd < 0)
+#endif
    program = YglGetProgram(input,prg, 12);
    if( program == NULL ) return -1;
    //YGLLOG( "program->quads = %X,%X,%d/%d\n",program->quads,program->vertexBuffer,program->currentQuad,program->maxQuad );
@@ -2380,6 +2736,9 @@ int YglQuadGrowShading_in(YglSprite * input, YglTexture * output, float * colors
      vtxa[22] = colors[14];
      vtxa[23] = colors[15];
    }
+#ifdef VITA_VDP1_GOURAUD_MERGE
+   if (merge_spd >= 0) YglGouraudFlag(vtxa, 6, merge_spd);
+#endif
 
    // texture
    tmp = (texturecoordinate_struct *)(program->textcoords + (program->currentQuad * 2));
@@ -3267,6 +3626,9 @@ void YglFrameChangeVDP1(){
 unsigned v1calls_;
 #endif
 void YglRenderVDP1(void) {
+#ifdef VITA_TESS_WORKER
+  YglTessDrain();
+#endif
   VT_SCOPE(VT_GPU_SUBMIT);
 #ifdef VITA_STACK_PROFILE
   ++v1calls_;
@@ -3396,6 +3758,11 @@ void YglRenderVDP1(void) {
         glDrawArrays(GL_PATCHES, 0, level->prg[j].currentQuad / 2);
 #endif
       }else{
+#ifdef VITA_GEOM_ARENA
+        GLint old_array = 0;
+        int arena = YglGeomOwned(level->prg[j].quads);
+        if (arena) YglGeomBind(&level->prg[j], &old_array);
+#endif
 #ifdef VITA_STACK_PROFILE
         static uint64_t ga_us; static unsigned ga_hit, ga_all, ga_frames;
         uint64_t td0 = sceKernelGetProcessTimeWide();
@@ -3426,10 +3793,16 @@ void YglRenderVDP1(void) {
             YuiMsg("bigdraw verts=%u arena=%d region_us=%llu draw_us=%llu", level->prg[j].currentQuad / 2, arena,
                    (unsigned long long)(tr1_ - tr0_), (unsigned long long)(tr2_ - tr1_)); }
         ga_us += sceKernelGetProcessTimeWide() - td0; ++ga_all;
+#ifdef VITA_GEOM_ARENA
+        ga_hit += arena;
+#endif
         if (ga_all == 512) { (void)ga_frames;
           YuiMsg("diag_v1 draws=%u arena=%u draw_us=%llu", ga_all, ga_hit, (unsigned long long)ga_us);
           ga_us = 0; ga_hit = ga_all = 0;
         }
+#endif
+#ifdef VITA_GEOM_ARENA
+        if (arena) glBindBuffer(GL_ARRAY_BUFFER, old_array);
 #endif
       }
       level->prg[j].currentQuad = 0;
@@ -3454,6 +3827,9 @@ void YglRenderVDP1(void) {
     glDepthFunc(GL_GEQUAL);
   }
   vita_fetch_seq = 0;
+#endif
+#ifdef VITA_GEOM_ARENA
+  YglGeomRetireLevel(level);
 #endif
 
 #ifdef YABAUSE_VITAGL
@@ -4169,6 +4545,9 @@ void YglSetClearColor(float r, float g, float b){
 unsigned vt_frame_seq;
 #endif
 void YglRender(void) {
+#ifdef VITA_TESS_WORKER
+  YglTessDrain();
+#endif
 #ifdef VITA_DIAG_ABLATE
   ++vt_frame_seq;
 #endif
@@ -4693,6 +5072,9 @@ int YglCleanUpWindow(YglProgram * prg){
 }
 
 void YglRenderDestinationAlpha(void) {
+#ifdef VITA_TESS_WORKER
+  YglTessDrain();
+#endif
   YglLevel * level;
   GLuint cprg = 0;
   int from = 0;
@@ -4877,6 +5259,9 @@ void YglRenderDestinationAlpha(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 void YglReset(void) {
+#ifdef VITA_TESS_WORKER
+  YglTessDrain();
+#endif
    YglLevel * level;
    unsigned int i,j;
 
