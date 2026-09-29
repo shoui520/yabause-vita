@@ -224,10 +224,15 @@ if(VITA_SH2_CACHED_DISPATCH)
 endif()
 option(VITA_SH2_RAM_LOADS "Use guarded A32 cached work-RAM loads (experimental)" OFF)
 option(VITA_SH2_WRITE_PREFLIGHT "Check empty high-RAM code ownership before invalidation calls" OFF)
+option(VITA_SH2_SAME_VALUE_STORES "Skip SH-2 code invalidation for high-RAM stores that leave the value unchanged" ON)
 option(VITA_SH2_WRITE_HELPER_O3 "Optimize SH-2 write helpers while preserving invalidation" OFF)
 if(VITA_SH2_WRITE_HELPER_O3)
   set_property(SOURCE src/core/sh2_dynarec/DynarecSh2CInterface.cpp APPEND PROPERTY
     COMPILE_DEFINITIONS VITA_SH2_WRITE_HELPER_O3)
+endif()
+if(VITA_SH2_SAME_VALUE_STORES)
+  set_property(SOURCE src/core/sh2_dynarec/DynarecSh2CInterface.cpp APPEND PROPERTY
+    COMPILE_DEFINITIONS VITA_SH2_SAME_VALUE_STORES)
 endif()
 if(VITA_SH2_WRITE_PREFLIGHT)
   set_property(SOURCE src/core/sh2_dynarec/DynarecSh2CInterface.cpp APPEND PROPERTY

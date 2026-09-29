@@ -54,6 +54,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #define NI_F    11
 
 #include <cstdlib>
+#include <cstring>
 #include <new>
 unsigned char *VitaSh2CodeArena();
 
@@ -63,7 +64,60 @@ using std::list;
 using std::map;
 using std::string;
 
+// Moves whenever a published high-RAM block is removed or replaced (and on
+// compiler reset): a read set may stand for a block's own code words by it.
+extern u32 g_code_epoch;
+#ifdef VITA_SH2_PARENT_LIST
 typedef list<u32> addrs;
+#else
+/* The block start PCs owning one halfword: the std::list operations used on
+ * it (push_back, unique, remove, clear, size, forward iteration) with the
+ * same order, without a heap node per entry. One entry is held inline; the
+ * table holds one of these per halfword of high work RAM. */
+class addrs {
+  u32 n_ = 0, cap_ = 1;
+  union { u32 one_; u32 *heap_; };
+  u32 *data() { return cap_ > 1 ? heap_ : &one_; }
+  const u32 *data() const { return cap_ > 1 ? heap_ : &one_; }
+ public:
+  addrs() : one_(0) {}
+  ~addrs() { if (cap_ > 1) free(heap_); }
+  addrs(const addrs &) = delete;
+  addrs &operator=(const addrs &) = delete;
+  size_t size() const { return n_; }
+  bool empty() const { return n_ == 0; }
+  const u32 *begin() const { return data(); }
+  const u32 *end() const { return data() + n_; }
+  void push_back(u32 v) {
+    if (n_ == cap_) {
+      const u32 cap = cap_ * 2;
+      u32 *p = static_cast<u32 *>(malloc(cap * sizeof(u32)));
+      if (!p) abort();
+      memcpy(p, data(), n_ * sizeof(u32));
+      if (cap_ > 1) free(heap_);
+      heap_ = p;
+      cap_ = cap;
+    }
+    data()[n_++] = v;
+  }
+  // Collapse runs of equal entries to one, as std::list::unique.
+  void unique() {
+    if (n_ < 2) return;
+    u32 *d = data(), k = 1;
+    for (u32 i = 1; i < n_; ++i)
+      if (d[i] != d[k - 1]) d[k++] = d[i];
+    n_ = k;
+  }
+  // Drop every entry equal to v, keeping the others' order.
+  void remove(u32 v) {
+    u32 *d = data(), k = 0;
+    for (u32 i = 0; i < n_; ++i)
+      if (d[i] != v) d[k++] = d[i];
+    n_ = k;
+  }
+  void clear() { n_ = 0; }
+};
+#endif
 
 struct CompileStaticsNode {
   u32 time;
@@ -93,12 +147,14 @@ struct Block
   u32 flags;
   u32 poll;
   u32 poll_step; // Exact single-iteration recipe; no added wait-skip authority.
+  u32 link_pc;   // b_addr while this is LookupTable's entry for it (high RAM), else 0
 };
 
 #define BLOCK_LOOP  (0x01)
 #define BLOCK_RESIDENT_LOOP (0x04)
 #define BLOCK_WRITE (0x02)
 #define BLOCK_POLL_FUSED (0x08)
+#define BLOCK_MAY_WRITE (0x10) // some instruction may write memory (conservative decode)
 
 #define IN_INFINITY_LOOP (-1)
 

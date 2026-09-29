@@ -480,6 +480,13 @@ extern "C" void VitaSh2MemReport(void) {
 #define WRITE_LINKAGE
 #define WRITE_NAME(Name) memSet##Name
 #endif
+#ifdef VITA_SH2_SAME_VALUE_STORES
+// Compiled code depends only on the words it was compiled from, so a store
+// leaving a halfword's value unchanged cannot make any block stale.
+#define SAME_HIGH(Width, addr, value) (T2Read##Width(HighWram, (addr) & 0xFFFFF) == (value))
+#else
+#define SAME_HIGH(Width, addr, value) 0
+#endif
 static __attribute__((always_inline)) inline void InvalidateHighWrite(CompileBlocks *block, u32 addr) {
 #ifdef VITA_SH2_WRITE_PREFLIGHT
   // Same live owner test as setDirty, before its large cold-path stack frame.
@@ -509,7 +516,7 @@ WRITE_LINKAGE void WRITE_NAME(Byte)(u32 addr , u8 data )
   // High Memory
   case 0x06000000:
 #if defined(SET_DIRTY)
-    InvalidateHighWrite(block, addr);
+    if (!SAME_HIGH(Byte, addr, data)) InvalidateHighWrite(block, addr);
 #else
     block->LookupTable[ (addr&0x000FFFFF)>>1 ] = NULL;
 #endif
@@ -562,7 +569,7 @@ WRITE_LINKAGE void WRITE_NAME(Word)(u32 addr, u16 data )
   // High Memory
    case 0x06000000:  {
 #if defined(SET_DIRTY)
-     InvalidateHighWrite(block, addr);
+     if (!SAME_HIGH(Word, addr, data)) InvalidateHighWrite(block, addr);
 #else
      block->LookupTable[(addr & 0x000FFFFF) >> 1] = NULL;
 #endif
@@ -615,8 +622,8 @@ WRITE_LINKAGE void WRITE_NAME(Long)(u32 addr , u32 data )
   // High Memory
   case 0x06000000:
 #if defined(SET_DIRTY)
-    InvalidateHighWrite(block, addr);
-    InvalidateHighWrite(block, addr+2);
+    if (!SAME_HIGH(Word, addr, (u16)(data >> 16))) InvalidateHighWrite(block, addr);
+    if (!SAME_HIGH(Word, addr + 2, (u16)data)) InvalidateHighWrite(block, addr+2);
 #else
     block->LookupTable[(addr & 0x000FFFFF) >> 1] = NULL;
     block->LookupTable[((addr & 0x000FFFFF) >> 1) + 1] = NULL;

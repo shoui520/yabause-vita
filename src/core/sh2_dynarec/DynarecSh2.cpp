@@ -939,6 +939,7 @@ void CompileBlocks::InvalidateLow(u32 address, u32 length) {
 }
 
 #include "../../vita/telemetry.h"
+static bool Sh2MayWrite(u16 op);
 Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
 {
   VT_SCOPE(VT_SH2_COMPILE);
@@ -1021,6 +1022,8 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
 
   return &g_CompleBlock[blockCount];
 }
+
+
 
 void CompileBlocks::ShowStatics() {
   //LOG("Compile\t%d\t%d\t%d\n", compile_count_, exec_count_, remove_count_);
@@ -1208,6 +1211,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #ifdef SET_DIRTY
     if (ParentT) {
       u32 keepaddr = adress_mask(addr);
+      MarkCode(keepaddr);
       ParentT[keepaddr].push_back(adress_mask(start_addr));
       ParentT[keepaddr].unique();
     }
@@ -1501,6 +1505,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #ifdef SET_DIRTY
       if (ParentT) {
         u32 keepaddr = adress_mask(addr);
+        MarkCode(keepaddr);
         ParentT[keepaddr].push_back(adress_mask(start_addr));
         ParentT[keepaddr].unique();
       }
