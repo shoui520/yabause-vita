@@ -46,6 +46,12 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "../vita/diag_timers.h"
 extern void YuiMsg(const char *format, ...);
 #include "scu_dsp_arithmetic.h"
+#if defined(VITA_SCU_DSP_JIT)
+u32 scu_dsp_prog_gen;                 /* JIT invalidation: every program RAM writer bumps it */
+#define SCU_DSP_PROG_BUMP() (++scu_dsp_prog_gen)
+#else
+#define SCU_DSP_PROG_BUMP() ((void)0)
+#endif
 #include "debug.h"
 #include "memory.h"
 #include "sh2core.h"
@@ -839,7 +845,7 @@ void dsp_dma03(scudspregs_struct *sc, u32 inst)
     for (i = 0; i < Counter; i++)
     {
       if (sel == 0x04){
-        sc->ProgramRam[index] = MappedMemoryReadLong((sc->RA0M << 2), NULL);
+        sc->ProgramRam[index] = MappedMemoryReadLong((sc->RA0M << 2), NULL); SCU_DSP_PROG_BUMP();
         //LOG("read from %08X to P[%d] val %08X", (sc->RA0 << 2), index, sc->ProgramRam[index]);
         index++;
       }
@@ -858,7 +864,7 @@ void dsp_dma03(scudspregs_struct *sc, u32 inst)
     {
 
       if (sel == 0x04){
-        sc->ProgramRam[index] = MappedMemoryReadLong((sc->RA0M << 2), NULL);
+        sc->ProgramRam[index] = MappedMemoryReadLong((sc->RA0M << 2), NULL); SCU_DSP_PROG_BUMP();
         //LOG("read from %08X to P[%d] val %08X", (sc->RA0 << 2), index, sc->ProgramRam[index]);
         index++;
       }else{
@@ -1316,6 +1322,243 @@ void ScuDmaProc(Scu * scu, int time) {
 }
 
 //////////////////////////////////////////////////////////////////////////////
+static void ScuDspDmaCommand(u32 instruction)
+{
+    // Finish Previous DMA operation
+    if (ScuDsp->dsp_dma_wait > 0) {
+      ScuDsp->dsp_dma_wait = 0;
+      step_dsp_dma(ScuDsp);
+    }
+
+    ScuDsp->dsp_dma_instruction = instruction;
+    ScuDsp->ProgControlPort.part.T0 = 1;
+
+    int Counter = 0;
+    if ( ((instruction >> 10) & 0x1F) == 0x00 || 
+         ((instruction >> 10) & 0x1F) == 0x04  || 
+         ((instruction >> 11) & 0x0F) == 0x08 || 
+         ((instruction >> 10) & 0x1F) == 0x14 )
+    {
+       Counter = instruction & 0xFF;
+    }
+    else if (
+      ((instruction >> 11) & 0x0F) == 0x04 || 
+      ((instruction >> 10) & 0x1F) == 0x0C || 
+      ((instruction >> 11) & 0x0F) == 0x0C || 
+      ((instruction >> 10) & 0x1F) == 0x1C)
+    {
+      switch ((instruction & 0x7))
+      {
+      case 0x00: Counter = ScuDsp->MD[0][ScuDsp->CT[0] & 0x3F]; break;
+      case 0x01: Counter = ScuDsp->MD[1][ScuDsp->CT[1] & 0x3F]; break;
+      case 0x02: Counter = ScuDsp->MD[2][ScuDsp->CT[2] & 0x3F]; break;
+      case 0x03: Counter = ScuDsp->MD[3][ScuDsp->CT[3] & 0x3F]; break;
+      case 0x04: Counter = ScuDsp->MD[0][ScuDsp->CT[0] & 0x3F]; ScuDsp->CT[0]++; ScuDsp->CT[0] &= 0x3F; break;
+      case 0x05: Counter = ScuDsp->MD[1][ScuDsp->CT[1] & 0x3F]; ScuDsp->CT[1]++; ScuDsp->CT[1] &= 0x3F; break;
+      case 0x06: Counter = ScuDsp->MD[2][ScuDsp->CT[2] & 0x3F]; ScuDsp->CT[2]++; ScuDsp->CT[2] &= 0x3F; break;
+      case 0x07: Counter = ScuDsp->MD[3][ScuDsp->CT[3] & 0x3F]; ScuDsp->CT[3]++; ScuDsp->CT[3] &= 0x3F; break;
+      }
+
+    }
+
+    ScuDsp->dsp_dma_size = Counter;
+    ScuDsp->dsp_dma_wait = 2; // DMA operation will be start when this count is zero
+    ScuDsp->WA0M = ScuDsp->WA0;
+    ScuDsp->RA0M = ScuDsp->RA0;
+    //LOG("Start DSP DMA RA=%08X WA=%08X inst=%08X count=%d wait = %d", ScuDsp->RA0M, ScuDsp->WA0M, ScuDsp->dsp_dma_instruction, Counter, ScuDsp->dsp_dma_wait );
+}
+
+#ifdef VITA_SCU_DSP_FAST
+/* Same behaviour as the reference loop in ScuExec (kept for breakpoints and
+ * DSPLOG): the DSP pointer and the four post-increment flags live in
+ * registers, and the bus helpers are inlined. Every bus access still
+ * completes a pending DSP DMA first, through the same step_dsp_dma. */
+#define DSP_DMA_SYNC(d) do { if ((d)->dsp_dma_wait > 0) { (d)->dsp_dma_wait = 0; step_dsp_dma(d); } } while (0)
+static inline u32 dsp_fast_read(scudspregs_struct *d, unsigned num, unsigned *inc) {
+  if (num <= 7) {
+    *inc |= ((num >> 2) & 1u) << (num & 3);
+    DSP_DMA_SYNC(d);
+    return d->MD[num & 3][d->CT[num & 3] & 0x3F];
+  }
+  if (num == 0x9) return (u32)d->ALU.part.L;
+  if (num == 0xA) return (u32)(d->ALU.all >> 16);
+  return 0xFFFFFFFF;
+}
+static inline void dsp_fast_d1write(scudspregs_struct *d, unsigned num, u32 val, unsigned *inc) {
+  DSP_DMA_SYNC(d);
+  switch (num) {
+    case 0x0: case 0x1: case 0x2: case 0x3:
+      d->MD[num][d->CT[num] & 0x3F] = val; *inc |= 1u << num; return;
+    case 0x4: d->RX = val; return;
+    case 0x5: d->P.all = (signed)val; return;
+    case 0x6: d->RA0 = val; return;
+    case 0x7: d->WA0 = val; return;
+    case 0xA: d->LOP = (u16)val; return;
+    case 0xB: d->TOP = (u8)val; return;
+    case 0xC: case 0xD: case 0xE: case 0xF:
+      d->CT[num & 3] = (u8)val; *inc &= ~(1u << (num & 3)); return;
+    default: return;
+  }
+}
+static inline void dsp_fast_immwrite(scudspregs_struct *d, unsigned num, u32 val, unsigned *inc) {
+  DSP_DMA_SYNC(d);
+  switch (num) {
+    case 0x0: case 0x1: case 0x2: case 0x3:
+      d->MD[num][d->CT[num] & 0x3F] = val; *inc |= 1u << num; return;
+    case 0x4: d->RX = val; return;
+    case 0x5: d->P.all = (s32)val; return;
+    case 0x6: d->RA0 = val & 0x1FFFFFF; return;
+    case 0x7: d->WA0 = val & 0x1FFFFFF; return;
+    case 0xA: d->LOP = (u16)(val & 0x0FFF); return;
+    case 0xC: d->TOP = d->PC + 1; d->jmpaddr = val; d->delayed = 0; return;
+    default: return;
+  }
+}
+static inline void dsp_fast_apply_inc(scudspregs_struct *d, unsigned inc) {
+  if (inc & 1) d->CT[0] = (d->CT[0] + 1) & 0x3f;
+  if (inc & 2) d->CT[1] = (d->CT[1] + 1) & 0x3f;
+  if (inc & 4) d->CT[2] = (d->CT[2] + 1) & 0x3f;
+  if (inc & 8) d->CT[3] = (d->CT[3] + 1) & 0x3f;
+}
+/* Condition field shared by MVI and JMP: bit 5 set = true-sense, bits 0..3
+ * select Z, S, (Z and S / Z or S), C, T0 exactly as the reference cases. */
+static inline int dsp_fast_cond(const scudspregs_struct *d, unsigned c, int *known) {
+  const int Z = d->ProgControlPort.part.Z, S = d->ProgControlPort.part.S;
+  const int C = d->ProgControlPort.part.C, T0 = d->ProgControlPort.part.T0;
+  *known = 1;
+  switch (c) {
+    case 0x01: return !Z;           case 0x02: return !S;
+    case 0x03: return Z == 0 && S == 0;
+    case 0x04: return !C;           case 0x08: return !T0;
+    case 0x21: return Z;            case 0x22: return S;
+    case 0x23: return Z || S;
+    case 0x24: return C;            case 0x28: return T0;
+    default: *known = 0; return 0;
+  }
+}
+/* One iteration of the reference loop (T0 step, instruction, CT increments,
+ * PC/delayed jump, counter). Returns the new counter. */
+static inline s32 dsp_fast_step(scudspregs_struct *const d, s32 dsp_counter) {
+  {
+    if (d->ProgControlPort.part.T0 != 0) step_dsp_dma(d);
+    const u32 instruction = d->ProgramRam[d->PC];
+    unsigned inc = 0;
+    d->ALU.all = d->AC.all;
+    const unsigned aluop = instruction >> 26;
+    if (aluop == 6) {                                  // AD2
+      d->ALU.all = (s64)d->AC.all + (s64)d->P.all;
+      d->ProgControlPort.part.Z = d->ALU.all == 0;
+      d->ProgControlPort.part.S = (d->ALU.all & 0x800000000000) != 0;
+      d->ProgControlPort.part.C =
+        (((d->AC.all & 0xffffffffffff) + (d->P.all & 0xffffffffffff)) & 0x1000000000000) != 0;
+    } else if (aluop - 1u < 15u) {
+      u32 value;
+      d->ProgControlPort.all = ScuDspAlu32(aluop, (u32)d->AC.part.L, (u32)d->P.part.L,
+                                           d->ProgControlPort.all, &value);
+      d->ALU.part.L = ScuDspSigned32(value);
+    }
+    switch (instruction >> 30) {
+    case 0x00: {                                       // Operation Commands
+      switch ((instruction >> 23) & 0x3) {
+        case 2: d->P.all = (s64)d->RX * (s32)d->RY; break;
+        case 3: d->P.all = (s64)(s32)dsp_fast_read(d, (instruction >> 20) & 0x7, &inc); break;
+        default: break;
+      }
+      if ((instruction >> 23) & 0x4) d->RX = dsp_fast_read(d, (instruction >> 20) & 0x7, &inc);
+      if ((instruction >> 17) & 0x4) d->RY = dsp_fast_read(d, (instruction >> 14) & 0x7, &inc);
+      switch ((instruction >> 17) & 0x3) {
+        case 1: d->AC.all = 0; break;
+        case 2: d->AC.all = d->ALU.all; break;
+        case 3: d->AC.all = (s64)(s32)dsp_fast_read(d, (instruction >> 14) & 0x7, &inc); break;
+        default: break;
+      }
+      switch ((instruction >> 12) & 0x3) {
+        case 1:                                        // MOV SImm,[d]: pending increments first
+          dsp_fast_apply_inc(d, inc); inc = 0;
+          dsp_fast_d1write(d, (instruction >> 8) & 0xF, (u32)(signed char)(instruction & 0xFF), &inc);
+          break;
+        case 3:
+          dsp_fast_d1write(d, (instruction >> 8) & 0xF, dsp_fast_read(d, instruction & 0xF, &inc), &inc);
+          break;
+        default: break;
+      }
+      break;
+    }
+    case 0x02:                                         // Load Immediate Commands
+      if ((instruction >> 25) & 1) {
+        int known;
+        if (dsp_fast_cond(d, (instruction >> 19) & 0x3F, &known) && known)
+          dsp_fast_immwrite(d, (instruction >> 26) & 0xF,
+            (instruction & 0x7FFFF) | ((instruction & 0x40000) ? 0xFFF80000 : 0x00000000), &inc);
+      } else {
+        int value = (instruction & 0x1FFFFFF);
+        if (value & 0x1000000) value |= 0xfe000000;
+        dsp_fast_immwrite(d, (instruction >> 26) & 0xF, value, &inc);
+      }
+      break;
+    case 0x03:
+      switch ((instruction >> 28) & 0xF) {
+        case 0x0C: ScuDspDmaCommand(instruction); break;
+        case 0x0D:                                     // Jump Commands
+          if (d->jmpaddr != 0xffffffff) break;
+          {
+            const unsigned c = (instruction >> 19) & 0x7F;
+            int known = 1, take = c == 0x00;
+            if (!take) { take = dsp_fast_cond(d, c & 0x3F, &known) && (c & 0x40); }
+            if (c != 0x00 && !(c & 0x40)) take = 0;    // reference: only 0x00 and 0x41..0x68 cases
+            if (take && known) { d->jmpaddr = instruction & 0xFF; d->delayed = 0; }
+          }
+          break;
+        case 0x0E:                                     // Loop bottom Commands
+          if (d->LOP != 0) {
+            d->jmpaddr = (instruction & 0x8000000) ? d->PC : d->TOP;
+            d->delayed = 0;
+            d->LOP--;
+          }
+          break;
+        case 0x0F:                                     // End Commands
+          d->ProgControlPort.part.EX = 0;
+          if (instruction & 0x8000000) {
+            d->ProgControlPort.part.E = 1;
+            ScuSendDSPEnd();
+          }
+          d->ProgControlPort.part.P = d->PC + 1;
+          dsp_counter = 1;
+          break;
+        default: break;
+      }
+      break;
+    default: break;
+    }
+    dsp_fast_apply_inc(d, inc);
+    d->PC++;
+    if (d->jmpaddr != 0xFFFFFFFF) {
+      if (d->delayed) {
+        d->PC = (unsigned char)d->jmpaddr;
+        d->jmpaddr = 0xFFFFFFFF;
+        dsp_counter += 1;                              // hold clock
+      } else
+        d->delayed = 1;
+    }
+    dsp_counter--;
+#ifdef VITA_DIAG_TIMERS
+    ++vita_diag_dsp_insns;
+#endif
+  }
+  return dsp_counter;
+}
+static void ScuDspRunFast(s32 dsp_counter) {
+  scudspregs_struct *const d = ScuDsp;
+  while (dsp_counter > 0) dsp_counter = dsp_fast_step(d, dsp_counter);
+}
+#endif
+#if defined(VITA_SCU_DSP_JIT) && defined(VITA_SCU_DSP_FAST) && (defined(__arm__) || defined(VITA))
+#include "scu_dsp_jit.h"
+#define SCU_DSP_PROG_WRITTEN() (++scu_dsp_prog_gen)
+#else
+#define SCU_DSP_PROG_WRITTEN() ((void)0)
+#endif
+
 #include "../vita/telemetry.h"
 void ScuExec(u32 timing) {
    VT_SCOPE(VT_SCU);
@@ -1382,6 +1625,16 @@ void ScuExec(u32 timing) {
      }
 #endif
      s32 dsp_counter = (s32)timing;
+#ifdef VITA_SCU_DSP_FAST
+     if (ScuBP->numcodebreakpoints == 0) {
+#if defined(VITA_SCU_DSP_JIT) && (defined(__arm__) || defined(VITA))
+       ScuDspRunJit(dsp_counter);
+#else
+       ScuDspRunFast(dsp_counter);
+#endif
+       dsp_counter = 0;
+     }
+#endif
       while (dsp_counter > 0) {
          u32 instruction;
 
@@ -1575,48 +1828,7 @@ void ScuExec(u32 timing) {
                switch((instruction >> 28) & 0xF) {
                  case 0x0C: // DMA Commands
                  {
-                   // Finish Previous DMA operation
-                   if (ScuDsp->dsp_dma_wait > 0) {
-                     ScuDsp->dsp_dma_wait = 0;
-                     step_dsp_dma(ScuDsp);
-                   }
-
-                   ScuDsp->dsp_dma_instruction = instruction;
-                   ScuDsp->ProgControlPort.part.T0 = 1;
-
-                   int Counter = 0;
-                   if ( ((instruction >> 10) & 0x1F) == 0x00 || 
-                        ((instruction >> 10) & 0x1F) == 0x04  || 
-                        ((instruction >> 11) & 0x0F) == 0x08 || 
-                        ((instruction >> 10) & 0x1F) == 0x14 )
-                   {
-                      Counter = instruction & 0xFF;
-                   }
-                   else if (
-                     ((instruction >> 11) & 0x0F) == 0x04 || 
-                     ((instruction >> 10) & 0x1F) == 0x0C || 
-                     ((instruction >> 11) & 0x0F) == 0x0C || 
-                     ((instruction >> 10) & 0x1F) == 0x1C)
-                   {
-                     switch ((instruction & 0x7))
-                     {
-                     case 0x00: Counter = ScuDsp->MD[0][ScuDsp->CT[0] & 0x3F]; break;
-                     case 0x01: Counter = ScuDsp->MD[1][ScuDsp->CT[1] & 0x3F]; break;
-                     case 0x02: Counter = ScuDsp->MD[2][ScuDsp->CT[2] & 0x3F]; break;
-                     case 0x03: Counter = ScuDsp->MD[3][ScuDsp->CT[3] & 0x3F]; break;
-                     case 0x04: Counter = ScuDsp->MD[0][ScuDsp->CT[0] & 0x3F]; ScuDsp->CT[0]++; ScuDsp->CT[0] &= 0x3F; break;
-                     case 0x05: Counter = ScuDsp->MD[1][ScuDsp->CT[1] & 0x3F]; ScuDsp->CT[1]++; ScuDsp->CT[1] &= 0x3F; break;
-                     case 0x06: Counter = ScuDsp->MD[2][ScuDsp->CT[2] & 0x3F]; ScuDsp->CT[2]++; ScuDsp->CT[2] &= 0x3F; break;
-                     case 0x07: Counter = ScuDsp->MD[3][ScuDsp->CT[3] & 0x3F]; ScuDsp->CT[3]++; ScuDsp->CT[3] &= 0x3F; break;
-                     }
-
-                   }
-
-                   ScuDsp->dsp_dma_size = Counter;
-                   ScuDsp->dsp_dma_wait = 2; // DMA operation will be start when this count is zero
-                   ScuDsp->WA0M = ScuDsp->WA0;
-                   ScuDsp->RA0M = ScuDsp->RA0;
-                   //LOG("Start DSP DMA RA=%08X WA=%08X inst=%08X count=%d wait = %d", ScuDsp->RA0M, ScuDsp->WA0M, ScuDsp->dsp_dma_instruction, Counter, ScuDsp->dsp_dma_wait );
+                   ScuDspDmaCommand(instruction);
                    break;
                   }
                   case 0x0D: // Jump Commands
@@ -2394,7 +2606,7 @@ void ScuDspGetRegisters(scudspregs_struct *regs) {
 
 void ScuDspSetRegisters(scudspregs_struct *regs) {
    if (regs != NULL) {
-      memcpy(ScuDsp->ProgramRam, regs->ProgramRam, sizeof(u32) * 256);
+      memcpy(ScuDsp->ProgramRam, regs->ProgramRam, sizeof(u32) * 256); SCU_DSP_PROG_BUMP();
       memcpy(ScuDsp->MD, regs->MD, sizeof(u32) * 64 * 4);
 
       ScuDsp->ProgControlPort.all = regs->ProgControlPort.all;
@@ -2756,7 +2968,7 @@ void FASTCALL ScuWriteLong(u32 addr, u32 val) {
          break;
       case 0x84: // DSP Program Ram Data Port
          //LOG("scu: wrote %08X to DSP Program ram offset %02X", val, ScuDsp->PC);
-         ScuDsp->ProgramRam[ScuDsp->PC] = val;
+         ScuDsp->ProgramRam[ScuDsp->PC] = val; SCU_DSP_PROG_BUMP();
          ScuDsp->PC++;
          ScuDsp->ProgControlPort.part.P = ScuDsp->PC;
          break;

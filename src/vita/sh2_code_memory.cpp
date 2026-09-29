@@ -182,3 +182,21 @@ extern "C" int VitaSh2CodeSmokeTest() {
     return -1;
   }
 }
+
+#ifdef VITA_SCU_DSP_JIT
+/* SCU DSP translator (scu_dsp_jit.h): the reserved 68K partition, published
+ * with the same VM-domain sequence, on the emulation thread only. */
+static VitaM68kCodeWrite *dsp_code_write;
+extern "C" unsigned char *VitaDspCodeArena(std::size_t *capacity) {
+  *capacity = vitacode::Layout::M68k;
+  return VitaM68kCodeArena();
+}
+extern "C" void VitaDspCodeWriteBegin(void *p, std::size_t n) {
+  dsp_code_write = new VitaM68kCodeWrite(p, n);
+}
+extern "C" void VitaDspCodeWriteEnd(void *p, std::size_t n) {
+  (void)p; (void)n;
+  delete dsp_code_write;
+  dsp_code_write = nullptr;
+}
+#endif

@@ -624,6 +624,9 @@ int main(void) {
 #endif
 #ifdef VITA_SH2_DYNAREC
   if (VitaSh2CompilerTest() != 0) { YabauseDeInit(); goto done; }
+#ifdef VITA_SCU_DSP_JIT
+  { extern int ScuDspJitSelfTest(void); if (ScuDspJitSelfTest() != 0) { YabauseDeInit(); goto done; } }
+#endif
 #endif
   if (VitaC68kReadTest() != 0) { YabauseDeInit(); goto done; }
   YuiMsg("init_complete");
