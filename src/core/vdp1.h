@@ -132,6 +132,9 @@ u32 FASTCALL	Vdp1RamReadLong(u32);
 void FASTCALL	Vdp1RamWriteByte(u32, u8);
 void FASTCALL	Vdp1RamWriteWord(u32, u16);
 void FASTCALL	Vdp1RamWriteLong(u32, u32);
+#ifdef VITA_SCU_DMA_FAST_VRAM
+void Vdp1RamWriteWordSpan(u32 addr, u32 stride, const u16 *vals, u32 n);
+#endif
 u8 FASTCALL Vdp1FrameBufferReadByte(u32);
 u16 FASTCALL Vdp1FrameBufferReadWord(u32);
 u32 FASTCALL Vdp1FrameBufferReadLong(u32);

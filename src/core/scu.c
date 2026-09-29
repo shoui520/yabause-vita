@@ -56,6 +56,10 @@ u32 scu_dsp_prog_gen;                 /* JIT invalidation: every program RAM wri
 #include "memory.h"
 #include "sh2core.h"
 #include "yabause.h"
+#ifdef VITA_SCU_DMA_FAST_VRAM
+#include "vdp1.h"
+#include "vdp2.h"
+#endif
 #include <inttypes.h>
 
 #ifdef OPTIMIZED_DMA
@@ -705,6 +709,24 @@ void dsp_dma01(scudspregs_struct *sc, u32 inst)
     }
   }
   else{
+#ifdef VITA_SCU_DMA_FAST_VRAM
+    /* Whole span in high work RAM (cache or cache-through area): the reads
+     * HighWramMemoryReadLong would make (no cycle pointer). */
+    if (imm) {
+      const u32 a0 = sc->RA0M << 2, a1 = (sc->RA0M + (imm - 1) * (add >> 2)) << 2;
+      if ((a0 >> 29) <= 1 && (a0 >> 29) == (a1 >> 29) && a1 >= a0 &&
+          ((a0 >> 16) & 0xFFF) >= 0x600 && ((a1 >> 16) & 0xFFF) <= 0x610) {
+        for (i = 0; i < imm ; i++)
+        {
+          sc->MD[sel][sc->CT[sel] & 0x3F] = T2ReadLong(HighWram, (sc->RA0M << 2) & 0xFFFFF);
+          sc->CT[sel]++;
+          sc->CT[sel] &= 0x3F;
+          sc->RA0M += (add >>2);
+        }
+        imm = 0;
+      }
+    }
+#endif
     for (i = 0; i < imm ; i++)
     {
       sc->MD[sel][sc->CT[sel] & 0x3F] = MappedMemoryReadLong((sc->RA0M << 2), NULL);
@@ -749,6 +771,43 @@ void dsp_dma_write_d0bus(scudspregs_struct *sc, int sel, int add, int count){
 
       if (add == 0) add = 1;
 
+#ifdef VITA_SCU_DMA_FAST_VRAM
+      /* Whole span in VDP1 or VDP2 VRAM: the handler MappedMemoryWriteWord
+       * picks for these pages (Adr has no cache bits; no cycle pointer). */
+      if (count > 0) {
+        const u32 last = Adr + (u32)(count - 1) * (u32)(add << 2) + 2;
+        const u32 p0 = Adr >> 16, p1 = last >> 16;
+        void (FASTCALL *write)(u32, u16) = (p0 >= 0x5C0 && p1 <= 0x5C7) ? Vdp1RamWriteWord :
+                                           (p0 >= 0x5E0 && p1 <= 0x5EF) ? Vdp2RamWriteWord : NULL;
+        if (write == Vdp2RamWriteWord && add == 1 && count <= 256) {
+          u16 buf[512];
+          for (i = 0; i < count; i++)
+          {
+            u32 Val = sc->MD[sel][sc->CT[sel] & 0x3F];
+            buf[2 * i] = (u16)(Val>>16);
+            buf[2 * i + 1] = (u16)Val;
+            sc->CT[sel]++;
+            sc->CT[sel] &= 0x3F;
+          }
+          Vdp2RamWriteWordSpan(Adr, 2, buf, 2 * (u32)count);
+          sc->WA0M = sc->WA0M + ((add*count));
+          goto d0bus_done;
+        }
+        if (write && last > Adr) {
+          for (i = 0; i < count; i++)
+          {
+            u32 Val = sc->MD[sel][sc->CT[sel] & 0x3F];
+            write(Adr, (u16)(Val>>16));
+            write(Adr+2, (u16)Val);
+            sc->CT[sel]++;
+            sc->CT[sel] &= 0x3F;
+            Adr += (add << 2);
+          }
+          sc->WA0M = sc->WA0M + ((add*count));
+          goto d0bus_done;
+        }
+      }
+#endif
       for (i = 0; i < count; i++)
       { 
         u32 Val = sc->MD[sel][sc->CT[sel] & 0x3F];
@@ -797,6 +856,9 @@ void dsp_dma_write_d0bus(scudspregs_struct *sc, int sel, int add, int count){
 
     }
 
+#ifdef VITA_SCU_DMA_FAST_VRAM
+d0bus_done:
+#endif
     sc->WA0 = sc->WA0M;
     sc->ProgControlPort.part.T0 = 0;
 
@@ -1196,6 +1258,50 @@ void SucDmaExec(scudmainfo_struct * dma, int * time ) {
       // Copy in 16-bit units, avoiding misaligned accesses.
       u32 counter = 0;
       u32 start = dma->WriteAddress;
+#ifdef VITA_SCU_DMA_FAST_VRAM
+      /* High work RAM -> VDP1/VDP2 VRAM: the words the loop below would move
+       * (until the time runs out or TransferNumber drops to <= 0), read
+       * straight from HighWram (HighWramMemoryReadWord) and written through
+       * the same RAM handler MappedMemoryWriteWord would pick; the memory
+       * cycle counts computed there are never used here. */
+      if (*time > 0 && dma->TransferNumber > 0 && dma->WriteAdd <= 0x100) {
+        const u32 n = (u32)*time < ((u32)dma->TransferNumber + 1) / 2 ? (u32)*time : ((u32)dma->TransferNumber + 1) / 2;
+        const u32 ra = dma->ReadAddress & 0x0FFFFFFF, ra_end = ra + 2 * (n - 1);
+        const u32 wa = dma->WriteAddress, wa_end = wa + (n - 1) * dma->WriteAdd;
+        const u32 wpage = (wa >> 16) & 0xFFF, wpage_end = (wa_end >> 16) & 0xFFF;
+        void (FASTCALL *write)(u32, u16) =
+          (wpage >= 0x5C0 && wpage_end <= 0x5C7) ? Vdp1RamWriteWord :
+          (wpage >= 0x5E0 && wpage_end <= 0x5EF) ? Vdp2RamWriteWord : NULL;
+        if (write && (wa >> 29) <= 1 && (wa & 0xF0000000u) == (wa_end & 0xF0000000u) && wa_end >= wa &&
+            (ra >> 16) >= 0x600 && (ra_end >> 16) <= 0x610 && ra_end >= ra) {
+          u32 r = ra, w = wa;
+          {
+            void (*span)(u32, u32, const u16 *, u32) =
+              write == Vdp2RamWriteWord ? Vdp2RamWriteWordSpan : Vdp1RamWriteWordSpan;
+            u16 buf[256];
+            if ((ra & 1) == 0 && (ra & 0xFFFFF) + 2 * n <= 0x100000) {
+              /* No wrap: the words are contiguous in HighWram already. */
+              span(w, dma->WriteAdd, (const u16 *)(HighWram + (ra & 0xFFFFF)), n);
+              w += n * dma->WriteAdd;
+              r += 2 * n;
+            } else
+            for (u32 k = 0; k < n; ) {
+              const u32 m = n - k < 256 ? n - k : 256;
+              for (u32 j = 0; j < m; ++j, r += 2) buf[j] = T2ReadWord(HighWram, r & 0xFFFFF);
+              span(w, dma->WriteAdd, buf, m);
+              w += m * dma->WriteAdd;
+              k += m;
+            }
+          }
+          *time -= (int)n;
+          dma->ReadAddress += 2 * n;
+          dma->WriteAddress = w;
+          dma->TransferNumber -= (s32)(2 * n);
+          SH2WriteNotify(start, dma->WriteAddress - start);
+          return;
+        }
+      }
+#endif
       while (*time > 0) {
         *time -= 1;
         u16 tmp = MappedMemoryReadWord((dma->ReadAddress & 0x0FFFFFFF), &cycle);
@@ -1212,6 +1318,37 @@ void SucDmaExec(scudmainfo_struct * dma, int * time ) {
     }
     else if (((dma->ReadAddress & 0x1FFFFFFF) >= 0x5A00000 && (dma->ReadAddress & 0x1FFFFFFF) < 0x5FF0000)) {
       u32 start = dma->WriteAddress;
+#ifdef VITA_SCU_DMA_FAST_FB
+      /* VDP1 framebuffer -> high work RAM (Burning Rangers copies rendered
+       * rows this way): the words the loop below would move, each read
+       * through the framebuffer's handler (Vdp1FrameBufferReadWord, or the
+       * render proxy's identical answer) and stored as HighWramMemoryWriteWord
+       * would; its memory cycle counts are never used. */
+      if (*time > 0 && dma->TransferNumber > 0) {
+        const u32 n = (u32)*time < ((u32)dma->TransferNumber + 1) / 2 ? (u32)*time : ((u32)dma->TransferNumber + 1) / 2;
+        const u32 ra = dma->ReadAddress & 0x0FFFFFFF, ra_end = ra + 2 * (n - 1);
+        const u32 step = dma->WriteAdd >> 1, wa = dma->WriteAddress, wa_end = wa + (n - 1) * step;
+        if ((ra >> 19) == (0x05C80000 >> 19) && (ra_end >> 19) == (0x05C80000 >> 19) && ra_end >= ra &&
+            (wa >> 29) <= 1 && ((wa >> 16) & 0xFFF) >= 0x600 && ((wa_end >> 16) & 0xFFF) <= 0x610 &&
+            wa_end >= wa && (wa & 0xF0000000u) == (wa_end & 0xF0000000u)) {
+          u32 r = ra, w = wa;
+          for (u32 k = 0; k < n; ++k, r += 2, w += step) {
+            u16 v;
+              v = Vdp1FrameBufferReadWord(r);
+            T2WriteWord(HighWram, w & 0xFFFFF, v);
+          }
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+          { extern u32 g_wram_epoch; g_wram_epoch += n; }
+#endif
+          *time -= (int)n;
+          dma->ReadAddress += 2 * n;
+          dma->WriteAddress = w;
+          dma->TransferNumber -= (s32)(2 * n);
+          SH2WriteNotify(start, dma->WriteAddress - start);
+          return;
+        }
+      }
+#endif
       while ( *time > 0) {
         *time -= 1;
         u16 tmp = MappedMemoryReadWord((dma->ReadAddress & 0x0FFFFFFF), &cycle);
