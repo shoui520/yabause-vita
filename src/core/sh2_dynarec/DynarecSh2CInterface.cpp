@@ -407,6 +407,19 @@ void SH2DynShowSttaics(SH2_struct * master, SH2_struct * slave ){
 // MemoyAcess from DynarecCPU
 //********************************************************************
 
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+extern "C" { extern u32 g_wram_epoch; extern u32 g_mem_io_reads; extern u32 g_mem_io_last; extern u32 g_mem_io_ftcsr; extern u32 g_mem_io_edsr; }
+#define VITA_WRAM_WRITTEN() (++g_wram_epoch)
+#ifdef A9_PMU_REGIONS
+static void A9IoCount(u32 a);
+#define VITA_IO_READ(a) (A9IoCount(a), g_mem_io_last = (a), ++g_mem_io_reads)
+#else
+#define VITA_IO_READ(a) (g_mem_io_last = (a), ++g_mem_io_reads)
+#endif
+#else
+#define VITA_WRAM_WRITTEN() ((void)0)
+#define VITA_IO_READ(a) ((void)0)
+#endif
 #if defined(VITA_STACK_PROFILE) || defined(VITA_SH2_MEM_PROFILE)
 extern "C" void YuiMsg(const char *, ...);
 // Profile only: SH-2 memory helper calls by 1 MiB region ((addr >> 20) & 0x3FF;
@@ -508,7 +521,7 @@ WRITE_LINKAGE void WRITE_NAME(Byte)(u32 addr , u8 data )
   // Low Memory
   case 0x00200000:
     block->InvalidateLow(addr, 1);
-    T2WriteByte(LowWram, addr & 0xFFFFF, data);
+    T2WriteByte(LowWram, addr & 0xFFFFF, data); VITA_WRAM_WRITTEN();
     if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 7;
     dynaFree();
     return;
@@ -520,7 +533,7 @@ WRITE_LINKAGE void WRITE_NAME(Byte)(u32 addr , u8 data )
 #else
     block->SetHigh((addr&0x000FFFFF)>>1, NULL);
 #endif
-    T2WriteByte(HighWram, addr & 0xFFFFF, data);
+    T2WriteByte(HighWram, addr & 0xFFFFF, data); VITA_WRAM_WRITTEN();
     if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
     dynaFree();
     return;
@@ -561,7 +574,7 @@ WRITE_LINKAGE void WRITE_NAME(Word)(u32 addr, u16 data )
   // Low Memory
    case 0x00200000:
     block->InvalidateLow(addr, 2);
-    T2WriteWord(LowWram, addr & 0xFFFFF, data);
+    T2WriteWord(LowWram, addr & 0xFFFFF, data); VITA_WRAM_WRITTEN();
     if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 7;
     dynaFree();
     return;
@@ -573,7 +586,7 @@ WRITE_LINKAGE void WRITE_NAME(Word)(u32 addr, u16 data )
 #else
      block->SetHigh((addr & 0x000FFFFF) >> 1, NULL);
 #endif
-    T2WriteWord(HighWram, addr & 0xFFFFF, data);
+    T2WriteWord(HighWram, addr & 0xFFFFF, data); VITA_WRAM_WRITTEN();
     if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
     dynaFree();
     return;
@@ -614,7 +627,7 @@ WRITE_LINKAGE void WRITE_NAME(Long)(u32 addr , u32 data )
     // Low Memory
   case 0x00200000:
     block->InvalidateLow(addr, 4);
-    T2WriteLong(LowWram, addr & 0xFFFFF, data);
+    T2WriteLong(LowWram, addr & 0xFFFFF, data); VITA_WRAM_WRITTEN();
     if(addr&0x20000000) DynarecSh2::CurrentContext->memcycle_ += 7;
     dynaFree();
     return;
@@ -628,7 +641,7 @@ WRITE_LINKAGE void WRITE_NAME(Long)(u32 addr , u32 data )
     block->SetHigh((addr & 0x000FFFFF) >> 1, NULL);
     block->SetHigh(((addr & 0x000FFFFF) >> 1) + 1, NULL);
 #endif
-    T2WriteLong(HighWram, addr & 0xFFFFF, data);
+    T2WriteLong(HighWram, addr & 0xFFFFF, data); VITA_WRAM_WRITTEN();
     if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
     dynaFree();
     return;
@@ -674,7 +687,7 @@ WRITE_LINKAGE void WRITE_NAME(Long)(u32 addr , u32 data )
     if ((addr & 0xdff00000u)==0x06000000u && block && \
         block->LookupParentTable[adress_mask(addr)].size()==0 && \
         ((Width)!=4 || block->LookupParentTable[adress_mask(addr+2)].size()==0)) { \
-      T2Write##Name(HighWram,addr&0xfffff,data); \
+      T2Write##Name(HighWram,addr&0xfffff,data); VITA_WRAM_WRITTEN(); \
       if(addr&0x20000000u) DynarecSh2::CurrentContext->memcycle_+=2; \
       return; \
     } \
@@ -734,6 +747,10 @@ u8 memGetByte(u32 addr)
     return val;
     break;
   }
+  VITA_IO_READ(addr);
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+  if (addr == 0xFFFFFE11u) ++g_mem_io_ftcsr;   // FTCSR: pure on-chip read (spin forward)
+#endif
 #ifdef VITA_SH2_DATA_ARRAY_DIRECT
   if ((addr >> 29) == 6) return T2ReadByte(CurrentSH2->DataArray, addr & 0xFFF);
 #endif
@@ -821,6 +838,10 @@ u32 memGetLong(u32 addr)
     return val;
     break;
   }
+  VITA_IO_READ(addr);
+#ifdef VITA_SH2_DATA_ARRAY_DIRECT
+  if ((addr >> 29) == 6) return T2ReadLong(CurrentSH2->DataArray, addr & 0xFFF);
+#endif
 #ifdef VITA_SH2_ONCHIP_DIRECT
   // On-chip modules: MappedMemoryReadLong's handler, with its 0 memory cycles.
   if (addr >= 0xFFFFFE00u) return OnchipReadLong(addr & 0x1FF);

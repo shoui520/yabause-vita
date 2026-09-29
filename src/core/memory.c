@@ -63,6 +63,14 @@ extern volatile u32 vt_mem_key;
 #define VT_MEM_KEY(op) ((void)0)
 #define VT_MEM_SCOPE() ((void)0)
 #endif
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+/* Every work-RAM write outside SH-2 native code bumps this (see DynarecSh2
+ * idle-slice skip); native region stores are covered by that skip's rules. */
+extern u32 g_wram_epoch;
+#define VITA_WRAM_WRITTEN() (++g_wram_epoch)
+#else
+#define VITA_WRAM_WRITTEN() ((void)0)
+#endif
 #include "coffelf.h"
 #include "cs0.h"
 #include "cs1.h"
@@ -395,6 +403,7 @@ static u32 FASTCALL HighWramMemoryReadLong(u32 addr)
 
 static void FASTCALL HighWramMemoryWriteByte(u32 addr, u8 val)
 {
+   VITA_WRAM_WRITTEN();
    T2WriteByte(HighWram, addr & 0xFFFFF, val);
 }
 
@@ -402,6 +411,7 @@ static void FASTCALL HighWramMemoryWriteByte(u32 addr, u8 val)
 
 static void FASTCALL HighWramMemoryWriteWord(u32 addr, u16 val)
 {
+   VITA_WRAM_WRITTEN();
    T2WriteWord(HighWram, addr & 0xFFFFF, val);
 }
 
@@ -409,6 +419,7 @@ static void FASTCALL HighWramMemoryWriteWord(u32 addr, u16 val)
 
 static void FASTCALL HighWramMemoryWriteLong(u32 addr, u32 val)
 {
+   VITA_WRAM_WRITTEN();
    T2WriteLong(HighWram, addr & 0xFFFFF, val);
 }
 
@@ -437,6 +448,7 @@ static u32 FASTCALL LowWramMemoryReadLong(u32 addr)
 
 static void FASTCALL LowWramMemoryWriteByte(u32 addr, u8 val)
 {
+   VITA_WRAM_WRITTEN();
    T2WriteByte(LowWram, addr & 0xFFFFF, val);
 }
 
@@ -444,6 +456,7 @@ static void FASTCALL LowWramMemoryWriteByte(u32 addr, u8 val)
 
 static void FASTCALL LowWramMemoryWriteWord(u32 addr, u16 val)
 {
+   VITA_WRAM_WRITTEN();
    T2WriteWord(LowWram, addr & 0xFFFFF, val);
 }
 
@@ -451,6 +464,7 @@ static void FASTCALL LowWramMemoryWriteWord(u32 addr, u16 val)
 
 static void FASTCALL LowWramMemoryWriteLong(u32 addr, u32 val)
 {
+   VITA_WRAM_WRITTEN();
    T2WriteLong(LowWram, addr & 0xFFFFF, val);
 }
 
@@ -1855,6 +1869,7 @@ int YabLoadStateStream(FILE *fp)
    fseek(fp, 0x10000, SEEK_CUR ); // skip this data
    yread(&check, (void *)HighWram, 0x100000, 1, fp);
    yread(&check, (void *)LowWram, 0x100000, 1, fp);
+   VITA_WRAM_WRITTEN();
 
    yread(&check, (void *)&yabsys.DecilineCount, sizeof(int), 1, fp);
    yread(&check, (void *)&yabsys.LineCount, sizeof(int), 1, fp);

@@ -531,6 +531,108 @@ public:
   u32 addcycle_ = 0;
   u32 &memcycle_;               // m_pDynaSh2->memcycle
   bool counted_slice_active_ = false;
+  // Spin fast-forward (VITA_SH2_SPIN_FORWARD); unconditional for one layout.
+  // Recorded architectural state (IdleRegs order) and slice count after each
+  // block of the current recording; ring of recent slice-end states.
+  // Blocks one recording may hold: a delay loop of 64 DT passes inside a
+  // polling loop is ~70 blocks per period.
+  enum { kSpinRecMax = 96 };
+  u32 spin_regs_[kSpinRecMax + 1][23];
+  u32 spin_count_[kSpinRecMax + 1];
+  // Per recorded state: hash of all 23 words, and of the words an affine
+  // period must leave unchanged (R0, SR..PC); cheap rejects for the searches.
+  u32 spin_hash_[kSpinRecMax + 1][2];
+  void SpinHash(unsigned k) {
+    const u32 *r = spin_regs_[k];
+    u32 h = r[0];
+    for (int w = 15; w < 23; ++w) h = (h << 5 | h >> 27) ^ r[w];
+    u32 f = h;
+    for (int w = 1; w < 15; ++w) f = (f << 5 | f >> 27) ^ r[w];
+    spin_hash_[k][0] = f; spin_hash_[k][1] = h;
+  }
+  u32 spin_end_pc_[4] = {}, spin_end_hash_[4] = {};
+  unsigned spin_end_next_ = 0;
+  bool spin_candidate_ = false;
+  unsigned spin_cooldown_ = 0;
+  unsigned spin_fails_ = 0;   // consecutive recordings without a forward (backoff)
+  // A recording still open at a slice end (VITA_SH2_SPIN_CARRY): its length,
+  // the offset that makes the next slice's counts continue spin_count_, and
+  // what must be unchanged for the next slice to continue it.
+  bool spin_carry_ = false, spin_carry_rs_ = false;  // rs: spin_read_* holds the recorded blocks' read set
+  unsigned spin_carry_n_ = 0, spin_carry_slices_ = 0;
+  u32 spin_carry_wram_ = 0, spin_carry_native_ = 0, spin_carry_pending_ = 0;
+  // Proven cycle (positions j..n of spin_regs_/spin_count_) usable by later
+  // slices while nothing can have changed memory or the pending interrupt.
+  // hint: recorded position where the last forward ended; div_*: cached
+  // (remaining - 1) -> whole-cycle cycles for the last remaining count.
+  // ftcsr_dep: the recorded cycle read this CPU's FTCSR, which then must
+  // still hold ftcsr_val for the proof to apply in a later slice.
+  struct { bool valid; unsigned j, n; u32 pending, epoch, native_epoch; unsigned hint; u32 div_rem, div_whole;
+           bool ftcsr_dep; u32 ftcsr_val; u32 pc_lo, pc_hi; } spin_proof_ = {};
+  // pc_lo..pc_hi: PC range of the proof's recorded states (a cheap miss test
+  // for slices that start elsewhere).
+  void SpinProofRange() {
+    u32 lo = ~0u, hi = 0;
+    for (unsigned p = spin_proof_.j; p <= spin_proof_.n; ++p) { const u32 pc = spin_regs_[p][22]; if (pc < lo) lo = pc; if (pc > hi) hi = pc; }
+    spin_proof_.pc_lo = lo; spin_proof_.pc_hi = hi;
+  }
+  // Read set of a proven cycle (VITA_SH2_SPIN_READSET): when every memory read
+  // of the cycle's blocks has a statically known address (PC-relative
+  // literals, register-indirect loads from the recorded entry state) and
+  // lands in work RAM or is this CPU's FTCSR, the proof depends on memory only
+  // through those words and the blocks' own code: the aligned host words are
+  // kept and compared instead of the global write epochs.
+  enum { kSpinReadMax = 48 };
+  bool spin_read_self_ = false;
+  unsigned spin_read_n_ = 0;
+  const u32 *spin_read_ptr_[kSpinReadMax] = {};
+  u32 spin_read_val_[kSpinReadMax] = {};
+  bool SpinReadSetBuild(unsigned j, unsigned n);
+  // Affine cycle (VITA_SH2_SPIN_AFFINE): recorded states j..n-1 are period 0,
+  // state n = state j + delta, where delta is nonzero only for general
+  // registers the cycle touches solely through ADD #imm to themselves (so
+  // nothing in the cycle depends on them). After m periods the state at
+  // position q is spin_regs_[q] + m * delta.
+  bool spin_affine_ = false;
+  u32 spin_delta_[16] = {};
+  u32 spin_div_periods_ = 0;
+  int SpinAffineDetect(unsigned spin_n);
+  bool SpinAffineIndependent(unsigned j, unsigned n) const;
+  bool last_selfloop_ = false;
+  bool last_resident_ = false;  // the slice ended in a resident loop at its deadline
+  bool SpinReadSetSame() const {
+    for (unsigned i = 0; i < spin_read_n_; ++i) if (*spin_read_ptr_[i] != spin_read_val_[i]) return false;
+    return true;
+  }
+  // Unconditional so every translation unit agrees on the object layout.
+  // valid: the last executed slice was one idle-loop run that ended in the
+  // same complete register state as the idle run before it (a fixed point),
+  // and nothing has changed the registers since (every executed slice
+  // re-derives this; external setters and reset clear it).
+  // native_epoch/io_*: see the SPIN_FORWARD generalization in ExecuteCountLean.
+  // affine (VITA_SH2_IDLE_AFFINE): the two runs ended in states differing
+  // by delta in R1..R14 only, registers the idle block uses only as ADD
+  // #imm to themselves; a skip adds delta (to the registers and to regs).
+  // mc: the idle block's memory cycles per run (the slice ends target + mc).
+  struct { bool valid, cand; u32 pc, epoch; u32 regs[23]; u32 native_epoch, io_addr, io_val;
+           bool affine, readset; u32 delta[16], mc; } idle_ = {};
+  inline void InvalidateIdle() { idle_.valid = idle_.cand = false; }
+  // readset (VITA_SH2_IDLE_AFFINE): the words the idle block can read (code,
+  // literals, known-address loads), valid instead of the global write epochs.
+  enum { kIdleReadMax = 16 };
+  const u32 *idle_read_ptr_[kIdleReadMax] = {};
+  u32 idle_read_val_[kIdleReadMax] = {};
+  unsigned idle_read_n_ = 0;
+  void IdleReadSetBuild(const u32 *regs);
+  bool IdleReadSetSame() const {
+    for (unsigned i = 0; i < idle_read_n_; ++i) if (*idle_read_ptr_[i] != idle_read_val_[i]) return false;
+    return true;
+  }
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+#define VITA_IDLE_INVALIDATE() InvalidateIdle()
+#else
+#define VITA_IDLE_INVALIDATE() ((void)0)
+#endif
   void ShowStatics();
   void ShowCompileInfo();
   void ResetCompileInfo();

@@ -765,6 +765,9 @@ void dsp_dma_write_d0bus(scudspregs_struct *sc, int sel, int add, int count){
           u32 Val = sc->MD[sel][sc->CT[sel] & 0x3F];
           Adr = (sc->WA0M << 2);
           T2WriteLong(HighWram, Adr & 0xFFFFC, Val);
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+          { extern u32 g_wram_epoch; ++g_wram_epoch; }
+#endif
           sc->CT[sel]++;
           sc->CT[sel] &= 0x3F;
           sc->WA0M += 1;
@@ -777,6 +780,9 @@ void dsp_dma_write_d0bus(scudspregs_struct *sc, int sel, int add, int count){
           u32 Val = sc->MD[sel][sc->CT[sel] & 0x3F];
           Adr = (sc->WA0M << 2);
           T2WriteLong(HighWram, Adr & 0xFFFFC, Val);
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+          { extern u32 g_wram_epoch; ++g_wram_epoch; }
+#endif
           sc->CT[sel]++;
           sc->CT[sel] &= 0x3F;
           sc->WA0M += (add >> 1);

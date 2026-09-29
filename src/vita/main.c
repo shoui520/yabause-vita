@@ -694,6 +694,9 @@ int main(void) {
       VitaDiagTimersReport();
 #endif
 #endif
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+      { extern void VitaSh2IdleReport(void); VitaSh2IdleReport(); }
+#endif
 #ifdef VITA_STACK_PROFILE
       { extern void ScspAccessReport(void); ScspAccessReport(); }
       { extern void VitaSh2MemReport(void); VitaSh2MemReport(); }
