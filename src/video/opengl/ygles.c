@@ -20,6 +20,7 @@
 
 #include <stdlib.h>
 #include "../../vita/telemetry.h"
+#include "../../vita/diag_timers.h"
 #include <math.h>
 #include "ygl.h"
 #include "yui.h"
@@ -505,7 +506,7 @@ int YglCalcTextureQ(
  * vitaGL ends/restarts scenes before waiting, adding traffic and losing overlap.
  * Empty boundaries can cost milliseconds; already-completed work is not timed.
  * NOT pure GPU execution times, utilization, or a normal FPS benchmark. */
-enum { VITA_GPU_STAGES = 6 };
+enum { VITA_GPU_STAGES = 8 };
 static const char *const vita_gpu_stage_names[VITA_GPU_STAGES] =
   {"pre_rot", "rotation", "vdp1", "compose", "blit", "swap"};
 static uint64_t vita_gpu_stage_us[VITA_GPU_STAGES];
@@ -515,7 +516,7 @@ void YglVitaGpuStage(int stage) {
   glFinish();
   vita_gpu_stage_us[stage] += sceKernelGetProcessTimeWide() - t0;
   ++vita_gpu_stage_calls[stage];
-  if (stage == VITA_GPU_STAGES - 1 && (++vita_gpu_stage_frames & 63) == 0) {
+  if (stage == 5 && (++vita_gpu_stage_frames & 63) == 0) {
     char line[512]; int n = snprintf(line, sizeof(line), "gpu_stage_us frames=%u", vita_gpu_stage_frames);
     for (int i = 0; i < VITA_GPU_STAGES; ++i)
       n += snprintf(line + n, sizeof(line) - n, " %s=%llu/%u", vita_gpu_stage_names[i],
@@ -528,6 +529,18 @@ void YglVitaGpuStage(int stage) {
 #define VITA_GPU_STAGE(n) YglVitaGpuStage(n)
 #else
 #define VITA_GPU_STAGE(n) ((void)0)
+#endif
+#ifdef VITA_DIAG_ABLATE
+/* Diagnostic only: skip GPU passes named by ux0:data/yabause-vita/ablate.txt. */
+unsigned vt_ablate; /* also read by rotation_gpu.inc */
+static void YglAblateLoad(void) {
+  FILE *f = fopen("ux0:data/yabause-vita/ablate.txt", "r");
+  if (f) { if (fscanf(f, "%u", &vt_ablate) != 1) vt_ablate = 0; fclose(f); }
+  YuiMsg("diag_ablate mask=%u", vt_ablate);
+}
+#define ABL(bit) (vt_ablate & (bit))
+#else
+#define ABL(bit) 0
 #endif
 #include "atlas_vita.inc"
 #include "feedback_vita.inc"
@@ -1534,6 +1547,9 @@ void YuiSetVideoAttribute(int type, int val){
 
 //////////////////////////////////////////////////////////////////////////////
 int YglInit(int width, int height, unsigned int depth) {
+#ifdef VITA_DIAG_ABLATE
+  YglAblateLoad();
+#endif
   unsigned int i,j;
   void * dataPointer=NULL;
   YGLLOG("YglInit(%d,%d,%d);",width,height,depth );
@@ -1853,7 +1869,9 @@ void YglCacheQuadGrowShading(YglSprite * input, float * colors, YglCache * cache
   }
   else if (_Ygl->polygonmode == PERSPECTIVE_CORRECTION) {
     if (YglCheckTriangle(input->vertices)){
+      VT_STACK_BEGIN(VT_VDP1_RASTER);
       YglTriangleGrowShading_in(input, NULL, colors, cache, 0);
+      VT_STACK_END();
     }
     else{
       YglQuadGrowShading_in(input, NULL, colors, cache, 0);
@@ -1873,7 +1891,10 @@ int YglQuadGrowShading(YglSprite * input, YglTexture * output, float * colors, Y
   }
   else if (_Ygl->polygonmode == PERSPECTIVE_CORRECTION) {
     if (YglCheckTriangle(input->vertices)){
-      return YglTriangleGrowShading_in(input, output, colors, c, 1);
+      VT_STACK_BEGIN(VT_VDP1_RASTER);
+      const int r = YglTriangleGrowShading_in(input, output, colors, c, 1);
+      VT_STACK_END();
+      return r;
     }
     return YglQuadGrowShading_in(input, output, colors, c, 1);
   }
@@ -3134,8 +3155,14 @@ void YglFrameChangeVDP1(){
 
 
 //////////////////////////////////////////////////////////////////////////////
+#ifdef VITA_STACK_PROFILE
+unsigned v1calls_;
+#endif
 void YglRenderVDP1(void) {
   VT_SCOPE(VT_GPU_SUBMIT);
+#ifdef VITA_STACK_PROFILE
+  ++v1calls_;
+#endif
   YglLevel * level;
   GLuint cprg=0;
   int j;
@@ -3143,6 +3170,10 @@ void YglRenderVDP1(void) {
   FrameProfileAdd("YglRenderVDP1 start");
   YabThreadLock(_Ygl->mutex);
   _Ygl->vdp1_hasMesh = 0;
+#ifdef VITA_STACK_PROFILE
+  float rb_[4]; memcpy(rb_, _Ygl->vdp1_region[_Ygl->drawframe], sizeof rb_);
+  int rbt_ = _Ygl->vdp1_region_tracked[_Ygl->drawframe];
+#endif
 
   YglMatrix m;
 
@@ -3238,7 +3269,37 @@ void YglRenderVDP1(void) {
         glDrawArrays(GL_PATCHES, 0, level->prg[j].currentQuad / 2);
 #endif
       }else{
-        glDrawArrays(GL_TRIANGLES, 0, level->prg[j].currentQuad / 2);
+#ifdef VITA_STACK_PROFILE
+        static uint64_t ga_us; static unsigned ga_hit, ga_all, ga_frames;
+        uint64_t td0 = sceKernelGetProcessTimeWide();
+#endif
+#ifdef VITA_STACK_PROFILE
+        uint64_t tr0_ = sceKernelGetProcessTimeWide();
+#endif
+#ifdef VITA_STACK_PROFILE
+        uint64_t tr1_ = sceKernelGetProcessTimeWide();
+#endif
+#ifdef VITA_STACK_PROFILE
+        { static unsigned fr_, nd_, nv_[64], np_[64]; static const void *lastl_; static unsigned lastc_;
+          extern unsigned v1calls_;
+          if (lastc_ != v1calls_ && nd_) { lastc_ = v1calls_; if ((++fr_ & 15) == 0) { char b_[512]; int o_ = 0;
+              for (int q_ = 0; q_ < 64; ++q_) if (np_[q_]) o_ += snprintf(b_ + o_, sizeof b_ - o_, " %d:%u/%u", q_, np_[q_], nv_[q_]);
+              YuiMsg("v1prg draws=%u wh=%dx%d%s", nd_, _Ygl->width, _Ygl->height, b_); }
+            nd_ = 0; memset(nv_, 0, sizeof nv_); memset(np_, 0, sizeof np_); }
+          lastc_ = v1calls_; ++nd_; unsigned id_ = (unsigned)level->prg[j].prgid & 63; ++np_[id_]; nv_[id_] += level->prg[j].currentQuad / 2; (void)lastl_; }
+#endif
+        if (!ABL(8)) glDrawArrays(GL_TRIANGLES, 0, level->prg[j].currentQuad / 2);
+#ifdef VITA_STACK_PROFILE
+        { uint64_t tr2_ = sceKernelGetProcessTimeWide(); static unsigned bn_;
+          if (level->prg[j].currentQuad / 2 > 10000 && (++bn_ & 7) == 0)
+            YuiMsg("bigdraw verts=%u arena=%d region_us=%llu draw_us=%llu", level->prg[j].currentQuad / 2, arena,
+                   (unsigned long long)(tr1_ - tr0_), (unsigned long long)(tr2_ - tr1_)); }
+        ga_us += sceKernelGetProcessTimeWide() - td0; ++ga_all;
+        if (ga_all == 512) { (void)ga_frames;
+          YuiMsg("diag_v1 draws=%u arena=%u draw_us=%llu", ga_all, ga_hit, (unsigned long long)ga_us);
+          ga_us = 0; ga_hit = ga_all = 0;
+        }
+#endif
       }
       level->prg[j].currentQuad = 0;
       _Ygl->cpu_framebuffer_write[ _Ygl->drawframe] = 0;
@@ -3249,6 +3310,11 @@ void YglRenderVDP1(void) {
     }
   }
   
+#ifdef VITA_STACK_PROFILE
+  { static unsigned n_; const float *r_ = _Ygl->vdp1_region[_Ygl->drawframe];
+    if ((++n_ & 31) < 4) YuiMsg("v1region n=%u df=%d tvmr=%x before=%d:%.0f,%.0f-%.0f,%.0f after=%d:%.0f,%.0f-%.0f,%.0f", n_, _Ygl->drawframe, Vdp1Regs->TVMR,
+      rbt_, rb_[0], rb_[1], rb_[2], rb_[3], _Ygl->vdp1_region_tracked[_Ygl->drawframe], r_[0], r_[1], r_[2], r_[3]); }
+#endif
   level->prgcurrent = 0;
 
 #ifdef YABAUSE_VITAGL
@@ -3512,6 +3578,7 @@ void YglUpdateVdp2Reg() {
 #include "framebuffer_priority.h"
 #endif
 void YglRenderFrameBuffer(int from, int to) {
+  if (ABL(2)) return;
 
   YglWindowCoord   vertices[12];
   GLfloat texcord[12];
@@ -3576,6 +3643,8 @@ void YglRenderFrameBuffer(int from, int to) {
     cwidth = _Ygl->rwidth;
     cheight = _Ygl->rheight;
   }
+#define FB_DRAW() glDrawArrays(GL_TRIANGLES, 0, 6)
+#define FB_RESTORE() ((void)0)
 
 
 
@@ -3845,7 +3914,13 @@ void YglSetClearColor(float r, float g, float b){
   _Ygl->clear_b = b;
 }
 
+#ifdef VITA_DIAG_ABLATE
+unsigned vt_frame_seq;
+#endif
 void YglRender(void) {
+#ifdef VITA_DIAG_ABLATE
+  ++vt_frame_seq;
+#endif
   VT_SCOPE(VT_GPU_SUBMIT);
    YglLevel * level;
    GLuint cprg=0;
@@ -3978,7 +4053,7 @@ void YglRender(void) {
         glEnable(GL_BLEND);
         glBlendFunc(blendfunc_src, blendfunc_dst);
 
-        if (Vdp1External.disptoggle & 0x01) YglRenderFrameBuffer(from, to);
+        if (Vdp1External.disptoggle & 0x01) { VITA_GPU_STAGE(3); YglRenderFrameBuffer(from, to); VITA_GPU_STAGE(6); }
         from = to;
 
         // clean up
@@ -4109,7 +4184,15 @@ void YglRender(void) {
             YglDrawIndexedVdp2Quads(&level->prg[j]);
           else
 #endif
-          glDrawArrays(GL_TRIANGLES, 0, level->prg[j].currentQuad / 2);
+          if (!ABL(4)) glDrawArrays(GL_TRIANGLES, 0, level->prg[j].currentQuad / 2);
+#ifdef VITA_DIAG_ABLATE
+          { static unsigned f_; extern unsigned vt_frame_seq; static unsigned last_;
+            if (last_ != vt_frame_seq) { last_ = vt_frame_seq; ++f_; }
+            if ((f_ & 63) == 1)
+              YuiMsg("v2draw frame=%u level=%d batch=%d prg=%d verts=%d blend=%d win=%d,%d", f_, i, j,
+                     level->prg[j].prgid, level->prg[j].currentQuad / 2, level->prg[j].blendmode,
+                     level->prg[j].bwin0, level->prg[j].bwin1); }
+#endif
 
           if (level->prg[j].bwin0 != 0 || level->prg[j].bwin1 != 0 || (level->prg[j].blendmode != VDP2_CC_NONE && ccwindow) ){
             level->prg[j].matrix = (GLfloat*)dmtx.m;
@@ -4131,11 +4214,11 @@ void YglRender(void) {
     }
     glEnable(GL_BLEND);
     glBlendFunc(blendfunc_src, blendfunc_dst);
-    if (Vdp1External.disptoggle & 0x01) YglRenderFrameBuffer(from, 8);
+    if (Vdp1External.disptoggle & 0x01) { VITA_GPU_STAGE(3); YglRenderFrameBuffer(from, 8); VITA_GPU_STAGE(6); }
   }
 
    if ((fixVdp2Regs->SDCTL & 0xFF) != 0 || _Ygl->msb_shadow_count_[_Ygl->readframe] != 0 ) {
-     YglRenderFrameBufferShadow();
+     VITA_GPU_STAGE(3); YglRenderFrameBufferShadow(); VITA_GPU_STAGE(7);
    }
 
   
@@ -4174,7 +4257,7 @@ void YglRender(void) {
     glEnable(GL_SCISSOR_TEST);
     glViewport(_Ygl->originx, _Ygl->originy, GlWidth, GlHeight);
     glScissor(_Ygl->originx, _Ygl->originy, GlWidth, GlHeight);
-    YglBlitFramebuffer(_Ygl->fxaa_fbotex, _Ygl->default_fbo, GlWidth, GlHeight);
+    if (!ABL(1)) YglBlitFramebuffer(_Ygl->fxaa_fbotex, _Ygl->default_fbo, GlWidth, GlHeight);
   }
   else{
     

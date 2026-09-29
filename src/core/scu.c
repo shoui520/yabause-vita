@@ -43,6 +43,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 #include <stdlib.h>
 #include "scu.h"
+#include "../vita/diag_timers.h"
+extern void YuiMsg(const char *format, ...);
 #include "scu_dsp_arithmetic.h"
 #include "debug.h"
 #include "memory.h"
@@ -1355,6 +1357,7 @@ void ScuExec(u32 timing) {
    // is dsp executing?
    if (ScuDsp->ProgControlPort.part.EX) {
      VT_SCOPE(VT_SCU_DSP);
+     DIAG_T0(dsp_t);
 
 #ifdef DSPLOG
      if (slogp == NULL){
@@ -1386,6 +1389,9 @@ void ScuExec(u32 timing) {
          }
 
          instruction = ScuDsp->ProgramRam[ScuDsp->PC];
+#ifdef VITA_DIAG_TIMERS
+         { extern u32 vita_diag_dsp_pc[256]; ++vita_diag_dsp_pc[ScuDsp->PC & 0xFF]; }
+#endif
          //LOG("scu: dsp %08X @ %08X", instruction, ScuDsp->PC);
          incFlg[0] = 0;
          incFlg[1] = 0;
@@ -1764,9 +1770,30 @@ void ScuExec(u32 timing) {
                ScuDsp->delayed = 1;
          }
          dsp_counter--;
+#ifdef VITA_DIAG_TIMERS
+         ++vita_diag_dsp_insns;
+#endif
       }
+      DIAG_T1(dsp_t, DT_SCU_DSP);
    }
 }
+
+#ifdef VITA_DIAG_TIMERS
+u32 vita_diag_dsp_pc[256];
+void VitaDiagDspReport(void) {
+  u32 total = 0; for (int i = 0; i < 256; ++i) total += vita_diag_dsp_pc[i];
+  if (!total) return;
+  for (int k = 0; k < 12; ++k) {
+    int best = 0; for (int i = 1; i < 256; ++i) if (vita_diag_dsp_pc[i] > vita_diag_dsp_pc[best]) best = i;
+    if (!vita_diag_dsp_pc[best]) break;
+    char buf[128]; ScuDspDisasm((u8)best, buf);
+    YuiMsg("diag_dsp_pc pc=%02x count=%u of %u insn=%08x %s", best, vita_diag_dsp_pc[best], total,
+           ScuDsp->ProgramRam[best], buf);
+    vita_diag_dsp_pc[best] = 0;
+  }
+  memset(vita_diag_dsp_pc, 0, sizeof(vita_diag_dsp_pc));
+}
+#endif
 
 //////////////////////////////////////////////////////////////////////////////
 

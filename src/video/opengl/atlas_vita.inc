@@ -6,6 +6,9 @@
 #ifdef YABAUSE_VITAGL
 #include "rotation_gpu.h"
 #endif
+/* The atlas frame whose texels the current storage still holds, if any
+ * (UINT_MAX: none). Without the zero-copy ring it is the previous frame. */
+unsigned vita_atlas_prev_frame = ~0u;
 static unsigned int *YglVitaAtlasStorage(unsigned width, unsigned height) {
   VT_SCOPE(VT_RENDER_ALLOC);
   /* SGX texture dimensions are bounded; avoid overflow and unbounded growth. */
@@ -79,7 +82,13 @@ void YglTMReset(YglTextureManager *tm) {
   memset(&tm->vita_cpu_extent,0,sizeof(tm->vita_cpu_extent));
 }
 
+static void YglTmPushInner(YglTextureManager *tm);
 void YglTmPush(YglTextureManager *tm) {
+  DIAG_T0(t);
+  YglTmPushInner(tm);
+  DIAG_T1(t, DT_ATLAS);
+}
+static void YglTmPushInner(YglTextureManager *tm) {
   /* Includes atlas binding/upload and rotation submission setup. Nested
    * rotation input uploads are charged separately, never counted twice. */
   VT_SCOPE(VT_ATLAS_PUSH);
@@ -130,6 +139,11 @@ void YglTmPush(YglTextureManager *tm) {
       if (!reuse)
 #endif
       {
+#ifdef VITA_DIAG_TIMERS
+        { static unsigned n; if ((n++ & 63) == 0)
+            YuiMsg("diag_atlas width=%u height=%u yMax=%u upload_height=%u curX=%u curY=%u", tm->width, tm->height,
+                   tm->yMax, upload_height, tm->currentX, tm->currentY); }
+#endif
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tm->width, upload_height, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, tm->texture);
         tm->vita_gpu_height = upload_height;
@@ -173,6 +187,9 @@ void YglTmPull(YglTextureManager *tm, u32 preserve) {
 
 void YglTMRealloc(YglTextureManager *tm, unsigned width, unsigned height) {
   VT_SCOPE(VT_RENDER_ALLOC);
+#ifdef VITA_DIAG_TIMERS
+  YuiMsg("diag_atlas_realloc %ux%u -> %ux%u yMax=%u", tm->width, tm->height, width, height, tm->yMax);
+#endif
   Vdp2RgbTextureSync();
   /* Allocate/copy before replacing anything; a width change needs row-wise
    * copies, not the desktop path's flat old-width byte copy.

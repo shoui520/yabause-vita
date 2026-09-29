@@ -4160,6 +4160,37 @@ scsp_midi_out_read (void)
 ////////////////////////////////////////////////////////////////
 // Access
 
+
+#ifdef VITA_STACK_PROFILE
+/* Profile only: decilines from the sound hand-off (SyncCPUtoSCSP) to the
+ * emulation thread's first sound RAM / SCSP register access in each frame. */
+u32 g_scsp_sync_mark = 0xFFFFFFFFu;
+static int scsp_first_seen;
+static u32 scsp_first_hist[34];
+void ScspMarkSync(u32 deciline) { if (!scsp_first_seen && g_scsp_sync_mark != 0xFFFFFFFFu) ++scsp_first_hist[33]; g_scsp_sync_mark = deciline; scsp_first_seen = 0; }
+static u32 scsp_early_kind[4]; /* within 160 decilines: RAM read, RAM write, reg read, reg write */
+static inline void ScspMainAccessProbe(int kind) {
+  if (VitaThreadPointer() != vt_stack_owner || g_scsp_sync_mark == 0xFFFFFFFFu) return;
+  const u32 now = yabsys.LineCount * 10 + yabsys.DecilineCount;
+  const u32 delta = (now + 2630 - g_scsp_sync_mark) % 2630;
+  if (delta < 160) ++scsp_early_kind[kind];
+  if (scsp_first_seen) return;
+  scsp_first_seen = 1;
+  ++scsp_first_hist[delta / 16 < 32 ? delta / 16 : 32];
+}
+void ScspAccessReport(void) {
+  char line[600]; int n = snprintf(line, sizeof(line), "scsp_first_access_after_sync none=%u buckets16:", scsp_first_hist[33]);
+  for (unsigned b = 0; b < 33; ++b) n += snprintf(line + n, sizeof(line) - n, " %u", scsp_first_hist[b]);
+  YuiMsg("%s", line);
+  YuiMsg("scsp_early_access ram_read=%u ram_write=%u reg_read=%u reg_write=%u",
+    scsp_early_kind[0], scsp_early_kind[1], scsp_early_kind[2], scsp_early_kind[3]);
+  memset(scsp_early_kind, 0, sizeof(scsp_early_kind));
+  memset(scsp_first_hist, 0, sizeof(scsp_first_hist));
+}
+#define SCSP_MAIN_ACCESS(kind) ScspMainAccessProbe(kind)
+#else
+#define SCSP_MAIN_ACCESS(kind) ((void)0)
+#endif
 void FASTCALL
 scsp_w_b (u32 a, u8 d)
 {
@@ -4903,6 +4934,7 @@ scu_interrupt_handler (void)
 u8 FASTCALL
 SoundRamReadByte (u32 addr)
 {
+  SCSP_MAIN_ACCESS(0);
   addr &= 0xFFFFF;
   u8 val = 0;
 
@@ -4974,6 +5006,7 @@ void SyncSh2And68k(){
 u16 FASTCALL
 SoundRamReadWord (u32 addr)
 {
+  SCSP_MAIN_ACCESS(0);
   addr &= 0xFFFFF;
   u16 val = 0;
 
@@ -5016,6 +5049,7 @@ SoundRamWriteWord (u32 addr, u16 val)
 u32 FASTCALL
 SoundRamReadLong (u32 addr)
 {
+  SCSP_MAIN_ACCESS(0);
   addr &= 0xFFFFF;
   u32 val;
   u32 pre_cycle = m68kcycle;
@@ -5311,6 +5345,38 @@ void MM68KExec(s32 cycles)
 void M68KExec(s32 cycles)
 #endif
 {
+#ifdef VITA_STACK_PROFILE
+  { /* Diagnostic: 68K PC at each 256-cycle chunk boundary (fixed-cycle sampling). */
+    extern u32 M68K_GetPC_Diag(void); extern void YuiMsg(const char *, ...);
+    enum { SLOTS = 4096 };
+    static u32 keys[SLOTS], counts[SLOTS], total;
+    u32 pc = M68K_GetPC_Diag() & 0xFFFFFF, h = (pc * 2654435761u) >> 20;
+    while (counts[h & (SLOTS - 1)] && keys[h & (SLOTS - 1)] != pc) ++h;
+    keys[h & (SLOTS - 1)] = pc; ++counts[h & (SLOTS - 1)];
+    if (++total == 4096) {
+      char line[512]; int n = snprintf(line, sizeof(line), "m68k_pc_profile samples=%u", total);
+      for (int k = 0; k < 8; ++k) {
+        u32 best = 0, bi = 0;
+        for (u32 i = 0; i < SLOTS; ++i) if (counts[i] > best) { best = counts[i]; bi = i; }
+        if (!best) break;
+        n += snprintf(line + n, sizeof(line) - n, " %06x:%u", keys[bi], best);
+        counts[bi] = 0;
+      }
+      YuiMsg("%s", line);
+      static int reports;
+      if (++reports == 500) { /* well inside gameplay, after the driver loads */
+        static const u32 ranges[][2] = {{0x10C0, 0x1180}, {0x4D30, 0x4D70}, {0x5290, 0x5330}};
+        for (unsigned r = 0; r < 3; ++r) {
+          char hex[512]; int m = snprintf(hex, sizeof(hex), "m68k_code %06x:", ranges[r][0]);
+          for (u32 a = ranges[r][0]; a < ranges[r][1]; a += 2)
+            m += snprintf(hex + m, sizeof(hex) - m, " %04x", T2ReadWord(SoundRam, a));
+          YuiMsg("%s", hex);
+        }
+      }
+      memset(keys, 0, sizeof(keys)); memset(counts, 0, sizeof(counts)); total = 0;
+    }
+  }
+#endif
   s32 newcycles = savedcycles - cycles;
   if (LIKELY(IsM68KRunning))
     {
@@ -5571,6 +5637,9 @@ void ScspAsynMainCpuTime( void * p ){
   //YabWaitEventQueue(q_scsp_frame_start);
   now = 0;
   before = 0;
+#if defined(VITA_STACK_PROFILE) && !defined(VITA_STACK_PROFILE_RENDER)
+  VitaStackAdoptSecondThread();
+#endif
   while (thread_running){
     while (g_scsp_lock) { YabThreadUSleep(1000); }
     u64 m68k_done_counter = 0;

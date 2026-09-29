@@ -20,7 +20,16 @@
  X(SH2_DMA, "sh2_dma", "work") \
  X(SH2_MEMORY, "sh2_memory", "work") \
  X(SH2_INVALIDATE, "sh2_invalidate", "work") \
+ X(SH2_NATIVE, "sh2_native", "work") \
+ X(SH2_FORWARD, "sh2_forward", "work") \
+ X(SH2_SLICE_TAIL, "sh2_slice_tail", "work") \
+ X(VDP2_CELL_LOOKUP, "vdp2_cell_lookup", "work") \
+ X(VDP2_CELL_QUAD, "vdp2_cell_quad", "work") \
+ X(VDP2_CELL_DECODE, "vdp2_cell_decode", "work") \
+ X(VDP2_CELL_ADDR, "vdp2_cell_addr", "work") \
  X(M68K, "m68k", "work") \
+ X(M68K_ORBIT, "m68k_orbit", "work") \
+ X(SCSP_TIMER, "scsp_timer", "work") \
  X(SCU, "scu_control", "work") \
  X(SCU_DMA, "scu_dma", "work") \
  X(SCU_DSP, "scu_dsp", "work") \
@@ -43,6 +52,11 @@
  X(VDP1_RASTER, "vdp1_raster", "work") \
  X(VDP2, "vdp2", "work") \
  X(VDP2_NORMAL, "vdp2_normal", "work") \
+ X(VDP2_BITMAP, "vdp2_bitmap", "work") \
+ X(VDP2_BITMAP_LS, "vdp2_bitmap_linescroll", "work") \
+ X(VDP2_BITMAP_CI, "vdp2_bitmap_coordinc", "work") \
+ X(VDP2_MAP_LINE, "vdp2_map_perline", "work") \
+ X(VDP2_MAP, "vdp2_map", "work") \
  X(VDP2_ROTATION, "vdp2_rotation", "work") \
  X(TEXTURE_DECODE, "texture_decode", "work") \
  X(TEXTURE_UPLOAD, "texture_upload", "work") \

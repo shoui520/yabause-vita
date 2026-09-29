@@ -407,6 +407,63 @@ void SH2DynShowSttaics(SH2_struct * master, SH2_struct * slave ){
 // MemoyAcess from DynarecCPU
 //********************************************************************
 
+#if defined(VITA_STACK_PROFILE) || defined(VITA_SH2_MEM_PROFILE)
+extern "C" void YuiMsg(const char *, ...);
+// Profile only: SH-2 memory helper calls by 1 MiB region ((addr >> 20) & 0x3FF;
+// 0x2xx = cache-through).
+static u32 prof_mem[2][1024];
+#ifdef VITA_SH2_MEM_PROFILE
+static struct { uintptr_t ra; u32 n, size; } prof_site[4096];
+static inline void ProfSite(uintptr_t ra, u32 size) {
+  unsigned h = unsigned(ra >> 2) * 2654435761u >> 20;
+  for (unsigned p = 0; p < 4096; ++p, h = (h + 1) & 4095)
+    if (prof_site[h].ra == ra || !prof_site[h].n) { prof_site[h].ra = ra; prof_site[h].size = size; ++prof_site[h].n; return; }
+}
+#define PROF_SITE(size) ProfSite(uintptr_t(__builtin_return_address(0)), size)
+#endif
+#define PROF_MEM(w, a) (++prof_mem[w][((a) >> 20) & 0x3FF])
+extern "C" void VitaSh2MemReport(void) {
+  for (int w = 0; w < 2; ++w) {
+    char line[400]; int n = snprintf(line, sizeof(line), "sh2_mem_helper %s", w ? "write" : "read");
+    for (int k = 0; k < 8; ++k) {
+      u32 best = 0, bi = 0;
+      for (u32 i = 0; i < 1024; ++i) if (prof_mem[w][i] > best) { best = prof_mem[w][i]; bi = i; }
+      if (!best) break;
+      n += snprintf(line + n, sizeof(line) - n, " %03x:%u", bi, best);
+      prof_mem[w][bi] = 0;
+    }
+    YuiMsg("%s", line);
+    memset(prof_mem[w], 0, sizeof(prof_mem[w]));
+  }
+#ifdef VITA_SH2_MEM_PROFILE
+  // Top cached-WRAM read call sites, mapped to their compiled guest block.
+  CompileBlocks *cb = CompileBlocks::existingInstance();
+  for (int k = 0; k < 6 && cb; ++k) {
+    unsigned best = 0;
+    for (unsigned i = 1; i < 4096; ++i) if (prof_site[i].n > prof_site[best].n) best = i;
+    if (!prof_site[best].n) break;
+    const uintptr_t ra = prof_site[best].ra;
+    const Block *blk = nullptr;
+    for (int b = 0; b < NUMOFBLOCKS; ++b) {
+      const Block &c = cb->g_CompleBlock[b];
+      if (c.code && uintptr_t(c.code) <= ra && (!blk || c.code > blk->code)) blk = &c;
+    }
+    char line[400]; int n = snprintf(line, sizeof(line), "sh2_mem_site n=%u size=%u host=+%u",
+      prof_site[best].n, prof_site[best].size, blk ? unsigned(ra - uintptr_t(blk->code)) : 0u);
+    if (blk) {
+      n += snprintf(line + n, sizeof(line) - n, " block=%08x..%08x ops", blk->b_addr, blk->e_addr);
+      for (u32 a = blk->b_addr; a <= blk->e_addr && a < blk->b_addr + 64 && n < 380; a += 2)
+        n += snprintf(line + n, sizeof(line) - n, " %04x", MappedMemoryReadWord(a, NULL));
+    }
+    YuiMsg("%s", line);
+    prof_site[best].n = 0;
+  }
+  memset(prof_site, 0, sizeof(prof_site));
+#endif
+}
+#else
+#define PROF_MEM(w, a) ((void)0)
+#endif
 #if defined(__arm__) || defined(__aarch64__)
 #pragma GCC push_options
 #pragma GCC optimize ("O1")
@@ -434,6 +491,7 @@ static __attribute__((always_inline)) inline void InvalidateHighWrite(CompileBlo
 
 WRITE_LINKAGE void WRITE_NAME(Byte)(u32 addr , u8 data )
 {
+  PROF_MEM(1, addr);
   dynaLock();
   u32 cycle = 0;
   //LOG("memSetWord %08X, %08X\n", addr, data);
@@ -475,6 +533,7 @@ WRITE_LINKAGE void WRITE_NAME(Byte)(u32 addr , u8 data )
 
 WRITE_LINKAGE void WRITE_NAME(Word)(u32 addr, u16 data )
 {
+  PROF_MEM(1, addr);
   dynaLock();
   u32 cycle = 0;
   //LOG("memSetWord %08X, %08X\n", addr, data);
@@ -517,6 +576,7 @@ WRITE_LINKAGE void WRITE_NAME(Word)(u32 addr, u16 data )
 
 WRITE_LINKAGE void WRITE_NAME(Long)(u32 addr , u32 data )
 {
+  PROF_MEM(1, addr);
   dynaLock();
   //LOG("memSetLong %08X, %08X\n", addr, data);
   u32 cycle = 0;
@@ -603,6 +663,7 @@ MAPPED_READ_HELPER(Long,u32)
 #endif
 u8 memGetByte(u32 addr)
 {
+  PROF_MEM(0, addr);
   dynaLock();
   u8 val;
   u32 cycle = 0;
@@ -620,6 +681,9 @@ u8 memGetByte(u32 addr)
   case 0x06000000:
     val = T2ReadByte(HighWram, addr & 0xFFFFF);
     if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
+#ifdef VITA_SH2_MEM_PROFILE
+    if (!(addr & 0x20000000)) PROF_SITE(1);
+#endif
     dynaFree();
     return val;
     break;
@@ -636,6 +700,7 @@ u8 memGetByte(u32 addr)
  
 u16 memGetWord(u32 addr)
 {
+  PROF_MEM(0, addr);
   dynaLock();
   u16 val;
   u32 cycle = 0;
@@ -653,6 +718,9 @@ u16 memGetWord(u32 addr)
   case 0x06000000:
     val = T2ReadWord(HighWram, addr & 0xFFFFF);
     if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
+#ifdef VITA_SH2_MEM_PROFILE
+    if (!(addr & 0x20000000)) PROF_SITE(2);
+#endif
     dynaFree();
     return val;
     break;
@@ -669,6 +737,7 @@ u16 memGetWord(u32 addr)
 
 u32 memGetLong(u32 addr)
 {
+  PROF_MEM(0, addr);
   dynaLock();
   u32 val;
   u32 cycle = 0;
@@ -685,6 +754,9 @@ u32 memGetLong(u32 addr)
   case 0x06000000:
     val = T2ReadLong(HighWram, addr & 0xFFFFF);
     if (addr & 0x20000000) DynarecSh2::CurrentContext->memcycle_ += 2;
+#ifdef VITA_SH2_MEM_PROFILE
+    if (!(addr & 0x20000000)) PROF_SITE(4);
+#endif
     dynaFree();
     return val;
     break;
@@ -839,3 +911,35 @@ int EachClock() {
 
 
 }
+#ifdef A9_PMU_REGIONS
+extern "C" void YuiMsg(const char *, ...);
+/* Linux profiling build: every live high work-RAM block's native size and the L1
+ * set of its first line (32-byte lines, 256 sets). */
+static struct { u32 addr, n[2]; } a9_io[256];
+static void A9IoCount(u32 a) {
+  const int c = DynarecSh2::CurrentContext && DynarecSh2::CurrentContext->IsSlave() ? 1 : 0;
+  for (unsigned h = (a * 2654435761u) >> 24, p = 0; p < 256; ++p, h = (h + 1) & 255)
+    if (a9_io[h].addr == a || !(a9_io[h].n[0] | a9_io[h].n[1])) { a9_io[h].addr = a; ++a9_io[h].n[c]; return; }
+}
+extern "C" void A9BlockDump(void) {
+  for (auto &e : a9_io) if (e.n[0] + e.n[1] > 1000) YuiMsg("io_read addr=%08x master=%u slave=%u", e.addr, e.n[0], e.n[1]);
+  CompileBlocks *cb = CompileBlocks::existingInstance();
+  if (!cb) return;
+  for (u32 i = 0; i < 0x100000 >> 1; ++i) {
+    const Block *b = cb->LookupTable[i];
+    if (!b || !b->code || b->b_addr != (0x06000000u | (i << 1))) continue;
+    const u32 *w = reinterpret_cast<const u32 *>(b->code);
+    u32 n = MAXBLOCKSIZE / 4;
+    if (b->id < cb->code_bytes_.size() && cb->code_bytes_[b->id]) n = cb->code_bytes_[b->id] / 4;
+    else while (n && !w[n - 1]) --n;
+    YuiMsg("blk b=%08x e=%08x set=%u size=%u code=%08x", b->b_addr, b->e_addr, unsigned((uintptr_t(b->code) >> 5) & 255), n * 4, unsigned(uintptr_t(b->code)));
+    char name[64]; snprintf(name, sizeof(name), "blk_%08x.bin", b->b_addr);
+    if (FILE *f = fopen(name, "wb")) { fwrite(w, 4, n, f); fclose(f); }
+    snprintf(name, sizeof(name), "blk_%08x.sh2", b->b_addr);
+    if (FILE *f = fopen(name, "wb")) {
+      for (u32 a = b->b_addr; a <= b->e_addr + 2; a += 2) { u16 op = MappedMemoryReadWord(a, NULL); op = u16(op >> 8 | op << 8); fwrite(&op, 2, 1, f); }
+      fclose(f);
+    }
+  }
+}
+#endif

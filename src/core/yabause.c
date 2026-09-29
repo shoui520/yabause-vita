@@ -44,6 +44,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 
 #include <sys/types.h>
+#include "../vita/diag_timers.h"
 #include "../vita/c68k_runtime.h"
 #ifdef VITA
 #include <psp2/kernel/processmgr.h>
@@ -781,13 +782,13 @@ int YabauseEmulate(void) {
        if(yabsys.DecilineCount == 9) {
          // HBlankIN
          PROFILE_START("hblankin");
-         Vdp2HBlankIN();
+         { DIAG_T0(t); Vdp2HBlankIN(); DIAG_T1(t, DT_HBLANK); }
          PROFILE_STOP("hblankin");
        }
        else if (yabsys.DecilineCount == 10) {
          // HBlankOUT
          PROFILE_START("hblankout");
-         Vdp2HBlankOUT();
+         { DIAG_T0(t); Vdp2HBlankOUT(); DIAG_T1(t, DT_HBLANK); }
          PROFILE_STOP("hblankout");
          PROFILE_START("SCSP");
          ScspExec();
@@ -948,6 +949,9 @@ void SyncCPUtoSCSP() {
 #endif
     saved_m68k_cycles = 0;
     setM68kCounter(saved_m68k_cycles);
+#ifdef VITA_STACK_PROFILE
+    { extern void ScspMarkSync(u32); ScspMarkSync(yabsys.LineCount * 10 + yabsys.DecilineCount); }
+#endif
     YabAddEventQueue(q_scsp_frame_start, 0);
   }
   //LOG("[SH2] START SCSP");

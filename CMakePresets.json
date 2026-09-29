@@ -14,6 +14,7 @@
         "VITA_ATLAS_TRIM": "ON",
         "VITA_C68K_ARM": "OFF",
         "VITA_C68K_RAM_READS": "OFF",
+        "VITA_DIAG_AUDIO_UNPACED": "OFF",
         "VITA_DIAG_CELL_ALPHA": "OFF",
         "VITA_DIAG_GPU_STAGES": "OFF",
         "VITA_DIAG_NO_VSYNC": "OFF",

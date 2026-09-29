@@ -75,12 +75,42 @@ static u64 resident_calls, resident_iterations, resident_cycles;
 static u64 poll_calls, poll_iterations, poll_cycles;
 static u32 chain_stops[7];
 static sh2a9::NativeHotSamples hot_samples;
+#ifdef VITA_STACK_PROFILE
+// Profile only: guest instructions of sampled blocks outside region admission,
+// by opcode_list index (weighted by block entries, not time).
+static u64 region_ops, outside_ops, outside_hist[256];
+static u64 mem_ops_total, mem_ops_r15; // sampled guest memory accesses; base R15
+#endif
+#ifdef VITA_STACK_PROFILE
+// Profile only: compiles by PC range, and blocks dropped by high-RAM writes.
+u32 g_prof_compiles[4], g_prof_self_modify_reuse;
+u32 g_prof_smc_pc[64], g_prof_smc_n[64], g_prof_smc_hit, g_prof_smc_miss;
+// Per CPU (0 master, 1 slave): slices, blocks, slices whose first block
+// idle-skipped, and blocks before an idle skip.
+u32 g_prof_slices[2], g_prof_blocks[2], g_prof_idle_first[2], g_prof_idle_skips[2];
+u32 g_prof_selfloop[2]; // block returned to its own start (not idle-skipped)
+u32 g_prof_dispatch[9]; // native returns by first failing sh2_dispatch check; [8] chained blocks
+u32 g_prof_spec[4];     // stack spec: high-RAM compiles scanned, plans active, planned accesses, bails
+#endif
 extern "C" void YuiMsg(const char *, ...);
 extern "C" void VitaSh2ReportExecution() {
   if (VitaTelemetrySamplingEnabled()) {
     const auto sorted = hot_samples.Ranked();
     YuiMsg("jit_hot_summary samples=%llu dropped=%llu policy=periodic_1024 cpu_busy=unmeasured",
       hot_samples.samples, hot_samples.dropped);
+#ifdef VITA_STACK_PROFILE
+    {
+      extern i_desc opcode_list[];
+      unsigned order[256]; for (unsigned i = 0; i < 256; ++i) order[i] = i;
+      std::sort(order, order + 256, [](unsigned a, unsigned b) { return outside_hist[a] > outside_hist[b]; });
+      YuiMsg("jit_region_mix region_ops=%llu outside_ops=%llu mem_ops=%llu mem_r15=%llu", region_ops, outside_ops,
+             mem_ops_total, mem_ops_r15);
+      mem_ops_total = mem_ops_r15 = 0;
+      for (unsigned i = 0; i < 24 && outside_hist[order[i]]; ++i)
+        YuiMsg("jit_outside op=%s count=%llu", opcode_list[order[i]].mnem, outside_hist[order[i]]);
+      region_ops = outside_ops = 0; memset(outside_hist, 0, sizeof(outside_hist));
+    }
+#endif
     for (unsigned i = 0; i < 8 && sorted[i].samples; ++i) {
       const auto &entry = sorted[i];
       const u32 region = entry.pc & 0x0ff00000;
@@ -93,6 +123,23 @@ extern "C" void VitaSh2ReportExecution() {
           T2ReadWord(ram, (entry.pc & 0xfffff) + word * 2));
       YuiMsg("jit_hot cpu=%s pc=%08x samples=%llu native_wall_us=%llu guest_cycles=%llu current_source=%s",
         entry.slave ? "slave" : "master", entry.pc, entry.samples, entry.us, entry.cycles, prefix);
+#ifdef VITA_STACK_PROFILE
+      { /* Profile only: one dump of the top blocks' native code, for offline disassembly. */
+        static unsigned reports;
+        if (i == 0) ++reports;
+        if (reports == 40 && i < 3 && (entry.pc & 0x0ff00000) == 0x06000000) {
+          Block *b = CompileBlocks::getInstance()->LookupTable[(entry.pc & 0xfffff) >> 1];
+          if (b && b->b_addr == entry.pc) {
+            const u32 *w = reinterpret_cast<const u32 *>(b->code);
+            for (unsigned line = 0; line < 8; ++line) {
+              char hex[64 * 9 + 64]; int m = snprintf(hex, sizeof(hex), "jit_code pc=%08x end=%08x off=%u:", entry.pc, b->e_addr, line * 64);
+              for (unsigned k = 0; k < 64; ++k) m += snprintf(hex + m, sizeof(hex) - m, " %08x", w[line * 64 + k]);
+              YuiMsg("%s", hex);
+            }
+          }
+        }
+      }
+#endif
       // At most one extra record per report. Explain the top block's initial
       // PC-relative load without invoking MMIO or treating mutable literals
       // as immutable compile-time constants. These are REPORT-TIME bytes.
@@ -122,7 +169,7 @@ extern "C" void VitaSh2ReportExecution() {
     "jit_resident_loops calls=%llu iterations=%llu guest_cycles=%llu\n"
     "jit_poll_skips calls=%llu iterations=%llu guest_cycles=%llu\n"
     "jit_chains batches=%llu blocks=%llu budget=%u quota=%u miss=%u interrupt=%u loop=%u mapping=%u post_block=%u",
-    native_returns - poll_step_calls, native_cycles - poll_step_cycles,
+    (unsigned long long)(native_returns - poll_step_calls), (unsigned long long)(native_cycles - poll_step_cycles),
     native_samples - poll_step_samples, native_sample_us - poll_step_us,
     resident_calls, resident_iterations, resident_cycles,
     poll_calls, poll_iterations, poll_cycles,
@@ -896,6 +943,11 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
 {
   VT_SCOPE(VT_SH2_COMPILE);
   compile_count_++;
+#ifdef VITA_STACK_PROFILE
+  ++g_prof_compiles[(pc & 0x0ff00000) == 0x06000000 ? 0 : (pc & 0x0ff00000) == 0x00200000 ? 1
+                    : (pc & 0xff000000) == 0xc0000000 ? 2 : 3];
+  if (self_modify_block.count(pc)) ++g_prof_self_modify_reuse;
+#endif
 
   auto block_index = self_modify_block.find(pc);
   if( block_index != self_modify_block.end()  ){

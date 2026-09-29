@@ -50,6 +50,19 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <ctype.h>
 
 #include "memory.h"
+#ifdef VITA_STACK_PROFILE
+#include "../vita/telemetry.h"
+extern volatile u32 vt_mem_key;
+#define VT_MEM_SCOPE() VT_SCOPE(VT_SH2_MEMORY)
+#define VT_MEM_KEY(op) (vt_mem_key = ((u32)(op) << 28) | ((addr >> 8) & 0x0FFFFFFF))
+#elif defined(A9_PMU_REGIONS)
+#include "../vita/telemetry.h"
+#define VT_MEM_KEY(op) ((void)0)
+#define VT_MEM_SCOPE() VT_SCOPE(VT_SH2_MEMORY)
+#else
+#define VT_MEM_KEY(op) ((void)0)
+#define VT_MEM_SCOPE() ((void)0)
+#endif
 #include "coffelf.h"
 #include "cs0.h"
 #include "cs1.h"
@@ -857,6 +870,7 @@ u8 FASTCALL MappedMemoryReadByteNocache(u32 addr)
 u8 FASTCALL MappedMemoryReadByte(u32 addr, u32 * cycle)
 #endif
 {
+  VT_MEM_SCOPE(); VT_MEM_KEY(1);
   if (cycle != NULL) { 
     //*cycle = getMemCycle(addr); 
     GET_MEM_CYCLE_R
@@ -921,6 +935,7 @@ u16 FASTCALL MappedMemoryReadWordNocache(u32 addr)
 u16 FASTCALL MappedMemoryReadWord(u32 addr, u32 * cycle)
 #endif
 {
+  VT_MEM_SCOPE(); VT_MEM_KEY(2);
   if (cycle != NULL) { 
     //*cycle = getMemCycle(addr); 
     GET_MEM_CYCLE_R
@@ -984,6 +999,7 @@ u32 FASTCALL MappedMemoryReadLongNocache(u32 addr)
 u32 FASTCALL MappedMemoryReadLong(u32 addr, u32 * cycle)
 #endif
 {
+  VT_MEM_SCOPE(); VT_MEM_KEY(3);
   if (cycle != NULL) { 
     //*cycle = getMemCycle(addr); 
     GET_MEM_CYCLE_R
@@ -1050,6 +1066,7 @@ void FASTCALL MappedMemoryWriteByteNocache(u32 addr, u8 val)
 void FASTCALL MappedMemoryWriteByte(u32 addr, u8 val, u32 * cycle)
 #endif
 {
+  VT_MEM_SCOPE(); VT_MEM_KEY(5);
   if (cycle != NULL) { 
     //*cycle = getMemCycle(addr); ]
     GET_MEM_CYCLE_W
@@ -1114,6 +1131,7 @@ void FASTCALL MappedMemoryWriteWordNocache(u32 addr, u16 val)
 void FASTCALL MappedMemoryWriteWord(u32 addr, u16 val, u32 * cycle )
 #endif
 {
+  VT_MEM_SCOPE(); VT_MEM_KEY(6);
   if (cycle != NULL) { 
     //*cycle = getMemCycle(addr); 
     GET_MEM_CYCLE_W
@@ -1178,6 +1196,7 @@ void FASTCALL MappedMemoryWriteLongNocache(u32 addr, u32 val)
 void FASTCALL MappedMemoryWriteLong(u32 addr, u32 val, u32 * cycle )
 #endif
 {
+  VT_MEM_SCOPE(); VT_MEM_KEY(7);
   if (cycle != NULL) { 
     //*cycle = getMemCycle(addr); 
     GET_MEM_CYCLE_W

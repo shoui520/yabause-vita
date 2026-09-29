@@ -229,9 +229,11 @@ void SH2PowerOn(SH2_struct *context) {
 //////////////////////////////////////////////////////////////////////////////
 
 #include "../vita/telemetry.h"
+#include "../vita/diag_timers.h"
 void FASTCALL SH2Exec(SH2_struct *context, u32 cycles)
 {
    VT_SCOPE(context->isslave ? VT_SH2_SLAVE : VT_SH2_MASTER);
+   DIAG_T0(diag_t);
    CurrentSH2 = context;
 
    SH2Core->Exec(context, cycles);

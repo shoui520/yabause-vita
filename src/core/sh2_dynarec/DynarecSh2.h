@@ -234,6 +234,11 @@ public:
   Block* LookupTable[0x100000>>1];    
   //addrs LookupParentTable[0x100000>>1];
   addrs * LookupParentTable = nullptr;
+  // One byte per KiB of high work RAM: set whenever an owner is added to
+  // LookupParentTable in that KiB, cleared only with the whole table. A zero
+  // entry proves every setDirty in the KiB is a no-op (guarded region stores).
+  u8 code_pages[1024] = {};
+  void MarkCode(u32 keep) { code_pages[keep >> 9] = 1; }
   // Dispatch indexes the full 1 MiB ROM address window, including mirrors.
   // Do not collapse aliases: block metadata contains the original guest PC.
   Block* LookupTableRom[0x100000>>1];

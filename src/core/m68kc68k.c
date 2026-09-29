@@ -91,6 +91,10 @@ static s32 FASTCALL M68KC68KExec(s32 cycle) {
 #endif
 }
 
+#ifdef VITA_STACK_PROFILE
+u32 M68K_GetPC_Diag(void) { return C68k_Get_PC(&C68K); }
+#endif
+
 static void M68KC68KSync(void) {
 }
 

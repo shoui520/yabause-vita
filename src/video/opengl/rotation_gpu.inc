@@ -292,6 +292,13 @@ static int YglVitaRotationSnapshotMatches(const VitaRotationJob *job,
 int YglVitaRotationBegin(RBGDrawInfo *rbg, vdp2rotationparameter_struct *p,
                          const unsigned char *vram) {
   const vdp2draw_struct *info = &rbg->info;
+#ifdef VITA_DIAG_ABLATE
+  { static unsigned n; if ((++n & 127) == 1)
+    YuiMsg("rotation_admit col=%d lcb=%x scm=%d bmp=%d pwh=%d pds=%d over=%d coefmode=%d coefenab=%d dkax=%g mh=%g mv=%g hres=%d vres=%d count=%u",
+           info->colornumber, info->LineColorBase, info->specialcolormode, info->isbitmap, info->patternwh,
+           info->patterndatasize, p->screenover, p->coefmode, p->coefenab, p->deltaKAx,
+           rbg->rotate_mval_h, rbg->rotate_mval_v, rbg->hres, rbg->vres, vita_rotation_count); }
+#endif
   if (info->colornumber < 0 || info->colornumber > 4 || info->colornumber == 2 || info->LineColorBase ||
       (info->colornumber < 3 && info->specialcolormode == 3) ||
       (!info->isbitmap && (info->patternwh < 1 || info->patternwh > 2 ||
@@ -861,6 +868,16 @@ void YglVitaRotationFlush(YglTextureManager *tm) {
           vita_rotation_pattern_builds,vita_rotation_pattern_fallbacks);
 #endif
     VitaRotationProgram *p = YglVitaRotationProgram(job, 0);
+#ifdef VITA_DIAG_ABLATE
+    { static unsigned n; if (!(++n & 63))
+        YuiMsg("rotation_job slot=%u size=%ux%u program=%d target=%u constk=%d isbitmap=%g over=%g "
+               "fmt=%g cells=%g words=%g shift=%g,%g max=%gx%g planew=%g patcached=%u k0=%g,%g kN=%g,%g",
+               slot, job->width, job->height, (int)(p - vita_rotation_programs), job->target,
+               YglVitaRotationConstK(job), job->pattern[3], job->bitmap[3], job->pixel[2],
+               job->map[3], job->pattern[0], job->map[0], job->map[1], job->bitmap[1], job->bitmap[2],
+               job->map[2], job->pattern_cached, job->rows[0][2], job->rows[0][3],
+               job->rows[job->height-1][2], job->rows[job->height-1][3]); }
+#endif
     glUseProgram(p->program);
 #ifdef VITA_ROTATION_PATTERN_CACHE
     if (p->pattern_size != -1)

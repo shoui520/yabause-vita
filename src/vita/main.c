@@ -1,5 +1,98 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include <psp2/kernel/processmgr.h>
+#include "diag_timers.h"
+#include <malloc.h>
+#ifdef VITA_DIAG_TIMERS
+#include <string.h>
+void YuiMsg(const char *, ...);
+uint64_t vita_diag_us[DT_COUNT], vita_diag_calls[DT_COUNT];
+uint64_t vita_diag_dsp_insns;
+uint64_t vita_diag_exec_us[2], vita_diag_exec_n[2];
+uint64_t vita_diag_sprite_us[8], vita_diag_sprite_texels[8], vita_diag_sprite_calls[8];
+int scePowerGetArmClockFrequency(void);
+#include <arm_neon.h>
+int sceDmacMemcpy(void *dst, const void *src, unsigned size);
+static void VitaDiagDramStores(void) {
+  static unsigned runs;
+  if (runs++ >= 3) return;
+  { /* cost of one empty DIAG_T0/DIAG_T1 pair */
+    uint64_t e0 = sceKernelGetProcessTimeWide(), acc = 0;
+    for (int k = 0; k < 10000; ++k) { uint64_t t = sceKernelGetProcessTimeWide(); acc += sceKernelGetProcessTimeWide() - t; }
+    uint64_t e1 = sceKernelGetProcessTimeWide();
+    YuiMsg("diag_timer_overhead pair_ns=%llu (10000 pairs, acc=%llu)", (unsigned long long)((e1 - e0) * 1000 / 10000),
+           (unsigned long long)acc);
+  }
+  { /* 1.5 MiB copy: CPU memcpy vs DMA engine */
+    const unsigned bytes = 1536u * 1024u;
+    static uint8_t *a, *b;
+    if (!a) { a = (uint8_t *)memalign(64, bytes); b = (uint8_t *)memalign(64, bytes); if (a) memset(a, 3, bytes); }
+    if (a && b) {
+      uint64_t c0 = sceKernelGetProcessTimeWide();
+      memcpy(b, a, bytes);
+      uint64_t c1 = sceKernelGetProcessTimeWide();
+      int rc = sceDmacMemcpy(b, a, bytes);
+      uint64_t c2 = sceKernelGetProcessTimeWide();
+      YuiMsg("diag_copy 1.5MiB memcpy=%llu dmac=%llu rc=%d us", (unsigned long long)(c1 - c0),
+             (unsigned long long)(c2 - c1), rc);
+    }
+  }
+  const unsigned n = 1u << 20;                         /* 1 Mi texels = 4 MiB */
+  static uint32_t *big;
+  if (!big) big = (uint32_t *)memalign(64, n * 4);
+  if (!big) return;
+  uint32x4_t v = vdupq_n_u32(0x12345678);
+  uint64_t t0 = sceKernelGetProcessTimeWide();
+  for (unsigned k = 0; k < n; k += 4) vst1q_u32(big + k, v);
+  uint64_t t1 = sceKernelGetProcessTimeWide();
+  for (unsigned k = 0; k < n; k += 8) { uint32x4x2_t w = {{v, v}}; vst1q_u32_x2(big + k, w); }
+  uint64_t t2 = sceKernelGetProcessTimeWide();
+  memset(big, 1, n * 4);
+  uint64_t t3 = sceKernelGetProcessTimeWide();
+  for (unsigned k = 0; k < n; ++k) big[k] = k;
+  uint64_t t4 = sceKernelGetProcessTimeWide();
+  YuiMsg("diag_dram 4MiB neon16=%llu neon32=%llu memset=%llu scalar=%llu us", (unsigned long long)(t1 - t0),
+         (unsigned long long)(t2 - t1), (unsigned long long)(t3 - t2), (unsigned long long)(t4 - t3));
+}
+void VitaDiagTimersReport(void) {
+  VitaDiagDramStores();
+  { /* measured core clock: 8 dependent 1-cycle ADDs per iteration */
+    uint64_t t0 = sceKernelGetProcessTimeWide();
+    unsigned x = 0;
+    for (unsigned i = 0; i < 2000000; ++i)
+      __asm__ volatile("add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n"
+                       "add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1" : "+r"(x));
+    uint64_t us = sceKernelGetProcessTimeWide() - t0;
+    YuiMsg("diag_clock measured_mhz=%llu reported_arm_mhz=%d x=%u", us ? (unsigned long long)(16000000ull / us) : 0ull,
+           scePowerGetArmClockFrequency(), x);
+  }
+  static const char *const names[DT_COUNT] = {"sprite_decode", "vdp2_bitmap", "atlas_push", "vdp1_draw",
+    "sh2_master_exec", "sh2_slave_exec", "hblank", "scu_exec", "smpc_cd_exec", "vdp2_draw", "gpu",
+    "scu_dma", "scu_dsp"};
+  for (unsigned i = 0; i < DT_COUNT; ++i)
+    if (vita_diag_calls[i])
+      YuiMsg("diag_timer name=%s us=%llu calls=%llu", names[i], (unsigned long long)vita_diag_us[i],
+             (unsigned long long)vita_diag_calls[i]);
+  for (unsigned m = 0; m < 8; ++m)
+    if (vita_diag_sprite_calls[m])
+      YuiMsg("diag_sprite mode=%u us=%llu texels=%llu calls=%llu", m, (unsigned long long)vita_diag_sprite_us[m],
+             (unsigned long long)vita_diag_sprite_texels[m], (unsigned long long)vita_diag_sprite_calls[m]);
+  memset(vita_diag_sprite_us, 0, sizeof(vita_diag_sprite_us)); memset(vita_diag_sprite_texels, 0, sizeof(vita_diag_sprite_texels));
+  memset(vita_diag_sprite_calls, 0, sizeof(vita_diag_sprite_calls));
+  { extern uint64_t vita_diag_exec_us[2], vita_diag_exec_n[2];
+    YuiMsg("diag_exec master_us=%llu master_n=%llu slave_us=%llu slave_n=%llu", (unsigned long long)vita_diag_exec_us[0],
+           (unsigned long long)vita_diag_exec_n[0], (unsigned long long)vita_diag_exec_us[1], (unsigned long long)vita_diag_exec_n[1]);
+    memset(vita_diag_exec_us, 0, sizeof(vita_diag_exec_us)); memset(vita_diag_exec_n, 0, sizeof(vita_diag_exec_n)); }
+  { extern uint32_t vita_diag_slice[2][8];
+    for (unsigned c = 0; c < 2; ++c)
+      YuiMsg("diag_slices cpu=%u early=%u idle=%u xforward=%u recorded=%u inslice_forward=%u other=%u", c,
+             vita_diag_slice[c][0], vita_diag_slice[c][1], vita_diag_slice[c][2], vita_diag_slice[c][3],
+             vita_diag_slice[c][4], vita_diag_slice[c][5]);
+    memset(vita_diag_slice, 0, sizeof(vita_diag_slice)); }
+  { extern void VitaDiagDspReport(void); VitaDiagDspReport(); }
+  YuiMsg("diag_dsp instructions=%llu", (unsigned long long)vita_diag_dsp_insns); vita_diag_dsp_insns = 0;
+  memset(vita_diag_us, 0, sizeof(vita_diag_us)); memset(vita_diag_calls, 0, sizeof(vita_diag_calls));
+}
+#endif
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/display.h>
@@ -27,6 +120,7 @@
 #include "m68kc68k.h"
 #include "osdcore.h"
 #include "peripheral.h"
+#include "memory.h"
 #include "present.h"
 #include "frame_capture.h"
 #include "input_replay.h"
@@ -596,6 +690,13 @@ int main(void) {
 #endif
 #ifdef VITA_SH2_DYNAREC
       VitaSh2ReportExecution();
+#ifdef VITA_DIAG_TIMERS
+      VitaDiagTimersReport();
+#endif
+#endif
+#ifdef VITA_STACK_PROFILE
+      { extern void ScspAccessReport(void); ScspAccessReport(); }
+      { extern void VitaSh2MemReport(void); VitaSh2MemReport(); }
 #endif
       YuiMsg("progress frames=%u elapsed_us=%llu fps=%.3f presentation_us=%llu copy_us=%llu master_pc=%08x slave_pc=%08x",
         frames, now-start, batch * 1000000.0/(now-last), present_us, copy_us,

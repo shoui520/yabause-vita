@@ -45,6 +45,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 #include <stdlib.h>
 #include "../vita/telemetry.h"
+#include "../vita/diag_timers.h"
 #include "yabause.h"
 #include "vdp1.h"
 #include "debug.h"
@@ -500,6 +501,10 @@ extern "C" void FASTCALL Vdp1WriteLong(u32 addr, UNUSED u32 val) {
 
 //////////////////////////////////////////////////////////////////////////////
 
+#ifdef VITA_STACK_PROFILE
+#include <psp2/kernel/processmgr.h>
+extern "C" void YuiMsg(const char *, ...);
+#endif
 extern "C" void Vdp1DrawCommands(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
 {
   std::unique_lock<std::mutex> lk(vdp1_clock_mtx);
@@ -534,6 +539,9 @@ extern "C" void Vdp1DrawCommands(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       vdp1_clock -= 10;
 #endif
       // First, process the command
+#if defined(VITA_STACK_PROFILE) && defined(VITA_DIAG_PER_CMD)
+      const uint64_t cmd_t0 = sceKernelGetProcessTimeWide();
+#endif
       if (!(command & 0x4000)) { // if (!skip)
          switch (command & 0x000F) {
          case 0: // normal sprite draw
@@ -577,6 +585,10 @@ extern "C" void Vdp1DrawCommands(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
          }
       }
 
+#if defined(VITA_STACK_PROFILE) && defined(VITA_DIAG_PER_CMD)
+      { static uint64_t us[16]; static unsigned cnt[16], calls; unsigned k = command & 0xF; us[k] += sceKernelGetProcessTimeWide() - cmd_t0; ++cnt[k];
+        if (++calls % 16384 == 0) { YuiMsg("vdp1_cmd us/n n0=%llu/%u s1=%llu/%u d2=%llu/%u p4=%llu/%u pl5=%llu/%u l6=%llu/%u c8=%llu/%u", us[0], cnt[0], us[1], cnt[1], us[2], cnt[2], us[4], cnt[4], us[5], cnt[5], us[6], cnt[6], us[8], cnt[8]); memset(us, 0, sizeof us); memset(cnt, 0, sizeof cnt); } }
+#endif
 	  // Force to quit internal command error( This technic(?) is used by BATSUGUN )
 	  if (regs->EDSR & 0x02){
 		  regs->LOPR = regs->addr >> 3;
@@ -747,7 +759,14 @@ int Vdp1GenerateCCode() {
 int g_vdp1_debug_dmp = 0;
 #endif
 
+static void Vdp1DrawInner(void);
 extern "C" void Vdp1Draw(void)
+{
+  DIAG_T0(t);
+  Vdp1DrawInner();
+  DIAG_T1(t, DT_VDP1);
+}
+static void Vdp1DrawInner(void)
 {
    VT_SCOPE(VT_VDP1);
 #if _DEBUG

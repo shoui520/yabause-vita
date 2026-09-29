@@ -44,6 +44,10 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #if defined(HAVE_LIBGL) || defined(__ANDROID__) || defined(IOS) || defined(NX)
 
 #include <math.h>
+#include <limits.h>
+#if defined(VITA_STACK_PROFILE) || defined(VITA_DIAG_ABLATE)
+#include <psp2/kernel/processmgr.h>
+#endif
 #define EPSILON (1e-10 )
 
 
@@ -564,6 +568,11 @@ static u32 FASTCALL Vdp1ReadPolygonColor(vdp1cmd_struct *cmd)
 }
 
 #include "../../vita/telemetry.h"
+#include "../../vita/diag_timers.h"
+#ifdef VITA_STACK_PROFILE
+static unsigned vt_rt_hit, vt_rt_miss, vt_rt_why[5]; static uint64_t vt_rt_us, vt_rt_texels;
+extern unsigned vita_atlas_frame, vita_atlas_prev_frame;
+#endif
 static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, YglTexture *texture)
 {
   VT_SCOPE(VT_TEXTURE_DECODE);
@@ -603,6 +612,18 @@ static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, Ygl
   addcolor = ((fixVdp2Regs->CCCTL & 0x540) == 0x140);
 
   Vdp1ReadPriority(cmd, &priority, &colorcl, &nromal_shadow);
+#ifdef VITA_STACK_PROFILE
+  { /* Diagnostic: VDP1 color modes by decoded texels, and flag mix. */
+    static unsigned texels[8], msb, spd, end, total;
+    texels[(cmd->CMDPMOD >> 3) & 7] += sprite->w * sprite->h;
+    msb += MSB_SHADOW; spd += SPD; end += END;
+    if (++total == 20000) {
+      YuiMsg("vdp1_modes sprites=%u texels bank4=%u lut4=%u bank64=%u bank128=%u bank256=%u rgb16=%u m6=%u m7=%u msb=%u spd=%u end=%u spctl=%x",
+        total, texels[0], texels[1], texels[2], texels[3], texels[4], texels[5], texels[6], texels[7], msb, spd, end, fixVdp2Regs->SPCTL);
+      memset(texels, 0, sizeof(texels)); msb = spd = end = total = 0;
+    }
+  }
+#endif
 
   switch ((cmd->CMDPMOD >> 3) & 0x7)
   {
@@ -2072,9 +2093,24 @@ static INLINE u32 Vdp2GetPixel32bppbmp(vdp2draw_struct *info, u32 addr) {
   return color;
 }
 
+static void FASTCALL Vdp2DrawBitmapInner(vdp2draw_struct *info, YglTexture *texture);
 static void FASTCALL Vdp2DrawBitmap(vdp2draw_struct *info, YglTexture *texture)
 {
+  DIAG_T0(t);
+  Vdp2DrawBitmapInner(info, texture);
+  DIAG_T1(t, DT_BITMAP);
+}
+static void FASTCALL Vdp2DrawBitmapInner(vdp2draw_struct *info, YglTexture *texture)
+{
+  VT_SCOPE(VT_VDP2_BITMAP);
   int i, j;
+#ifdef VITA_STACK_PROFILE
+  { static unsigned n; if ((n++ % 600) == 0)
+      YuiMsg("vdp2_bitmap_diag color=%d w=%d h=%d spri=%d sccm=%d scf=%d transp=%d alpha=%d co=%d pal=%x bank=%d ccctl=%x",
+        info->colornumber, info->cellw, info->cellh, info->specialprimode, info->specialcolormode,
+        info->specialcolorfunction, info->transparencyenable, info->alpha, info->coloroffset, info->paladdr,
+        info->char_bank[info->charaddr >> 17], fixVdp2Regs->CCCTL); }
+#endif
 
   switch (info->colornumber)
   {
@@ -2219,6 +2255,18 @@ static void FASTCALL Vdp2DrawCell(vdp2draw_struct *info, YglTexture *texture)
     return;
   }
 
+#ifdef VITA_STACK_PROFILE
+  { /* Diagnostic: which decode path each VDP2 cell takes. */
+    static unsigned counts[8], total;
+    const int path = info->colornumber > 4 ? 7 : info->colornumber;
+    ++counts[info->specialprimode == 2 ? 5 : (info->specialcolormode >= 2 && info->colornumber < 2) ? 6 : path];
+    if (++total == 200000) {
+      YuiMsg("vdp2_cell_paths 4bpp=%u 8bpp=%u 16pal=%u rgb16=%u rgb32=%u spri2=%u ccmode23=%u other=%u",
+        counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7]);
+      memset(counts, 0, sizeof(counts)); total = 0;
+    }
+  }
+#endif
   switch (info->colornumber)
   {
   case 0: // 4 BPP
@@ -2281,6 +2329,7 @@ static void FASTCALL Vdp2DrawCell(vdp2draw_struct *info, YglTexture *texture)
 
 static void FASTCALL Vdp2DrawBitmapLineScroll(vdp2draw_struct *info, YglTexture *texture)
 {
+  VT_SCOPE(VT_VDP2_BITMAP_LS);
   int i, j;
   int height = vdp2height;
 
@@ -2409,8 +2458,12 @@ static void FASTCALL Vdp2DrawBitmapLineScroll(vdp2draw_struct *info, YglTexture 
 }
 
 
+#ifdef VITA_STACK_PROFILE
+static uint64_t ci_copy_us; static unsigned ci_copy_n;
+#endif
 static void FASTCALL Vdp2DrawBitmapCoordinateInc(vdp2draw_struct *info, YglTexture *texture)
 {
+  VT_SCOPE(VT_VDP2_BITMAP_CI);
   u32 color;
   int i, j;
 
@@ -2428,6 +2481,17 @@ static void FASTCALL Vdp2DrawBitmapCoordinateInc(vdp2draw_struct *info, YglTextu
   if (vdp1_interlace != 0) {
     linestart = vdp1_interlace - 1;
   }
+
+  /* A row depends only on (sh, sv, inch): repeat rows (vertical zoom) copy the
+   * previous one. Rows are decoded into cached memory first, since the texture
+   * may be uncached video memory. */
+#ifdef VITA_STACK_PROFILE
+  { static unsigned calls, n; static uint64_t px; ++calls; px += (uint64_t)vdp2width * vdp2height;
+    if (++n % 64 == 0) YuiMsg("coordinc calls=%u px=%llu w=%d h=%d cn=%d inch=%d incv=%d ls=%d cellw=%d cellh=%d tex_w=%d", calls, px, vdp2width, vdp2height, info->colornumber, inch, incv, info->islinescroll, info->cellw, info->cellh, texture->w); }
+#endif
+  static u32 rowbuf[1024];
+  const int use_rowbuf = vdp2width > 0 && vdp2width <= 1024;
+  int prev_sh = 0, prev_sv = -1, prev_inch = 0;
 
   for (i = linestart; i < height; i += lineinc)
   {
@@ -2456,6 +2520,21 @@ static void FASTCALL Vdp2DrawBitmapCoordinateInc(vdp2draw_struct *info, YglTextu
 
     //sh &= (info->cellw - 1);
     sv &= (info->cellh - 1);
+
+    if (sv == prev_sv && sh == prev_sh && inch == prev_inch && use_rowbuf) {
+#ifdef VITA_STACK_PROFILE
+      uint64_t tc0 = sceKernelGetProcessTimeWide();
+      memcpy(texture->textdata, rowbuf, (size_t)vdp2width * sizeof(*texture->textdata));
+      ci_copy_us += sceKernelGetProcessTimeWide() - tc0; ++ci_copy_n;
+#else
+      memcpy(texture->textdata, rowbuf, (size_t)vdp2width * sizeof(*texture->textdata));
+#endif
+      texture->textdata += vdp2width + texture->w;
+      continue;
+    }
+    prev_sh = sh; prev_sv = sv; prev_inch = inch;
+    u32 *const row = texture->textdata;
+    if (use_rowbuf) texture->textdata = rowbuf;
 
     switch (info->colornumber) {
     case 0:
@@ -2530,15 +2609,22 @@ static void FASTCALL Vdp2DrawBitmapCoordinateInc(vdp2draw_struct *info, YglTextu
 
       }
       break;
-    case 3:
+    case 3: {
       //baseaddr += ((sh + sv * info->cellw) << 1);
+      int last_h = -1;
+      u32 last = 0;
       for (j = 0; j < vdp2width; j++)
       {
         int h = ((j*inch) >> 8);
-        u32 addr = (((sh + h)&(info->cellw - 1)) + sv * info->cellw) << 1;  // Not confrimed
-        *texture->textdata++ = Vdp2GetPixel16bppbmp(info, baseaddr + addr);
+        if (h != last_h) {
+          u32 addr = (((sh + h)&(info->cellw - 1)) + sv * info->cellw) << 1;  // Not confrimed
+          last = Vdp2GetPixel16bppbmp(info, baseaddr + addr);
+          last_h = h;
+        }
+        *texture->textdata++ = last;
       }
       break;
+    }
     case 4:
       //baseaddr += ((sh + sv * info->cellw) << 2);
       for (j = 0; j < vdp2width; j++)
@@ -2548,6 +2634,16 @@ static void FASTCALL Vdp2DrawBitmapCoordinateInc(vdp2draw_struct *info, YglTextu
         *texture->textdata++ = Vdp2GetPixel32bppbmp(info, baseaddr + addr);
       }
       break;
+    }
+    if (use_rowbuf) {
+#ifdef VITA_STACK_PROFILE
+      uint64_t tc0 = sceKernelGetProcessTimeWide();
+      memcpy(row, rowbuf, (size_t)vdp2width * sizeof(*row));
+      ci_copy_us += sceKernelGetProcessTimeWide() - tc0; ++ci_copy_n;
+#else
+      memcpy(row, rowbuf, (size_t)vdp2width * sizeof(*row));
+#endif
+      texture->textdata = row + vdp2width;
     }
     texture->textdata += texture->w;
   }
@@ -2572,6 +2668,9 @@ static void Vdp2AuditCellAlpha(const vdp2draw_struct *tile,const YglCache *c) {
   ++vita_cell_alpha_counts[cls];
   if(cls==1 && (tile->blendmode&3)==VDP2_CC_NONE) ++vita_cell_alpha_counts[3];
 }
+#endif
+#ifdef VITA_DIAG_ABLATE
+unsigned vt_pat[2]; /* diagnostic: NBG0 pattern cache misses, hits */
 #endif
 static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x, int y, int cx, int cy, int lines )
 {
@@ -2634,13 +2733,21 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
   tile.cob = info->cob;
 
 
-  if (1 == YglIsCached(_Ygl->texture_manager, cacheaddr, &c))
+  VT_STACK_BEGIN(VT_VDP2_CELL_LOOKUP);
+  const int cell_cached = YglIsCached(_Ygl->texture_manager, cacheaddr, &c);
+  VT_STACK_END();
+#ifdef VITA_DIAG_ABLATE
+  if (info->id == 0) { extern unsigned vt_pat[2]; ++vt_pat[cell_cached == 1]; }
+#endif
+  if (1 == cell_cached)
   {
 #ifdef VITA_SKIP_TRANSPARENT_CELLS
     if (c.x < 0.0f) { ++vita_transparent_cells_skipped; return; } /* all texels alpha 0 */
 #endif
     //printf("x=%d,y=%d %lx cached\n",x,y,cacheaddr);
+    VT_STACK_BEGIN(VT_VDP2_CELL_QUAD);
     YglCachedQuadOffset(&tile, &c, cx, cy, info->coordincx, info->coordincy);
+    VT_STACK_END();
 #ifdef VITA_DIAG_CELL_ALPHA
     Vdp2AuditCellAlpha(&tile,&c);
 #endif
@@ -2648,8 +2755,11 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
   }
 
   //printf("x=%d,y=%d %lx not cached\n",x,y,cacheaddr);
+  VT_STACK_BEGIN(VT_VDP2_CELL_QUAD);
   YglQuadOffset(&tile, texture, &c, cx, cy, info->coordincx, info->coordincy);
   YglCacheAdd(_Ygl->texture_manager, cacheaddr, &c);
+  VT_STACK_END();
+  VT_STACK_BEGIN(VT_VDP2_CELL_DECODE);
 #ifdef VITA_SKIP_TRANSPARENT_CELLS
   const unsigned int *cell_texels = texture->textdata;
   const unsigned cell_pitch = texture->w + tile.cellw; /* YglTMAllocate: w = width - cellw */
@@ -2695,6 +2805,7 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
   }
   ++vita_transparent_cells_decoded;
 #endif
+  VT_STACK_END();
 #ifdef VITA_DIAG_CELL_ALPHA
   Vdp2AuditCellAlpha(&tile,&c);
 #endif
@@ -3006,7 +3117,158 @@ static INLINE u32 Vdp2RotationFetchPixel(vdp2draw_struct *info, int x, int y, in
 
 //////////////////////////////////////////////////////////////////////////////
 
+/* One 8-dot cell row of a 4bpp (colornumber 0) or 8bpp (1) cell at rowaddr
+ * in VDP2 RAM, read forwards (fx 0) or mirrored (fx 7): the dot's CRAM
+ * index base + dot with alpha a24 in the top byte, or 0 for a transparent
+ * dot 0. */
+static INLINE void Vdp2PerLineDecodeCellRow(u32 rowaddr, int colornumber, int fx, u32 base, u32 a24, int transp,
+                                            u32 *row) {
+  if (rowaddr + 8 <= 0x80000 && (fx == 0 || fx == 7)) {
+    uint8x8_t dots;
+    if (colornumber == 0) {
+      u32 w;
+      memcpy(&w, Vdp2Ram + rowaddr, 4);
+      const uint8x8_t b = vreinterpret_u8_u32(vdup_n_u32(w));
+      dots = vzip_u8(vshr_n_u8(b, 4), vand_u8(b, vdup_n_u8(0xF))).val[0];
+    } else {
+      dots = vld1_u8(Vdp2Ram + rowaddr);
+    }
+    if (fx) dots = vrev64_u8(dots);
+    const uint16x8_t d16 = vmovl_u8(dots);
+    const uint32x4_t lo = vmovl_u16(vget_low_u16(d16)), hi = vmovl_u16(vget_high_u16(d16));
+    const uint32x4_t b4 = vdupq_n_u32(base), a4 = vdupq_n_u32(a24);
+    uint32x4_t tlo = vorrq_u32(vaddq_u32(b4, lo), a4), thi = vorrq_u32(vaddq_u32(b4, hi), a4);
+    if (transp) {
+      tlo = vbicq_u32(tlo, vceqq_u32(lo, vdupq_n_u32(0)));
+      thi = vbicq_u32(thi, vceqq_u32(hi, vdupq_n_u32(0)));
+    }
+    vst1q_u32(row, tlo);
+    vst1q_u32(row + 4, thi);
+    return;
+  }
+  if (colornumber == 0) {
+    for (int k = 0; k < 8; ++k) {
+      const int x = k ^ fx;
+      u32 dot = T1ReadByte(Vdp2Ram, (rowaddr + (x >> 1)) & 0x7FFFF);
+      dot = (x & 1) ? (dot & 0xF) : (dot >> 4);
+      row[k] = (dot == 0 && transp) ? 0 : ((base + dot) | a24);
+    }
+  } else {
+    for (int k = 0; k < 8; ++k) {
+      const u32 dot = T1ReadByte(Vdp2Ram, (rowaddr + (k ^ fx)) & 0x7FFFF);
+      row[k] = (dot == 0 && transp) ? 0 : ((base + dot) | a24);
+    }
+  }
+}
+
+/* Whether Vdp2PerLineDecodeCellRow decodes the layer's cells. */
+static INLINE int Vdp2PerLineCellRowFast(const vdp2draw_struct *info) {
+  return info->colornumber <= 1 && info->specialprimode != 2 && info->specialcolormode <= 1 && info->cellw == 8;
+}
+
+/* rowcache[k] == Vdp2RotationFetchPixel(info, k ^ fx, y, info->cellw) for k in 0..7. */
+static INLINE void Vdp2PerLineDecodeRow(vdp2draw_struct *info, int y, int fx, u32 *row) {
+  const int cellw = info->cellw;
+  if (Vdp2PerLineCellRowFast(info)) {
+    const u32 alpha = (info->specialcolormode == 1 && info->specialcolorfunction == 0) ? 0xFF : info->alpha;
+    const u32 rowaddr = (info->charaddr + y * (info->colornumber == 0 ? 4 : 8)) & 0x7FFFF;
+    Vdp2PerLineDecodeCellRow(rowaddr, info->colornumber, fx, info->coloroffset + (info->paladdr << 4), alpha << 24,
+                             info->transparencyenable, row);
+    return;
+  }
+  for (int k = 0; k < 8; ++k) row[k] = Vdp2RotationFetchPixel(info, k ^ fx, y, cellw);
+}
+
+#ifdef VITA_STACK_PROFILE
+static unsigned vt_perline_px, vt_perline_miss;
+static unsigned vt_pl_mode;
+#endif
+/* Dot position inside the pattern's cell data for the page-local (charx, chary), after flips. */
+static INLINE void Vdp2PerLineCellXYF(int patternwh, int flipfunction, int charx, int chary, int *px, int *py) {
+  int x = charx;
+  int y = chary;
+
+  if (patternwh == 1)
+  {
+    x &= 8 - 1;
+    y &= 8 - 1;
+
+    // vertical flip
+    if (flipfunction & 0x2)
+      y = 8 - 1 - y;
+
+    // horizontal flip	
+    if (flipfunction & 0x1)
+      x = 8 - 1 - x;
+  }
+  else
+  {
+    if (flipfunction)
+    {
+      y &= 16 - 1;
+      if (flipfunction & 0x2)
+      {
+        if (!(y & 8))
+          y = 8 - 1 - y + 16;
+        else
+          y = 16 - 1 - y;
+      }
+      else if (y & 8)
+        y += 8;
+
+      if (flipfunction & 0x1)
+      {
+        if (!(x & 8))
+          y += 8;
+
+        x &= 8 - 1;
+        x = 8 - 1 - x;
+      }
+      else if (x & 8)
+      {
+        y += 8;
+        x &= 8 - 1;
+      }
+      else
+        x &= 8 - 1;
+    }
+    else
+    {
+      y &= 16 - 1;
+      if (y & 8)
+        y += 8;
+      if (x & 8)
+        y += 8;
+      x &= 8 - 1;
+    }
+  }
+  *px = x;
+  *py = y;
+}
+
+static INLINE void Vdp2PerLineCellXY(const vdp2draw_struct *info, int charx, int chary, int *px, int *py) {
+  Vdp2PerLineCellXYF(info->patternwh, info->flipfunction, charx, chary, px, py);
+}
+
 static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
+  VT_SCOPE(VT_VDP2_MAP_LINE);
+#ifdef VITA_STACK_PROFILE
+  {
+    static unsigned diag_n;
+    if ((++diag_n & 255) == 1) {
+      int hvar = 0, vvar = 0, zvar = 0;
+      for (int l = 1; l < vdp2height && l < 512; ++l) {
+        hvar += info->lineinfo[l].LineScrollValH != info->lineinfo[0].LineScrollValH;
+        vvar += info->lineinfo[l].LineScrollValV != info->lineinfo[0].LineScrollValV;
+        zvar += info->lineinfo[l].CoordinateIncH != info->lineinfo[0].CoordinateIncH;
+      }
+      YuiMsg("diag_perline n=%u pri=%d ls=%x lineinc=%d col=%d pwh=%d cellw=%d spm=%d scm=%d incx=%f incy=%f vs=%d tr=%d hvar=%d vvar=%d zvar=%d h=%d\n",
+             diag_n, info->priority, info->islinescroll, info->lineinc, info->colornumber, info->patternwh, info->cellw,
+             info->specialprimode, info->specialcolormode, info->coordincx, info->coordincy, info->isverticalscroll,
+             info->transparencyenable, hvar, vvar, zvar, vdp2height);
+    }
+  }
+#endif
 
   int lineindex = 0;
 
@@ -3063,6 +3325,14 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
   }
 
 
+#ifdef VITA_STACK_PROFILE
+  if (vt_pl_mode != 4)
+#endif
+  u32 linebuf[1024];
+#ifdef VITA_STACK_PROFILE
+  static uint64_t dpl_copy_us, dpl_total_us; static unsigned dpl_calls;
+  const uint64_t dpl_t0 = sceKernelGetProcessTimeWide();
+#endif
   for (v = 0; v < vdp2height; v += 1) {  // ToDo: info->coordincy
 
     int targetv = 0;
@@ -3120,10 +3390,29 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
     if (pagey < 0) pagey = info->pagewh - 1 + pagey;
 
     int inch = 1.0 / info->coordincx*256.0;
+    int precell = INT_MIN;
+    u32 rowcache[8];
+    u32 *const lineout = texture->textdata;
+    texture->textdata = linebuf;
 
     for (int j = 0; j < info->draww; j += 1) {
       
       int h = ((j*inch) >> 8);
+      /* Every input except the dot's column is constant across an 8-dot
+       * aligned run (plane, page and pattern boundaries are multiples of 8),
+       * so decode the cell row once and index it. */
+      const int pos = h + sx;
+#ifdef VITA_STACK_PROFILE
+      ++vt_perline_px;
+#endif
+      if ((pos >> 3) == precell) {
+        *texture->textdata++ = rowcache[pos & 7];
+        continue;
+      }
+      precell = pos >> 3;
+#ifdef VITA_STACK_PROFILE
+      ++vt_perline_miss;
+#endif
 
       //mapx = (h + sx) / (512 * info->planew);
       mapx = (h + sx) >> planew_shift;
@@ -3156,8 +3445,8 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
         prepagey = pagey;
       }
 
-      int x = charx;
-      int y = chary;
+      int x, y;
+      Vdp2PerLineCellXY(info, charx, chary, &x, &y);
 
       if (info->patternwh == 1)
       {
@@ -3218,8 +3507,23 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
 
     }
     if((v & linemask) == linemask) lineindex++;
-    texture->textdata += texture->w;
+#ifdef VITA_STACK_PROFILE
+    const uint64_t dpl_c0 = sceKernelGetProcessTimeWide();
+#endif
+    memcpy(lineout, linebuf, info->draww * sizeof(u32));
+#ifdef VITA_STACK_PROFILE
+    dpl_copy_us += sceKernelGetProcessTimeWide() - dpl_c0;
+#endif
+    texture->textdata = lineout + info->draww + texture->w;
   }
+#ifdef VITA_STACK_PROFILE
+  dpl_total_us += sceKernelGetProcessTimeWide() - dpl_t0;
+  if ((++dpl_calls & 127) == 0) {
+    YuiMsg("diag_perline_general calls=128 total_us=%llu copy_us=%llu draww=%d h=%d inch=%d incv=%d px=%u miss=%u",
+           (unsigned long long)dpl_total_us, (unsigned long long)dpl_copy_us, info->draww, vdp2height,
+           (int)(1.0 / info->coordincx * 256.0), incv, vt_perline_px, vt_perline_miss);
+    dpl_total_us = dpl_copy_us = 0; }
+#endif
 
 }
 
@@ -3391,7 +3695,11 @@ void Vdp2DrawMapPerLineNbg23(vdp2draw_struct *info, YglTexture *texture, int id,
 
 }
 
+#ifdef VITA_STACK_PROFILE
+static unsigned dm_cells[8], dm_calls[8];
+#endif
 static void Vdp2DrawMapTest(vdp2draw_struct *info, YglTexture *texture) {
+  VT_SCOPE(VT_VDP2_MAP);
 
   int lineindex = 0;
 
@@ -3487,15 +3795,27 @@ static void Vdp2DrawMapTest(vdp2draw_struct *info, YglTexture *texture) {
       charx = dot_on_pagex & page_mask;
       if (pagex < 0) pagex = info->pagewh - 1 + pagex;
 
+      VT_STACK_BEGIN(VT_VDP2_CELL_ADDR);
       info->PlaneAddr(info, info->mapwh * mapy + mapx, fixVdp2Regs);
       Vdp2PatternAddrPos(info, planex, pagex, planey, pagey);
+      VT_STACK_END();
       Vdp2DrawPatternPos(info, texture, h - charx, v - chary, 0, 0, info->lineinc);
+#ifdef VITA_STACK_PROFILE
+      ++dm_cells[info->id & 7];
+#endif
 
     }
 
     lineindex++;
   }
-
+#ifdef VITA_STACK_PROFILE
+  if ((++dm_calls[info->id & 7] & 127) == 0) {
+    YuiMsg("diag_drawmap id=%d calls=128 cells=%u pwh=%d col=%d incx=%f incy=%f win=%d/%d vs=%d spm=%d scm=%d",
+           info->id, dm_cells[info->id & 7], info->patternwh, info->colornumber, info->coordincx, info->coordincy,
+           info->bEnWin0, info->bEnWin1, info->isverticalscroll, info->specialprimode, info->specialcolormode);
+    dm_cells[info->id & 7] = 0;
+  }
+#endif
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -4650,7 +4970,15 @@ void VIDOGLVdp1DrawStart(void)
     YglTMReset(YglTM);
     YglCacheReset(YglTM);
   }
+#ifdef VITA_STACK_PROFILE
+  static uint64_t v1s_pull, v1s_cmd; static unsigned v1s_n;
+  uint64_t v1s_t0 = sceKernelGetProcessTimeWide();
+#endif
   YglTmPull(YglTM, 1);
+#ifdef VITA_STACK_PROFILE
+  uint64_t v1s_t1 = sceKernelGetProcessTimeWide();
+  v1s_pull += v1s_t1 - v1s_t0;
+#endif
 
   maxpri = 0x00;
   minpri = 0x07;
@@ -4664,8 +4992,14 @@ void VIDOGLVdp1DrawStart(void)
 
   _Ygl->msb_shadow_count_[_Ygl->drawframe] = 0;
 
+  VT_STACK_BEGIN(VT_VDP1);
   Vdp1DrawCommands(Vdp1Ram, Vdp1Regs, NULL);
+  VT_STACK_END();
   FrameProfileAdd("Vdp1Command end ");
+#ifdef VITA_STACK_PROFILE
+  v1s_cmd += sceKernelGetProcessTimeWide() - v1s_t1;
+  if ((++v1s_n & 63) == 0) { YuiMsg("diag_v1start calls=64 pull_us=%llu cmd_us=%llu", v1s_pull, v1s_cmd); v1s_pull = v1s_cmd = 0; }
+#endif
 
 }
 
@@ -4709,6 +5043,8 @@ void VIDOGLVdp1NormalSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
     return; // BAD Command
   }
 
+  sprite.id = 0;   /* VDP1 has no screen id; only a batching key */
+  sprite.cor = 0;
   sprite.dst = 0;
   sprite.blendmode = VDP1_COLOR_CL_REPLACE;
   sprite.linescreen = 0;
@@ -4844,6 +5180,8 @@ void VIDOGLVdp1ScaledSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
     return; // BAD Command
   }
 
+  sprite.id = 0;   /* VDP1 has no screen id; only a batching key */
+  sprite.cor = 0;
   sprite.dst = 0;
   sprite.blendmode = VDP1_COLOR_CL_REPLACE;
   sprite.linescreen = 0;
@@ -5055,11 +5393,20 @@ void VIDOGLVdp1DistortedSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
   float col[4 * 4];
   int isSquare;
 
+#if defined(VITA_STACK_PROFILE) && defined(VITA_DIAG_PER_CMD)
+  uint64_t dt0 = sceKernelGetProcessTimeWide(), dt1, dt2;
+  static uint64_t dus[5]; static unsigned dn[3], dcalls;
+#define DPROF_END(k) do { uint64_t e_ = sceKernelGetProcessTimeWide(); dus[0] += dt1 - dt0; dus[1] += dt2 - dt1; dus[2+(k)] += e_ - dt2; ++dn[k]; \
+    if (++dcalls % 8192 == 0) { YuiMsg("dist_prof setup=%llu cachechk=%llu hit=%llu/%u miss=%llu/%u", dus[0], dus[1], dus[2], dn[0], dus[3], dn[1]); memset(dus,0,sizeof dus); memset(dn,0,sizeof dn);} } while (0)
+#else
+#define DPROF_END(k) ((void)0)
+#endif
   Vdp1ReadCommand(&cmd, Vdp1Regs->addr, Vdp1Ram);
   if (cmd.CMDSIZE == 0) {
     return; // BAD Command
   }
 
+  sprite.id = 0;   /* VDP1 has no screen id; only a batching key */
   sprite.blendmode = VDP1_COLOR_CL_REPLACE;
   sprite.linescreen = 0;
   sprite.dst = 1;
@@ -5260,27 +5607,53 @@ void VIDOGLVdp1DistortedSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       col[(i << 2) + 3] = 1.0f;
     }
 
+#if defined(VITA_STACK_PROFILE) && defined(VITA_DIAG_PER_CMD)
+    dt1 = sceKernelGetProcessTimeWide();
+    int hitg_ = YglIsCached(_Ygl->texture_manager, tmp, &cash);
+    dt2 = sceKernelGetProcessTimeWide();
+    if (1 == hitg_)
+    {
+      YglCacheQuadGrowShading(&sprite, col, &cash);
+      DPROF_END(0);
+      return;
+    }
+#else
     if (1 == YglIsCached(_Ygl->texture_manager, tmp, &cash))
     {
       YglCacheQuadGrowShading(&sprite, col, &cash);
       return;
     }
+#endif
 
     YglQuadGrowShading(&sprite, &texture, col, &cash);
     YglCacheAdd(_Ygl->texture_manager, tmp, &cash);
     Vdp1ReadTexture(&cmd, &sprite, &texture);
+    DPROF_END(1);
     return;
   }
   else // No Gouraud shading, use same color for all 4 vertices
   {
+#if defined(VITA_STACK_PROFILE) && defined(VITA_DIAG_PER_CMD)
+    dt1 = sceKernelGetProcessTimeWide();
+    int hit_ = YglIsCached(_Ygl->texture_manager, tmp, &cash);
+    dt2 = sceKernelGetProcessTimeWide();
+    if (1 == hit_)
+    {
+      YglCacheQuadGrowShading(&sprite, NULL, &cash);
+      DPROF_END(0);
+      return;
+    }
+#else
     if (1 == YglIsCached(_Ygl->texture_manager, tmp, &cash))
     {
       YglCacheQuadGrowShading(&sprite, NULL, &cash);
       return;
     }
+#endif
     YglQuadGrowShading(&sprite, &texture, NULL, &cash);
     YglCacheAdd(_Ygl->texture_manager, tmp, &cash);
     Vdp1ReadTexture(&cmd, &sprite, &texture);
+    DPROF_END(1);
   }
   return;
       }
@@ -5307,6 +5680,7 @@ void VIDOGLVdp1PolygonDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
   int colorcalc = 0;
   vdp1cmd_struct cmd;
 
+  sprite.id = 0;   /* VDP1 has no screen id; only a batching key */
   sprite.linescreen = 0;
 
   Vdp1ReadCommand(&cmd, Vdp1Regs->addr, Vdp1Ram);
@@ -5747,6 +6121,7 @@ void VIDOGLVdp1PolylineDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
   int normalshadow = 0;
   int colorcalc = 0;
 
+  polygon.id = 0;   /* VDP1 has no screen id; only a batching key */
   polygon.blendmode = VDP1_COLOR_CL_REPLACE;
   polygon.linescreen = 0;
   polygon.dst = 0;
@@ -6012,6 +6387,7 @@ void VIDOGLVdp1LineDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
   int normalshadow = 0;
   int colorcalc = 0;
   u16 color2;
+  polygon.id = 0;   /* VDP1 has no screen id; only a batching key */
   polygon.cor = 0x00;
   polygon.cog = 0x00;
   polygon.cob = 0x00;
@@ -6848,6 +7224,13 @@ static void Vdp2DrawNBG0(void)
   else
     info.isverticalscroll = 0;
 
+#ifdef VITA_DIAG_ABLATE
+  { static unsigned n; if ((n++ & 127) == 0)
+      YuiMsg("nbg0 enable=%d bitmap=%d linescroll=%d vscroll=%d coordinc=%g,%g size=%dx%d cell=%dx%d patternwh=%d colornumber=%d scrctl=%x zmctl=%x",
+        info.enable, info.isbitmap, info.islinescroll, info.isverticalscroll, info.coordincx, info.coordincy,
+        vdp2width, vdp2height, info.cellw, info.cellh, info.patternwh, info.colornumber,
+        fixVdp2Regs->SCRCTL, fixVdp2Regs->ZMCTL); }
+#endif
   if (info.enable == 1)
   {
     // NBG0 draw
@@ -6962,12 +7345,31 @@ static void Vdp2DrawNBG0(void)
 
         infotmp.flipfunction = 0;
         YglQuad(&infotmp, &texture, &tmpc);
+#ifdef VITA_STACK_PROFILE
+        { static uint64_t pl_us; static unsigned pl_n; uint64_t t0 = sceKernelGetProcessTimeWide();
         Vdp2DrawMapPerLine(&info, &texture);
+        pl_us += sceKernelGetProcessTimeWide() - t0;
+        if ((++pl_n & 127) == 0) { YuiMsg("diag_perline_us calls=128 us=%llu px=%u miss=%u\n", (unsigned long long)pl_us, vt_perline_px, vt_perline_miss); pl_us = 0; vt_perline_px = vt_perline_miss = 0; } }
+#elif defined(VITA_DIAG_ABLATE)
+        { static uint64_t pl_us; static unsigned pl_n; uint64_t t0 = sceKernelGetProcessTimeWide();
+        Vdp2DrawMapPerLine(&info, &texture);
+        pl_us += sceKernelGetProcessTimeWide() - t0;
+        if ((++pl_n & 127) == 0) { YuiMsg("nbg0_perline calls=128 us=%llu", (unsigned long long)pl_us); pl_us = 0; } }
+#else
+        Vdp2DrawMapPerLine(&info, &texture);
+#endif
       }
       else {
         info.x = fixVdp2Regs->SCXIN0 & 0x7FF;
         info.y = fixVdp2Regs->SCYIN0 & 0x7FF;
+#ifdef VITA_DIAG_ABLATE
+        { static uint64_t us; static unsigned n; const uint64_t t0 = sceKernelGetProcessTimeWide();
         Vdp2DrawMapTest(&info, &texture);
+        us += sceKernelGetProcessTimeWide() - t0;
+        if ((++n & 63) == 0) { YuiMsg("nbg0_map calls=64 us=%llu miss=%u hit=%u", (unsigned long long)us, vt_pat[0], vt_pat[1]); us = 0; vt_pat[0] = vt_pat[1] = 0; } }
+#else
+        Vdp2DrawMapTest(&info, &texture);
+#endif
       }
     }
   }
@@ -7067,6 +7469,7 @@ static void Vdp2DrawNBG1(void)
     info.alpha = ((~fixVdp2Regs->CCRNA & 0x1F00) >> 5) + 0x7;
     if (fixVdp2Regs->CCCTL & 0x100 ) {
       info.blendmode |= VDP2_CC_ADD;
+      info.alpha = 0xFF;
     } else {
       info.blendmode |= VDP2_CC_RATE;
     }
@@ -7185,7 +7588,13 @@ static void Vdp2DrawNBG1(void)
         infotmp.cellh = vdp2height;
 
       YglQuad(&infotmp, &texture, &tmpc);
+#ifdef VITA_STACK_PROFILE
+      { static uint64_t us; static unsigned n; uint64_t t0 = sceKernelGetProcessTimeWide();
       Vdp2DrawBitmapCoordinateInc(&info, &texture);
+      us += sceKernelGetProcessTimeWide() - t0; if (++n % 64 == 0) { YuiMsg("coordinc_us per64=%llu copy=%llu/%u", us, ci_copy_us, ci_copy_n); us = 0; ci_copy_us = 0; ci_copy_n = 0; } }
+#else
+      Vdp2DrawBitmapCoordinateInc(&info, &texture);
+#endif
     }
     else {
 
@@ -7269,7 +7678,21 @@ static void Vdp2DrawNBG1(void)
       infotmp.cellh = vdp2height;
       infotmp.flipfunction = 0;
       YglQuad(&infotmp, &texture, &tmpc);
+#ifdef VITA_STACK_PROFILE
+      { static uint64_t pl_fast, pl_gen; static unsigned pl_n;
+      vdp2draw_struct si = info; YglTexture st = texture;
+      vt_pl_mode = 4;
+      uint64_t t0 = sceKernelGetProcessTimeWide();
       Vdp2DrawMapPerLine(&info, &texture);
+      pl_gen += sceKernelGetProcessTimeWide() - t0;
+      info = si; texture = st; vt_pl_mode = 0;
+      t0 = sceKernelGetProcessTimeWide();
+      Vdp2DrawMapPerLine(&info, &texture);
+      pl_fast += sceKernelGetProcessTimeWide() - t0;
+      if ((++pl_n & 63) == 0) { YuiMsg("diag_perline1_ab calls=64 fast=%llu general=%llu\n", pl_fast, pl_gen); pl_fast = pl_gen = 0; } }
+#else
+      Vdp2DrawMapPerLine(&info, &texture);
+#endif
     }
     else {
       //Vdp2DrawMap(&info, &texture);
@@ -7334,6 +7757,7 @@ static void Vdp2DrawNBG2(void)
     if (fixVdp2Regs->CCCTL & 0x100 /*&& info.specialcolormode == 0*/)
     {
       info.blendmode |= VDP2_CC_ADD;
+      info.alpha = 0xFF;
     }
     else {
       info.blendmode |= VDP2_CC_RATE;
@@ -7495,6 +7919,7 @@ static void Vdp2DrawNBG3(void)
       if (fixVdp2Regs->CCCTL & 0x100 )
       {
         info.blendmode |= VDP2_CC_ADD;
+        info.alpha = 0xFF;
       }
       else {
         info.blendmode |= VDP2_CC_RATE;
@@ -7929,6 +8354,7 @@ static void Vdp2DrawRBG0(void)
     info->alpha = ((~fixVdp2Regs->CCRR & 0x1F) << 3) + 0x7;
     if (fixVdp2Regs->CCCTL & 0x100 ){
         info->blendmode |= VDP2_CC_ADD;
+        info->alpha = 0xFF;
     } else {
         info->blendmode |= VDP2_CC_RATE;
     }
@@ -7973,20 +8399,41 @@ void VIDOGLVdp2DrawScreens(void)
 
   Vdp2GenerateWindowInfo();
 
+#ifdef VITA_STACK_PROFILE
+  static uint64_t ls_us[6]; static unsigned ls_n;
+  uint64_t ls_t = sceKernelGetProcessTimeWide(), ls_t1;
+#define LS_MARK(i) (ls_t1 = sceKernelGetProcessTimeWide(), ls_us[i] += ls_t1 - ls_t, ls_t = ls_t1)
+#else
+#define LS_MARK(i) ((void)0)
+#endif
   Vdp2DrawRBG0();
   FrameProfileAdd("RBG0 end");
+  LS_MARK(0);
   
   Vdp2DrawBackScreen();
   Vdp2DrawLineColorScreen();
+  LS_MARK(1);
     
   Vdp2DrawNBG3();
   FrameProfileAdd("NBG3 end");
+  LS_MARK(2);
   Vdp2DrawNBG2();
   FrameProfileAdd("NBG2 end");
+  LS_MARK(3);
   Vdp2DrawNBG1();
   FrameProfileAdd("NBG1 end");
+  LS_MARK(4);
   Vdp2DrawNBG0();
   FrameProfileAdd("NBG0 end");
+  LS_MARK(5);
+#undef LS_MARK
+#ifdef VITA_STACK_PROFILE
+  if ((++ls_n & 127) == 0) {
+    YuiMsg("diag_layers calls=128 rbg0=%llu back=%llu nbg3=%llu nbg2=%llu nbg1=%llu nbg0=%llu",
+           ls_us[0], ls_us[1], ls_us[2], ls_us[3], ls_us[4], ls_us[5]);
+    memset(ls_us, 0, sizeof(ls_us));
+  }
+#endif
 
   Vdp2DrawRotationSync();
 }

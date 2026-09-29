@@ -520,6 +520,10 @@ void Vdp2Reset(void) {
    Vdp2Internal.ColorMode = 0;
 
    Vdp2External.disptoggle = 0xFF;
+#ifdef VITA_DIAG_LAYERS
+   { FILE *f = fopen("ux0:data/yabause-vita/layers.txt", "r"); unsigned m;
+     if (f) { if (fscanf(f, "%u", &m) == 1) Vdp2External.disptoggle = m; fclose(f); } }
+#endif
    Vdp2External.perline_alpha_a = 0;
    Vdp2External.perline_alpha_b = 0;
    Vdp2External.perline_alpha = &Vdp2External.perline_alpha_a;
@@ -825,6 +829,8 @@ void Vdp2HBlankIN(void) {
 
   if (yabsys.LineCount < yabsys.VBlankLineCount) {
     Vdp2Regs->TVSTAT |= 0x0004;
+#ifdef VITA_STACK_PROFILE
+#endif
     ScuSendHBlankIN();
     //if (yabsys.IsSSH2Running)
     //  SH2SendInterrupt(SSH2, 0x42, 0x2);
@@ -987,6 +993,8 @@ void Vdp2HBlankOUT(void) {
       }
   }
 #else
+#ifdef VITA_STACK_PROFILE
+#endif
     vdp2VBlankOUT();
   }
   

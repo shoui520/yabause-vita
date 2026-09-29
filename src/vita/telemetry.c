@@ -111,6 +111,9 @@ static const char *names[] = { VITA_TELEMETRY_PHASES(VT_NAME) };
 static const char *kinds[] = { VITA_TELEMETRY_PHASES(VT_KIND) };
 #undef VT_KIND
 
+#ifdef VITA_STACK_PROFILE
+static void vt_stack_start(void);
+#endif
 void VitaTelemetryThread(const char *role) {
   if (!VitaTelemetryMode) return;
   if (!initialized) {
@@ -135,6 +138,9 @@ void VitaTelemetryThread(const char *role) {
   }
   if (!strcmp(role, "emulation")) observer_tid = sceKernelGetThreadId();
   pthread_mutex_unlock(&registry_lock);
+#ifdef VITA_STACK_PROFILE
+  if (!strcmp(role, "emulation")) vt_stack_start();
+#endif
   if (registry_slot < 0) YuiMsg("telemetry_registry_full coverage=partial");
 }
 static void ensure_owner(void) {
@@ -162,7 +168,81 @@ static VitaTelemetrySampler *owner_samples(void) {
   }
   return sample_owners.phase[slot];
 }
+#ifdef VITA_STACK_PROFILE
+volatile unsigned char vt_stack[64];
+volatile unsigned vt_stack_depth;
+uintptr_t vt_stack_owner = 1; /* never a valid thread pointer until set */
+static volatile unsigned vt_stack_hist[VT_PHASE_COUNT + 1];
+volatile unsigned char vt_stack2[64];
+volatile unsigned vt_stack2_depth;
+uintptr_t vt_stack2_owner = 1;
+static volatile unsigned vt_stack2_hist[VT_PHASE_COUNT + 1];
+unsigned vt_hirq_reads, vt_cd_data_reads;
+const volatile uintptr_t *vt_pc_src;
+unsigned vt_pc_off;
+#define VT_PC_N 4096
+static volatile uintptr_t vt_pc_last_bad;
+static volatile unsigned vt_pc_bad, vt_pc_calls, vt_pc_null, vt_pc_zero;
+static volatile uint32_t vt_pc_key[VT_PC_N], vt_pc_cnt[VT_PC_N];
+volatile uint32_t vt_mem_key;
+static volatile uint32_t vt_mk_key[VT_PC_N], vt_mk_cnt[VT_PC_N];
+static void vt_mem_sample(void) {
+  uint32_t k = vt_mem_key;
+  if ((k & 0x0FFFFFFF) >= (0x05C80000u >> 8) && (k & 0x0FFFFFFF) < (0x05CC0000u >> 8)) {
+    const volatile uintptr_t *src = vt_pc_src;
+    const uintptr_t b = src ? *src : 0;
+    if (!(b & 3) && b >= 0x01000000u)
+      k = 0x80000000u | ((*(const volatile uint32_t *)(b + vt_pc_off)) & 0x0FFFFFFF);
+  }
+  unsigned h = (k * 0x9e3779b1u) >> 20;
+  for (unsigned n = 0; n < VT_PC_N; ++n, h = (h + 1) & (VT_PC_N - 1)) {
+    if (vt_mk_key[h] == k) { ++vt_mk_cnt[h]; return; }
+    if (!vt_mk_key[h]) { vt_mk_key[h] = k; vt_mk_cnt[h] = 1; return; }
+  }
+}
+static void vt_pc_sample(void) {
+  const volatile uintptr_t *src = vt_pc_src;
+  ++vt_pc_calls;
+  if (!src) { ++vt_pc_null; return; }
+  const uintptr_t b = *src;
+  if ((b & 3) || b < 0x01000000u) { ++vt_pc_bad; vt_pc_last_bad = b; return; }
+  const uint32_t pc = *(const volatile uint32_t *)(b + vt_pc_off);
+  if (!pc) { ++vt_pc_zero; return; }
+  unsigned h = (pc * 0x9e3779b1u) >> 20;
+  for (unsigned n = 0; n < VT_PC_N; ++n, h = (h + 1) & (VT_PC_N - 1)) {
+    if (vt_pc_key[h] == pc) { ++vt_pc_cnt[h]; return; }
+    if (!vt_pc_key[h]) { vt_pc_key[h] = pc; vt_pc_cnt[h] = 1; return; }
+  }
+}
+void VitaStackAdoptSecondThread(void) { vt_stack2_depth = 0; vt_stack2_owner = VitaThreadPointer(); }
+static int vt_stack_sampler(SceSize args, void *argp) {
+  (void)args; (void)argp;
+  for (;;) {
+    sceKernelDelayThread(97); /* not a divisor of the 1 ms tick or frame */
+    unsigned d = vt_stack_depth;
+    unsigned p = d ? vt_stack[(d > 64 ? 64 : d) - 1] : VT_PHASE_COUNT;
+    ++vt_stack_hist[p < VT_PHASE_COUNT ? p : VT_PHASE_COUNT];
+    if (p == VT_SH2_NATIVE) vt_pc_sample();
+    if (p == VT_SH2_MEMORY) vt_mem_sample();
+    d = vt_stack2_depth;
+    p = d ? vt_stack2[(d > 64 ? 64 : d) - 1] : VT_PHASE_COUNT;
+    ++vt_stack2_hist[p < VT_PHASE_COUNT ? p : VT_PHASE_COUNT];
+  }
+  return 0;
+}
+static void vt_stack_start(void) {
+  vt_stack_owner = VitaThreadPointer();
+  /* USER_2 (bit 18): the rotation core. Priority 64 is the highest user
+   * priority so sampling continues while that core's worker runs. */
+  SceUID thread = sceKernelCreateThread("vt_stack_sampler", vt_stack_sampler, 64, 0x2000, 0, 0x40000, NULL);
+  int rc = thread >= 0 ? sceKernelStartThread(thread, 0, NULL) : thread;
+  YuiMsg("stack_profile_start rc=%d", rc);
+}
+#endif
 void *VitaTelemetryEnter(VitaTelemetryPhase phase) {
+#ifdef VITA_STACK_PROFILE
+  VitaStackPush(phase);
+#endif
   if (!VitaTelemetryPhaseEnabled(VitaTelemetryMode, phase)) {
     if (VitaTelemetryMode == VT_SAMPLED && (unsigned)phase < VT_PHASE_COUNT) {
       // No emulated TLS in the established-owner hot path. Exit retains the
@@ -178,15 +258,23 @@ void *VitaTelemetryEnter(VitaTelemetryPhase phase) {
   VitaTelemetryAccountEnter(&accounting, phase, sceKernelGetProcessTimeWide());
   return NULL;
 }
-void VitaTelemetryLeaveSample(void *sample) {
-  VitaTelemetrySampler *s = sample;
+static void leave_sample(VitaTelemetrySampler *s) {
   if (VitaTelemetrySampleLeave(s))
     VitaTelemetrySampleComplete(s, sceKernelGetProcessTimeWide());
 }
+void VitaTelemetryLeaveSample(void *sample) {
+#ifdef VITA_STACK_PROFILE
+  VitaStackPop(); /* pairs with the push in VitaTelemetryEnter */
+#endif
+  leave_sample(sample);
+}
 void VitaTelemetryLeave(VitaTelemetryPhase phase) {
+#ifdef VITA_STACK_PROFILE
+  VitaStackPop();
+#endif
   if (!VitaTelemetryPhaseEnabled(VitaTelemetryMode, phase)) {
     if (VitaTelemetryMode == VT_SAMPLED && (unsigned)phase < VT_PHASE_COUNT) {
-      VitaTelemetryLeaveSample(&owner_samples()[phase]);
+      leave_sample(&owner_samples()[phase]);
     }
     return;
   }
@@ -246,6 +334,36 @@ void VitaTelemetryReport(void) {
       VitaTelemetrySampleResetWindow(s);
     }
   }
+#ifdef VITA_STACK_PROFILE
+  if (tid == observer_tid) {
+    append_report(report, sizeof(report), &used, "stack_profile seq=%u none=%u depth=%u", sequence, vt_stack_hist[VT_PHASE_COUNT], vt_stack_depth);
+    for (unsigned i = 0; i < VT_PHASE_COUNT; ++i)
+      if (vt_stack_hist[i])
+        append_report(report, sizeof(report), &used, "stack_sample seq=%u name=%s count=%u", sequence, names[i], vt_stack_hist[i]);
+    for (unsigned i = 0; i < VT_PHASE_COUNT; ++i)
+      if (vt_stack2_hist[i])
+        append_report(report, sizeof(report), &used, "stack2_sample seq=%u name=%s count=%u", sequence, names[i], vt_stack2_hist[i]);
+    append_report(report, sizeof(report), &used, "pc_profile hirq_reads=%u cd_data_reads=%u seq=%u calls=%u null=%u bad=%u zero=%u src=%p off=%u lastbad=%p", vt_hirq_reads, vt_cd_data_reads, sequence, vt_pc_calls, vt_pc_null, vt_pc_bad, vt_pc_zero, (void *)vt_pc_src, vt_pc_off, (void *)vt_pc_last_bad);
+    /* Top blocks this window; counts are then cleared (keys kept). */
+    for (unsigned k = 0; k < 16; ++k) {
+      unsigned best = VT_PC_N; uint32_t bc = 0;
+      for (unsigned j = 0; j < VT_PC_N; ++j) if (vt_pc_cnt[j] > bc) { bc = vt_pc_cnt[j]; best = j; }
+      if (best == VT_PC_N) break;
+      append_report(report, sizeof(report), &used, "pc_sample seq=%u pc=%08x count=%u bad=%u", sequence, (unsigned)vt_pc_key[best], (unsigned)bc, vt_pc_bad);
+      vt_pc_cnt[best] = 0;
+    }
+    for (unsigned j = 0; j < VT_PC_N; ++j) vt_pc_cnt[j] = 0;
+    for (unsigned k = 0; k < 16; ++k) {
+      unsigned best = VT_PC_N; uint32_t bc = 0;
+      for (unsigned j = 0; j < VT_PC_N; ++j) if (vt_mk_cnt[j] > bc) { bc = vt_mk_cnt[j]; best = j; }
+      if (best == VT_PC_N) break;
+      append_report(report, sizeof(report), &used, "mem_sample seq=%u op=%u page=%07x00 count=%u", sequence, (unsigned)(vt_mk_key[best] >> 28), (unsigned)(vt_mk_key[best] & 0x0FFFFFFF), (unsigned)bc);
+      vt_mk_cnt[best] = 0;
+    }
+    for (unsigned j = 0; j < VT_PC_N; ++j) vt_mk_cnt[j] = 0;
+    vt_hirq_reads = vt_cd_data_reads = 0;
+  }
+#endif
   append_report(report, sizeof(report), &used, "telemetry_end thread=%d seq=%u", tid, sequence);
   if (used < sizeof(report)) YuiMsg("%s", report);
   else YuiMsg("telemetry_report_overflow");
