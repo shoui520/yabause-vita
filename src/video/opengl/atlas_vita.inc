@@ -13,6 +13,134 @@ unsigned vita_atlas_frame, vita_atlas_gen;
 /* The atlas frame whose texels the current storage still holds, if any
  * (UINT_MAX: none). Without the zero-copy ring it is the previous frame. */
 unsigned vita_atlas_prev_frame = ~0u;
+#ifdef VITA_ATLAS_ZERO_COPY
+/* Zero-copy atlas. Each atlas frame (YglTMReset to YglTMReset) writes its
+ * texels straight into a buffer the GPU samples, mapped with sceGxmMapMemory:
+ * cached main memory (SCE_KERNEL_MEMBLOCK_TYPE_USER_RW), which the GPU snoops
+ * (libgxm Overview, "Memory Block Types"), or with VITA_ATLAS_ZC_CDRAM video
+ * memory, which the GPU samples faster. Neither needs cache maintenance or a
+ * copy. The atlas GL texture keeps its identity and dimensions; its data
+ * pointer (vitaGL's tex->data for framebuffer attachment, and the GXM texture
+ * control words that draws copy when they are recorded) is pointed at the
+ * frame's buffer at its first push, as an upload would replace the texels:
+ * draws recorded between a reset and that push still sample the old frame.
+ *
+ * Draws of vitaGL frame F may still read a buffer until that frame has
+ * completed. With double buffering the display queue admits one pending
+ * swap, so frames up to F-2 are complete while F is recorded (vitaGL
+ * reuses its circular vertex pool on the same schedule). A buffer is
+ * therefore rewritten only when its last use is at least ZC_LAG frames old;
+ * if none is, glFinish waits for the GPU. vitaGL never frees our storage:
+ * the texture's own backing is restored before any glTexImage2D or delete. */
+#include <psp2/kernel/sysmem.h>
+#include <psp2/gxm.h>
+extern uint32_t vgl_framecount;
+#define ZC_MAX 4
+#define ZC_LAG 2u
+typedef struct {
+  SceUID blk; unsigned *pixels; size_t bytes;
+  unsigned width, height, gen;
+  uint32_t used; int ever_used;     /* last vitaGL frame that drew from it */
+  unsigned atlas_frame;             /* atlas frame its texels belong to */
+} ZcBuf;
+/* cur: the buffer the CPU writes. gpu: the buffer the texture samples. As
+ * with uploads, what the GPU samples changes only at a push (or a resize). */
+typedef struct { ZcBuf buf[ZC_MAX]; int cur, gpu; void *orig; } ZcState;
+static unsigned zc_gen_counter = 0x80000000u;
+static int ZcIdle(const ZcBuf *b) { return !b->ever_used || vgl_framecount - b->used >= ZC_LAG; }
+static void ZcFree(ZcBuf *b) {
+  if (!b->pixels) return;
+  sceGxmUnmapMemory(b->pixels);
+  sceKernelFreeMemBlock(b->blk);
+  memset(b, 0, sizeof(*b));
+}
+static void ZcAlloc(ZcBuf *b, unsigned width, unsigned height) {
+  VT_SCOPE(VT_RENDER_ALLOC);
+  if (!width || !height || width > 4096 || height > 4096) {
+    fprintf(stderr, "Invalid Vita atlas size %u x %u\n", width, height); abort();
+  }
+#ifdef VITA_ATLAS_ZC_CDRAM
+  /* Video memory: the GPU samples it at full speed; CPU stores go straight out. */
+  const size_t bytes = ((size_t)width * height * 4u + 0x3FFFFu) & ~(size_t)0x3FFFF;
+  void *base = NULL;
+  SceUID blk = sceKernelAllocMemBlock("yab_atlas", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, bytes, NULL);
+#else
+  const size_t bytes = ((size_t)width * height * 4u + 0xFFFu) & ~(size_t)0xFFF;
+  void *base = NULL;
+  SceUID blk = sceKernelAllocMemBlock("yab_atlas", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, bytes, NULL);
+#endif
+  if (blk < 0 || sceKernelGetMemBlockBase(blk, &base) < 0 ||
+      sceGxmMapMemory(base, bytes, SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE) < 0) {
+    YuiMsg("atlas_zero_copy_alloc_failed %ux%u blk=%08x", width, height, (unsigned)blk);
+    abort();
+  }
+  memset(base, 0, bytes);
+  b->blk = blk; b->pixels = base; b->bytes = bytes;
+  b->width = width; b->height = height; b->gen = ++zc_gen_counter;
+  b->ever_used = 0; b->used = 0; b->atlas_frame = ~0u;
+}
+/* Point the atlas texture (bound on unit 0 around this) at data. */
+static void ZcPointTexture(GLuint texture, void *data) {
+  GLint active = 0, bound = 0;
+  glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+  glActiveTexture(GL_TEXTURE0);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+  glBindTexture(GL_TEXTURE_2D, texture);
+  vglOverloadTexDataPointer(GL_TEXTURE_2D, data);
+  sceGxmTextureSetData(vglGetGxmTexture(GL_TEXTURE_2D), data);
+  glBindTexture(GL_TEXTURE_2D, bound);
+  glActiveTexture(active);
+}
+static void ZcSample(YglTextureManager *tm, int i) {
+  ZcState *z = tm->vita_zc;
+  if (z->gpu >= 0) { z->buf[z->gpu].used = vgl_framecount; z->buf[z->gpu].ever_used = 1; }
+  z->gpu = i;
+  z->buf[i].used = vgl_framecount; z->buf[i].ever_used = 1;
+  ZcPointTexture(tm->textureID_in[0], z->buf[i].pixels);
+}
+static void ZcUse(YglTextureManager *tm, int i, int sample) {
+  ZcState *z = tm->vita_zc;
+  ZcBuf *b = &z->buf[i];
+  z->cur = i;
+  if (tm->texture) tm->texture = b->pixels;
+  tm->texture_in[0] = b->pixels;
+  vita_atlas_gen = b->gen;
+  b->used = vgl_framecount; b->ever_used = 1;
+  if (sample) ZcSample(tm, i);
+}
+/* A buffer of the current size, not current, idle; allocated or waited for. */
+static int ZcAcquire(YglTextureManager *tm) {
+  ZcState *z = tm->vita_zc;
+#ifdef VITA_ATLAS_ZC_RING4
+  /* A ring of even length: a game drawing VDP1 every other frame finds, in
+   * the storage it acquires, the atlas frame of its previous VDP1 draw, so
+   * cross-frame texture reuse (prev_frame) can match. The oldest atlas frame
+   * goes first, which keeps the rotation strict. */
+  for (int i = 0; i < ZC_MAX; ++i)
+    if (i != z->cur && i != z->gpu && !z->buf[i].pixels) { ZcAlloc(&z->buf[i], tm->width, tm->height); return i; }
+#endif
+  for (int pass = 0; pass < 2; ++pass) {
+    int pick = -1;
+    for (int i = 0; i < ZC_MAX; ++i) {
+      ZcBuf *b = &z->buf[i];
+      if (i == z->cur || i == z->gpu || !b->pixels || !ZcIdle(b)) continue;
+      if (b->width != tm->width || b->height != tm->height) { ZcFree(b); continue; }
+#ifdef VITA_ATLAS_ZC_RING4
+      if (pick < 0 || b->atlas_frame == ~0u ||
+          (z->buf[pick].atlas_frame != ~0u && (int32_t)(b->atlas_frame - z->buf[pick].atlas_frame) < 0)) pick = i;
+#else
+      if (pick < 0 || !b->ever_used || (z->buf[pick].ever_used && (int32_t)(b->used - z->buf[pick].used) < 0)) pick = i;
+#endif
+    }
+    if (pick >= 0) return pick;
+    for (int i = 0; i < ZC_MAX; ++i)
+      if (i != z->cur && i != z->gpu && !z->buf[i].pixels) { ZcAlloc(&z->buf[i], tm->width, tm->height); return i; }
+    glFinish();   /* every other buffer is still in flight */
+    for (int i = 0; i < ZC_MAX; ++i) z->buf[i].ever_used = 0;
+  }
+  abort();
+}
+#endif
 static unsigned int *YglVitaAtlasStorage(unsigned width, unsigned height) {
   VT_SCOPE(VT_RENDER_ALLOC);
   /* SGX texture dimensions are bounded; avoid overflow and unbounded growth. */
