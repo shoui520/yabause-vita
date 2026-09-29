@@ -521,6 +521,16 @@ WRITE_LINKAGE void WRITE_NAME(Byte)(u32 addr , u8 data )
 
   // Cache
   default:
+#ifdef VITA_SH2_DATA_ARRAY_DIRECT
+    // Data array (cache used as RAM): no memory cycles, as in MappedMemoryWrite.
+    if ((addr >> 29) == 6) {
+      if ((addr & 0xFF000000) == 0xC0000000 && !block->LookupTableC.empty())
+        block->LookupTableC.clear();
+      T2WriteByte(CurrentSH2->DataArray, addr & 0xFFF, data);
+      dynaFree();
+      return;
+    }
+#endif
     if ((addr & 0xFF000000) == 0xC0000000)
     {
       block->LookupTableC.clear();
@@ -564,6 +574,16 @@ WRITE_LINKAGE void WRITE_NAME(Word)(u32 addr, u16 data )
     break;
   // Cache
   default:
+#ifdef VITA_SH2_DATA_ARRAY_DIRECT
+    // Data array (cache used as RAM): no memory cycles, as in MappedMemoryWrite.
+    if ((addr >> 29) == 6) {
+      if ((addr & 0xFF000000) == 0xC0000000 && !block->LookupTableC.empty())
+        block->LookupTableC.clear();
+      T2WriteWord(CurrentSH2->DataArray, addr & 0xFFF, data);
+      dynaFree();
+      return;
+    }
+#endif
     if ((addr & 0xFF000000) == 0xC0000000)
     {
       block->LookupTableC.clear();
@@ -609,6 +629,16 @@ WRITE_LINKAGE void WRITE_NAME(Long)(u32 addr , u32 data )
 
   // Cache
   default:
+#ifdef VITA_SH2_DATA_ARRAY_DIRECT
+    // Data array (cache used as RAM): no memory cycles, as in MappedMemoryWrite.
+    if ((addr >> 29) == 6) {
+      if ((addr & 0xFF000000) == 0xC0000000 && !block->LookupTableC.empty())
+        block->LookupTableC.clear();
+      T2WriteLong(CurrentSH2->DataArray, addr & 0xFFF, data);
+      dynaFree();
+      return;
+    }
+#endif
     if ((addr & 0xFF000000) == 0xC0000000)
     {
       block->LookupTableC.clear();
@@ -624,6 +654,13 @@ WRITE_LINKAGE void WRITE_NAME(Long)(u32 addr , u32 data )
 #pragma GCC optimize ("O3")
 // Only the already-existing high-RAM/no-code-owner case is a leaf. All code
 // invalidation, initialization, low RAM and mapped devices use the old helper.
+#ifdef VITA_SH2_ONCHIP_DIRECT
+// On-chip modules: MappedMemoryWrite##Name's handler, with its 0 memory cycles.
+#define ONCHIP_WRITE(Name, addr, data) \
+    if ((addr) >= 0xFFFFFE00u) { PROF_MEM(1, addr); OnchipWrite##Name((addr) & 0x1FF, data); return; }
+#else
+#define ONCHIP_WRITE(Name, addr, data)
+#endif
 #define WRITE_LEAF(Name, Type, Width) \
   void memSet##Name(u32 addr, Type data) { \
     CompileBlocks *block=CompileBlocks::existingInstance(); \
@@ -688,6 +725,13 @@ u8 memGetByte(u32 addr)
     return val;
     break;
   }
+#ifdef VITA_SH2_DATA_ARRAY_DIRECT
+  if ((addr >> 29) == 6) return T2ReadByte(CurrentSH2->DataArray, addr & 0xFFF);
+#endif
+#ifdef VITA_SH2_ONCHIP_DIRECT
+  // On-chip modules: MappedMemoryReadByte's handler, with its 0 memory cycles.
+  if (addr >= 0xFFFFFE00u) return OnchipReadByte(addr & 0x1FF);
+#endif
 #ifdef VITA_SH2_READ_HELPER_O3
   return ReadMappedByte(addr);
 #else
@@ -725,6 +769,13 @@ u16 memGetWord(u32 addr)
     return val;
     break;
   }
+#ifdef VITA_SH2_DATA_ARRAY_DIRECT
+  if ((addr >> 29) == 6) return T2ReadWord(CurrentSH2->DataArray, addr & 0xFFF);
+#endif
+#ifdef VITA_SH2_ONCHIP_DIRECT
+  // On-chip modules: MappedMemoryReadWord's handler, with its 0 memory cycles.
+  if (addr >= 0xFFFFFE00u) return OnchipReadWord(addr & 0x1FF);
+#endif
 #ifdef VITA_SH2_READ_HELPER_O3
   return ReadMappedWord(addr);
 #else
@@ -761,6 +812,10 @@ u32 memGetLong(u32 addr)
     return val;
     break;
   }
+#ifdef VITA_SH2_ONCHIP_DIRECT
+  // On-chip modules: MappedMemoryReadLong's handler, with its 0 memory cycles.
+  if (addr >= 0xFFFFFE00u) return OnchipReadLong(addr & 0x1FF);
+#endif
 #ifdef VITA_SH2_READ_HELPER_O3
   return ReadMappedLong(addr);
 #else

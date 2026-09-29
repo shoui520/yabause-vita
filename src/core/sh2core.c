@@ -194,6 +194,8 @@ void SH2Reset(SH2_struct *context)
 
    context->frc.leftover = 0;
    context->frc.shift = 3;
+   context->frc_pending = 0;
+   context->frc_quiet = 0;
  
    context->wdt.isenable = 0;
    context->wdt.isinterval = 1;
@@ -238,11 +240,33 @@ void FASTCALL SH2Exec(SH2_struct *context, u32 cycles)
 
    SH2Core->Exec(context, cycles);
 
+#ifdef VITA_TICK_EARLY_OUT
+   /* The modules' own entry tests, taken here so that an idle module costs
+    * no call: a quiet FRT only accumulates, a stopped or overflowed WDT and
+    * DMA with no enabled channel do nothing. */
+   {
+      SH2_struct *const c = CurrentSH2;
+#ifdef VITA_SH2_FRT_LAZY
+      const u32 p = c->frc_pending + cycles;
+      if (p < c->frc_quiet) c->frc_pending = p;
+      else
+#endif
+      { VT_SCOPE(VT_SH2_ONCHIP); FRTExec(cycles); }
+      if (c->wdt.isenable && !(c->onchip.WTCSR & 0x80) && !(c->onchip.RSTCSR & 0x80)) {
+         VT_SCOPE(VT_SH2_ONCHIP); WDTExec(cycles);
+      }
+      if (!(c->onchip.DMAOR & 0x6) && ((c->onchip.CHCR0 & 0x3) == 0x01 || (c->onchip.CHCR1 & 0x3) == 0x01)) {
+         VT_SCOPE(VT_SH2_DMA); DMAProc(cycles);
+      }
+   }
+#else
    { VT_SCOPE(VT_SH2_ONCHIP);
      FRTExec(cycles);
      WDTExec(cycles);
    }
    { VT_SCOPE(VT_SH2_DMA); DMAProc(cycles); }
+#endif
+   DIAG_T1(diag_t, context->isslave ? DT_SH2S : DT_SH2M);
 
    //if (UNLIKELY(context->cycles < cycles))
    //   context->cycles = 0;
@@ -1089,6 +1113,8 @@ void OnchipReset(SH2_struct *context) {
    context->onchip.TIER = 0x01;
    context->onchip.FTCSR = 0x00;
    context->onchip.FRC.all = 0x0000;
+   context->frc_pending = 0;
+   context->frc_quiet = 0;
    context->onchip.OCRA = 0xFFFF;
    context->onchip.OCRB = 0xFFFF;
    context->onchip.TCR = 0x00;
@@ -1136,7 +1162,28 @@ void OnchipReset(SH2_struct *context) {
 
 //////////////////////////////////////////////////////////////////////////////
 
+#ifdef VITA_SH2_FRT_LAZY
+/* Applies the FRT cycles FRTExec deferred. They reach no compare match and
+ * no overflow (FRTExec defers only below frc_quiet), so this is the counter
+ * and prescaler arithmetic of FRTExec alone. The next FRTExec recomputes
+ * the bound, as the registers may change. */
+static void FRTSync(SH2_struct *c) {
+   if (c->frc_pending) {
+      const u32 t = c->frc_pending + c->frc.leftover;
+      c->onchip.FRC.all = (u16)(c->onchip.FRC.all + (t >> c->frc.shift));
+      c->frc.leftover = t & ((1u << c->frc.shift) - 1);
+      c->frc_pending = 0;
+   }
+   c->frc_quiet = 0;
+}
+#define FRT_ACCESS(addr) do { if ((u32)(addr) - 0x10u < 0x0Au) FRTSync(CurrentSH2); } while (0)
+#else
+#define FRTSync(c) ((void)0)
+#define FRT_ACCESS(addr) ((void)0)
+#endif
+
 u8 FASTCALL OnchipReadByte(u32 addr) {
+   FRT_ACCESS(addr);
    
    //LOG("[%s] OnchipReadByte %08X\n", CurrentSH2->isslave?"SH2-S":"SH2-M", addr);
 
@@ -1248,6 +1295,7 @@ u8 FASTCALL OnchipReadByte(u32 addr) {
 //////////////////////////////////////////////////////////////////////////////
 
 u16 FASTCALL OnchipReadWord(u32 addr) {
+   FRT_ACCESS(addr);
 
    //LOG("[%s] OnchipReadWord %08X\n", CurrentSH2->isslave?"SH2-S":"SH2-M", addr);
          
@@ -1303,6 +1351,7 @@ u16 FASTCALL OnchipReadWord(u32 addr) {
 //////////////////////////////////////////////////////////////////////////////
 
 u32 FASTCALL OnchipReadLong(u32 addr) {
+   FRT_ACCESS(addr);
 
    //LOG("[%s] OnchipReadLong %08X@%08X", CurrentSH2->isslave?"SH2-S":"SH2-M", addr, CurrentSH2->regs.PC );
    
@@ -1381,6 +1430,7 @@ u32 FASTCALL OnchipReadLong(u32 addr) {
 //////////////////////////////////////////////////////////////////////////////
 
 void FASTCALL OnchipWriteByte(u32 addr, u8 val) {
+   FRT_ACCESS(addr);
    switch(addr) {
       case 0x000:
 //         LOG("Serial Mode Register write: %02X\n", val);
@@ -1563,6 +1613,7 @@ void FASTCALL OnchipWriteByte(u32 addr, u8 val) {
 //////////////////////////////////////////////////////////////////////////////
 
 void FASTCALL OnchipWriteWord(u32 addr, u16 val) {
+   FRT_ACCESS(addr);
    switch(addr)
    {
       case 0x060:
@@ -1686,6 +1737,7 @@ void FASTCALL OnchipWriteWord(u32 addr, u16 val) {
 //////////////////////////////////////////////////////////////////////////////
 
 void FASTCALL OnchipWriteLong(u32 addr, u32 val)  {
+   FRT_ACCESS(addr);
    switch (addr)
    {
    case 0x010:
@@ -2049,6 +2101,15 @@ void FRTExec(u32 cycles)
    u32 frcold;
    u32 frctemp;
    u32 mask;
+#ifdef VITA_SH2_FRT_LAZY
+   {
+      SH2_struct *const c = CurrentSH2;
+      const u32 p = c->frc_pending + cycles;
+      if (p < c->frc_quiet) { c->frc_pending = p; return; }
+      c->frc_pending = 0;
+      cycles = p;   /* the deferred calls and this one, as one call */
+   }
+#endif
 
    frcold = frctemp = (u32)CurrentSH2->onchip.FRC.all;
    mask = (1 << CurrentSH2->frc.shift) - 1;
@@ -2098,6 +2159,19 @@ void FRTExec(u32 cycles)
 
    // Write new FRC value
    CurrentSH2->onchip.FRC.all = frctemp;
+#ifdef VITA_SH2_FRT_LAZY
+   {
+      /* Cycles c from here reach FRC + ((c + leftover) >> shift): the next
+       * compare match (a register above FRC) or the overflow is not reached
+       * while c < ((E - FRC) << shift) - leftover. */
+      SH2_struct *const c = CurrentSH2;
+      const u32 frc = c->onchip.FRC.all;
+      u32 e = 0x10000;
+      if (frc < c->onchip.OCRA) e = c->onchip.OCRA;
+      if (frc < c->onchip.OCRB && c->onchip.OCRB < e) e = c->onchip.OCRB;
+      c->frc_quiet = ((e - frc) << c->frc.shift) - c->frc.leftover;
+   }
+#endif
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -2574,6 +2648,7 @@ void DMATransfer(u32 *CHCR, u32 *SAR, u32 *DAR, u32 *TCR, u32 *VCRDMA)
 
 void FASTCALL MSH2InputCaptureWriteWord(UNUSED u32 addr, UNUSED u16 data)
 {
+   FRTSync(MSH2);
    // Set Input Capture Flag
    MSH2->onchip.FTCSR |= 0x80;
 
@@ -2605,6 +2680,7 @@ void FASTCALL MSH2InputCaptureWriteWord(UNUSED u32 addr, UNUSED u16 data)
 
 void FASTCALL SSH2InputCaptureWriteWord(UNUSED u32 addr, UNUSED u16 data)
 {
+   FRTSync(SSH2);
    // Set Input Capture Flag
    SSH2->onchip.FTCSR |= 0x80;
 
@@ -2666,6 +2742,7 @@ int SH2SaveState(SH2_struct *context, FILE *fp)
    SH2GetRegisters(context, &regs);
    ywrite(&check, (void *)&regs, sizeof(sh2regs_struct), 1, fp);
 
+   FRTSync(context);
    // Write onchip registers
    ywrite(&check, (void *)&context->onchip, sizeof(Onchip_struct), 1, fp);
 
@@ -2727,6 +2804,8 @@ int SH2LoadState(SH2_struct *context, FILE *fp, UNUSED int version, int size)
 
    // Read internal variables
    yread(&check, (void *)&context->frc, sizeof(context->frc), 1, fp);
+   context->frc_pending = 0;
+   context->frc_quiet = 0;
    {  // FIXME: backward compatibility hack (see SH2SaveState() comment)
       u32 div = context->frc.shift;
       context->frc.shift = 0;

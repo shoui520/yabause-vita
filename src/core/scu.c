@@ -1351,7 +1351,11 @@ void ScuExec(u32 timing) {
      //}
    }
 #else
-  ScuDmaProc(ScuRegs, (int)timing<<4);
+#ifdef VITA_TICK_EARLY_OUT
+  /* SucDmaCheck does nothing for a channel with no transfer left. */
+  if (ScuRegs->dma0.TransferNumber > 0 || ScuRegs->dma1.TransferNumber > 0 || ScuRegs->dma2.TransferNumber > 0)
+#endif
+  { DIAG_T0(t); ScuDmaProc(ScuRegs, (int)timing<<4); DIAG_T1(t, DT_SCU_DMA); }
 #endif
 
    // is dsp executing?

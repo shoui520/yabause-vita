@@ -836,7 +836,16 @@ int YabauseEmulate(void) {
       }
 
       PROFILE_START("SCU");
-      ScuExec(sh2cycles >> 1);
+#ifdef VITA_TICK_EARLY_OUT
+      /* ScuExec runs timer 1, DMA and the DSP; with none active it does nothing. */
+      { extern scudspregs_struct *ScuDsp;
+        if ((ScuRegs->T1MD & 0x1) || ScuDsp->ProgControlPort.part.EX ||
+            ScuRegs->dma0.TransferNumber > 0 || ScuRegs->dma1.TransferNumber > 0 || ScuRegs->dma2.TransferNumber > 0)
+#endif
+      { DIAG_T0(t); ScuExec(sh2cycles >> 1); DIAG_T1(t, DT_SCU); }
+#ifdef VITA_TICK_EARLY_OUT
+      }
+#endif
       PROFILE_STOP("SCU");
       PROFILE_START("68K");
       M68KSync();  // Wait for the previous iteration to finish
@@ -844,10 +853,40 @@ int YabauseEmulate(void) {
 
       yabsys.UsecFrac += usecinc;
       PROFILE_START("SMPC");
-      SmpcExec(yabsys.UsecFrac >> YABSYS_TIMING_BITS);
+#ifdef VITA_TICK_EARLY_OUT
+      {
+        /* SmpcExec does nothing without a pending command, and only counts
+         * down while the command's time has not run out (and an INTBACK
+         * continuation is not released at line 207). */
+        extern int intback_wait_for_line;
+        const s32 us = (s32)(yabsys.UsecFrac >> YABSYS_TIMING_BITS);
+        const s32 left = SmpcInternalVars->timing;
+        if (left <= 0) {}
+        else if (left - us > 0 && !(intback_wait_for_line && yabsys.LineCount == 207))
+          SmpcInternalVars->timing = left - us;
+        else
+#endif
+      { DIAG_T0(t); SmpcExec(yabsys.UsecFrac >> YABSYS_TIMING_BITS); DIAG_T1(t, DT_SMPC_CD); }
+#ifdef VITA_TICK_EARLY_OUT
+      }
+#endif
       PROFILE_STOP("SMPC");
       PROFILE_START("CDB");
-      Cs2Exec(yabsys.UsecFrac >> YABSYS_TIMING_BITS);
+#ifdef VITA_TICK_EARLY_OUT
+      {
+        /* Cs2Exec when no command is pending or locked and neither the
+         * status nor the periodic period elapses: it only counts time. */
+        const u32 t3 = (yabsys.UsecFrac >> YABSYS_TIMING_BITS) * 3;
+        const u32 st = Cs2Area->_statuscycles + t3, pe = Cs2Area->_periodiccycles + t3;
+        if (Cs2Area->_command_execlock <= 0 && Cs2Area->_commandtiming == 0 &&
+            st < Cs2Area->_statustiming && pe < Cs2Area->_periodictiming) {
+          Cs2Area->_statuscycles = st; Cs2Area->_periodiccycles = pe;
+        } else
+#endif
+      { DIAG_T0(t); Cs2Exec(yabsys.UsecFrac >> YABSYS_TIMING_BITS); DIAG_T1(t, DT_SMPC_CD); }
+#ifdef VITA_TICK_EARLY_OUT
+      }
+#endif
       PROFILE_STOP("CDB");
       yabsys.UsecFrac &= YABSYS_TIMING_MASK;
       

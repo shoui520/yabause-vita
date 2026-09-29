@@ -450,6 +450,11 @@ typedef struct
    u32 pre_cycle;
    void * ext;  
 
+   /* Lazy FRT (VITA_SH2_FRT_LAZY): cycles given to FRTExec but not yet
+    * applied, and the cycle count below which applying them can reach no
+    * compare match or overflow. Outside the saved frc struct. */
+   u32 frc_pending;
+   u32 frc_quiet;
 } SH2_struct;
 
 typedef struct
