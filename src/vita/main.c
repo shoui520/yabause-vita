@@ -707,7 +707,9 @@ int main(void) {
   FILE *bkram = fopen(DATA "bkram.bin", "rb");
   if (bkram) fclose(bkram);
   init.buppath = bkram ? DATA "bkram.bin" : DATA "backup.bin"; init.carttype = 0;
-  init.regionid = 1; init.videoformattype = VIDEOFORMATTYPE_NTSC;
+  /* Region from the disc header (Japan without one); the BIOS rejects a
+   * disc whose area code does not match. Video stays NTSC. */
+  init.regionid = REGION_AUTODETECT; init.videoformattype = VIDEOFORMATTYPE_NTSC;
   init.clocksync = 1; init.basetime = 946684800; init.numthreads = 1;
   init.scsp_sync_count_per_frame = 1;
   YuiMsg("init sh2=%s renderer=%s audio=enabled disc=%s",
