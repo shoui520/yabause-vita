@@ -2591,6 +2591,7 @@ void Cs2GetThenDeleteSectorData(void)
    Cs2Area->cdwnum = 0;
    Cs2Area->datatranstype = CDB_DATATRANSTYPE_GETDELSECTOR;
    Cs2Area->datatranspartition = Cs2Area->partition + gtdsdbufno;
+   Cs2Area->datatranspartitionnum = (u8)gtdsdbufno;
    Cs2Area->datatransoffset = 0;
    Cs2Area->datanumsecttrans = 0;
    Cs2Area->datatranssectpos = (u16)gtdsdsectoffset;
@@ -4357,6 +4358,9 @@ int Cs2LoadState(FILE * fp, int version, int size) {
       Cs2Area->outconhost = Cs2Area->filter + Cs2Area->outconhostnum;
 
    yread(&check, (void *)&Cs2Area->datatranspartitionnum, 1, 1, fp);
+   // The transfer's partition is saved by number only.
+   Cs2Area->datatranspartition = Cs2Area->partition +
+      (Cs2Area->datatranspartitionnum < MAX_SELECTORS ? Cs2Area->datatranspartitionnum : 0);
    yread(&check, (void *)&Cs2Area->datatransoffset, 4, 1, fp);
    yread(&check, (void *)&Cs2Area->datanumsecttrans, 4, 1, fp);
    yread(&check, (void *)&Cs2Area->datatranssectpos, 2, 1, fp);

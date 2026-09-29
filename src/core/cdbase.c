@@ -63,6 +63,8 @@ static int LoadBinCue(const char *cuefilename, FILE *iso_file);
 
 // Remove this for now, execution on windows fails because of it
 // #include "streams/file_stream_transforms.h"
+#include "../vita/disc_io.h"
+VITA_DISC_IO_STORAGE
 #ifndef HAVE_STRICMP
 #ifdef HAVE_STRCASECMP
 #define stricmp strcasecmp
@@ -1477,6 +1479,7 @@ void BuildTOC()
 //////////////////////////////////////////////////////////////////////////////
 
 static int ISOCDInit(const char * iso) {
+   VitaDiscForget();
    char header[6];
    char *ext;
    int ret;
@@ -1569,6 +1572,7 @@ static int ISOCDInit(const char * iso) {
 //////////////////////////////////////////////////////////////////////////////
 
 static void ISOCDDeInit(void) {
+   VitaDiscForget();
    int i, j, k;
    if (disc.session)
    {
