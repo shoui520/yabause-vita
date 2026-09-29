@@ -43,6 +43,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 */
 
 #include <stdlib.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include "vdp2.h"
 #include "debug.h"
 #include "peripheral.h"
@@ -52,6 +55,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "vdp1.h"
 #include "yabause.h"
 #include "movie.h"
+#ifdef VITA_VDP2_CELL_SCROLL_SOFT_ONLY
+#include "vidsoft.h"
+#endif
 #include "osdcore.h"
 #include "threads.h"
 #include "yui.h"
@@ -136,6 +142,7 @@ int Vdp2GenerateCCode();
 
 void Vdp1_onHblank();
 
+#ifndef VITA_VRAM_NOLOCK
 void VdpLockVram() {
   YabThreadLock(vrammutex);
 }
@@ -143,6 +150,7 @@ void VdpLockVram() {
 void VdpUnLockVram() {
   YabThreadUnLock(vrammutex);
 }
+#endif
 
 
 //////////////////////////////////////////////////////////////////////////////
@@ -838,7 +846,11 @@ void Vdp2HBlankIN(void) {
 }
 
 using std::atomic;
+#ifdef VITA_VDP1_CLOCK_PLAIN
+extern int vdp1_clock;
+#else
 extern atomic<int> vdp1_clock;
+#endif
 
 
 void Vdp2HBlankOUT(void) {
@@ -851,7 +863,9 @@ void Vdp2HBlankOUT(void) {
     memcpy(Vdp2Lines + yabsys.LineCount, Vdp2Regs, sizeof(Vdp2));
     for (i = 0; i < 88; i++)
     {
-      cell_scroll_data[yabsys.LineCount].data[i] = Vdp2RamReadLong(cell_scroll_table_start_addr + i * 4);
+      u32 *cell_line = cell_scroll_data[yabsys.LineCount].data;
+      for (i = 0; i < 88; i++)
+        cell_line[i] = T1ReadLong(Vdp2Ram, (cell_scroll_table_start_addr + i * 4) & 0x7FFFF);
     }
 
 

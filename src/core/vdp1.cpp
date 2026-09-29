@@ -73,7 +73,13 @@ Vdp1 * Vdp1Regs;
 Vdp1External_struct Vdp1External = { 0 };
 }
 
+#ifdef VITA_VDP1_CLOCK_PLAIN
+/* Only the emulation thread reads or writes it (no YAB_ASYNC_RENDERING): a
+ * plain int avoids a barrier pair on every VDP1 RAM write. */
+int vdp1_clock = 0;
+#else
 atomic<int> vdp1_clock{ 0 };
+#endif
 condition_variable vdp1_clock_cv;
 mutex vdp1_clock_mtx;
 

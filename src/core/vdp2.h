@@ -479,8 +479,15 @@ int VideoSetFilterType( int video_filter_type );
 void vdp2ReqDump();
 void vdp2ReqRestore();
 
+#ifdef VITA_VRAM_NOLOCK
+/* Each copy of this lock (core and render-thread shadow) is only ever taken
+ * by one thread, so it excludes nothing. */
+static inline void VdpLockVram(void) {}
+static inline void VdpUnLockVram(void) {}
+#else
 void VdpLockVram();
 void VdpUnLockVram();
+#endif
 
 void YglOnUpdateColorRamWord(u32 addr);
 void YglUpdateColorRam();
