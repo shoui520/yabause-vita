@@ -1865,6 +1865,181 @@ int ScspCpuSliceIsQuiescent(void) {
   // Incremental new-SCSP and real-time pacing do NOT provide this guarantee.
   return !ScspHasAsyncWorker() || (!use_new_scsp && g_scsp_main_mode == 0);
 }
+#ifdef VITA_SCSP_EARLY_FRAME
+/* Early sound frame (legacy CPU-paced sound only). The 68000's frame runs at
+ * VBlank-in while both SH-2s wait in SyncCPUtoSCSP, and reads only sound-side
+ * state: sound RAM, SCSP/DSP registers, the 68000 itself. When the main side
+ * leaves all of that alone from some point until VBlank-in, running the frame
+ * from that point gives the same result, off the SH-2s' critical path. The
+ * worker does so from a snapshot of everything the frame writes; any main-side
+ * access to sound state before VBlank-in (memory map, 68000 start/stop, reset,
+ * state save/load) first rolls it back. A frame that would interrupt the main
+ * CPU rolls itself back (its SCU delivery may run SCU DMA on this thread, which
+ * the frame could then observe) and runs at VBlank-in as before. At VBlank-in
+ * a completed frame is committed and the SH-2s go on without waiting. */
+enum { EARLY_IDLE, EARLY_REQUESTED, EARLY_RUNNING, EARLY_DONE, EARLY_ABORT,
+       EARLY_COMMIT, EARLY_BLOCKED };
+enum { EARLY_START_LINE = 40, EARLY_LAST_LINE = 200, EARLY_QUIET_LINES = 16 };
+static _Atomic int early_state;
+/* Set by the worker once the snapshot of its running frame is complete and
+ * cleared before that frame commits or rolls back: while set, the snapshot
+ * holds sound RAM and the SCSP as they were before the frame. */
+static _Atomic int early_snap_ok;
+static u8 *ScspEarlySnapRam(u32 *mem4b);
+void SyncSh2And68k();
+static int early_in_frame, early_self_abort;   /* worker only */
+/* 4 KB sound RAM pages written since the early frame's snapshot; every
+ * writer reports through M68KWriteNotify. A rollback restores only these. */
+static u32 early_dirty[0x80000 >> 12 >> 5];
+/* 4 KB pages whose snapshot copy may differ from sound RAM (all at first):
+ * set by every write, cleared when a save copies the page. A save copies
+ * only these; the rest of the snapshot already holds sound RAM. */
+static u32 early_stale[0x80000 >> 12 >> 5] = { ~0u, ~0u, ~0u, ~0u };
+static void ScspEarlyWritten(u32 address, u32 size) {
+  if (size >= 0x80000) {
+    memset(early_dirty, 0xFF, sizeof(early_dirty));
+    memset(early_stale, 0xFF, sizeof(early_stale));
+  } else if (size) {
+    const u32 first = (address & 0x7FFFF) >> 12;
+    const u32 last = ((address & 0x7FFFF) + size - 1) >> 12 & 127;
+    for (u32 p = first;; p = (p + 1) & 127) {
+      early_dirty[p >> 5] |= 1u << (p & 31);
+      early_stale[p >> 5] |= 1u << (p & 31);
+      if (p == last) break;
+    }
+  }
+}
+#define SCSP_EARLY_WRITTEN(a, n) ScspEarlyWritten(a, n)
+static unsigned early_line, early_quiet;       /* main side only (policy) */
+/* The worker blocks here once its frame is done, until the main side
+ * decides (commit or abort) and posts exactly once. */
+static YabEventQueue *early_decision;
+u32 g_early_stats[5];
+#ifdef A9_DIAG_EARLY_VERIFY
+u32 g_early_verify[2];
+#endif   /* commits, main rollbacks, self rollbacks, commit waits, frames */
+static int ScspEarlyUsable(void) {
+  return !use_new_scsp && g_scsp_main_mode == 0 && ScspHasAsyncWorker() &&
+         !VitaSoundBudgetBlocking() && M68K && M68K->id == M68KCORE_C68K;
+}
+/* Main side, before touching sound state: no early frame may be in flight. */
+static void ScspEarlyCancel(void) {
+  for (;;) {
+    int s = atomic_load_explicit(&early_state, memory_order_acquire);
+    if (s == EARLY_IDLE || s == EARLY_BLOCKED || s == EARLY_COMMIT) return;
+    if (s == EARLY_REQUESTED) {
+      if (atomic_compare_exchange_weak(&early_state, &s, EARLY_IDLE)) return;
+      continue;
+    }
+    if ((s == EARLY_RUNNING || s == EARLY_DONE) &&
+        atomic_compare_exchange_weak(&early_state, &s, EARLY_ABORT)) {
+      if (s == EARLY_DONE) YabAddEventQueue(early_decision, 0);
+      ++g_early_stats[1];
+      continue;
+    }
+    __asm__ volatile("yield");   /* EARLY_ABORT: the worker is rolling back */
+  }
+}
+void ScspEarlyMainAccess(void) {
+  early_quiet = 0;
+  const int s = atomic_load_explicit(&early_state, memory_order_acquire);
+  if (s != EARLY_IDLE && s != EARLY_BLOCKED && s != EARLY_COMMIT) ScspEarlyCancel();
+}
+/* Main side, once per scanline: allow an early frame once the SH-2s have
+ * left sound alone for a while (policy only; exactness never depends on it). */
+void ScspEarlyLine(void) {
+  ++early_line; ++early_quiet;
+  if (early_line < EARLY_START_LINE || early_line > EARLY_LAST_LINE || early_quiet < EARLY_QUIET_LINES)
+    return;
+  int s = EARLY_IDLE;
+  if (atomic_load_explicit(&early_state, memory_order_relaxed) == EARLY_IDLE && ScspEarlyUsable())
+    atomic_compare_exchange_strong(&early_state, &s, EARLY_REQUESTED);
+}
+/* Main side at VBlank-in, with the frame's budget published: 1 when an early
+ * frame stood and has been committed (the worker mixes it next), else 0 (the
+ * worker runs the frame now, as before). */
+int ScspEarlyCommit(void) {
+  early_line = 0;
+  for (;;) {
+    int s = atomic_load_explicit(&early_state, memory_order_acquire);
+    switch (s) {
+    case EARLY_REQUESTED:
+      if (atomic_compare_exchange_weak(&early_state, &s, EARLY_IDLE)) return 0;
+      break;
+    case EARLY_RUNNING:
+      ++g_early_stats[3];
+      while (atomic_load_explicit(&early_state, memory_order_acquire) == EARLY_RUNNING)
+        __asm__ volatile("yield");
+      break;
+    case EARLY_DONE:
+      atomic_store_explicit(&scsp_mix_busy, 1, memory_order_release);
+      atomic_store_explicit(&early_state, EARLY_COMMIT, memory_order_release);
+      YabAddEventQueue(early_decision, 0);
+      ++g_early_stats[0];
+      return 1;
+    case EARLY_BLOCKED:
+      atomic_store_explicit(&early_state, EARLY_IDLE, memory_order_release);
+      return 0;
+    default:
+      return 0;
+    }
+  }
+}
+#define SCSP_MAIN_GATE() ScspEarlyMainAccess()
+#else
+#define SCSP_MAIN_GATE() ((void)0)
+#endif
+#ifdef VITA_SCSP_EARLY_FRAME
+/* Main-side memory map entries to sound RAM and the SCSP (the 68000 reaches
+ * the same state through its own handlers on the sound worker). */
+static inline void ScspMainMapAccess(void) {
+  SCSP_MAIN_GATE();
+}
+/* A main-side sound RAM read leaves the early frame running: the frame runs
+ * after it either way, and until VBlank-in commits the frame the read must see
+ * sound RAM as of the frame's start, which the snapshot holds. Anything else
+ * (and an address past 512 KiB) cancels the frame first. */
+static u8 *ScspMainRamReadMap(u32 *a) {
+  early_quiet = 0;
+  const int s = atomic_load_explicit(&early_state, memory_order_acquire);
+  if (s == EARLY_IDLE || s == EARLY_BLOCKED || s == EARLY_COMMIT) return NULL;
+  u32 mem4b;
+  u8 *ram;
+  if ((s == EARLY_RUNNING || s == EARLY_DONE) &&
+      atomic_load_explicit(&early_snap_ok, memory_order_acquire) &&
+      (ram = ScspEarlySnapRam(&mem4b)) && (!mem4b || (*a & 0xFFFFF) <= 0x7FFFF)) {
+    *a &= mem4b ? 0x7FFFF : 0x3FFFF;
+    return ram;
+  }
+  ScspEarlyCancel();
+  return NULL;
+}
+u8 FASTCALL ScspMainRamReadByte(u32 a) {
+  u8 *ram = ScspMainRamReadMap(&a);
+  return ram ? T2ReadByte(ram, a) : SoundRamReadByte(a);
+}
+u16 FASTCALL ScspMainRamReadWord(u32 a) {
+  u8 *ram = ScspMainRamReadMap(&a);
+  if (!ram) return SoundRamReadWord(a);
+  SyncSh2And68k();
+  return T2ReadWord(ram, a);
+}
+u32 FASTCALL ScspMainRamReadLong(u32 a) {
+  u8 *ram = ScspMainRamReadMap(&a);
+  if (!ram) return SoundRamReadLong(a);
+  SyncSh2And68k();
+  return T2ReadLong(ram, a);
+}
+void FASTCALL ScspMainRamWriteByte(u32 a, u8 v) { ScspMainMapAccess(); SoundRamWriteByte(a, v); }
+void FASTCALL ScspMainRamWriteWord(u32 a, u16 v) { ScspMainMapAccess(); SoundRamWriteWord(a, v); }
+void FASTCALL ScspMainRamWriteLong(u32 a, u32 v) { ScspMainMapAccess(); SoundRamWriteLong(a, v); }
+u8 FASTCALL ScspMainRegReadByte(u32 a) { ScspMainMapAccess(); return scsp_r_b(a); }
+u16 FASTCALL ScspMainRegReadWord(u32 a) { ScspMainMapAccess(); return scsp_r_w(a); }
+u32 FASTCALL ScspMainRegReadLong(u32 a) { ScspMainMapAccess(); return scsp_r_d(a); }
+void FASTCALL ScspMainRegWriteByte(u32 a, u8 v) { ScspMainMapAccess(); scsp_w_b(a, v); }
+void FASTCALL ScspMainRegWriteWord(u32 a, u16 v) { ScspMainMapAccess(); scsp_w_w(a, v); }
+void FASTCALL ScspMainRegWriteLong(u32 a, u32 v) { ScspMainMapAccess(); scsp_w_d(a, v); }
+#endif
 static int scsp_sample_count = 0;
 static int scsp_checktime = 0;
 ////////////////////////////////////////////////////////////////
@@ -5141,6 +5316,9 @@ c68k_interrupt_handler (u32 level)
 static void
 scu_interrupt_handler (void)
 {
+#ifdef VITA_SCSP_EARLY_FRAME
+  if (early_in_frame) { early_self_abort = 1; return; }   /* rolled back, reruns at VBlank-in */
+#endif
   // send interrupt to scu
   ScuSendSoundRequest ();
 }
@@ -5167,6 +5345,9 @@ SoundRamReadByte (u32 addr)
 
 //////////////////////////////////////////////////////////////////////////////
 
+#ifndef SCSP_EARLY_WRITTEN
+#define SCSP_EARLY_WRITTEN(a, n) ((void)0)
+#endif
 void FASTCALL
 SoundRamWriteByte (u32 addr, u8 val)
 {
@@ -5183,6 +5364,7 @@ SoundRamWriteByte (u32 addr, u8 val)
   //SCSPLOG("SoundRamWriteByte %08X:%02X", addr, val);
   C68K_NATIVE_GUARD;
   T2WriteByte (SoundRam, addr, val);
+  SCSP_EARLY_WRITTEN(addr, 1);
   M68K->WriteNotify (addr, 1);
 }
 
@@ -5265,6 +5447,7 @@ SoundRamWriteWord (u32 addr, u16 val)
   //LOG("SoundRamWriteWord %08X:%04X", addr, val);
   C68K_NATIVE_GUARD;
   T2WriteWord (SoundRam, addr, val);
+  SCSP_EARLY_WRITTEN(addr, 2);
   M68K->WriteNotify (addr, 2);
   //SyncSh2And68k();
 }
@@ -5343,6 +5526,7 @@ SoundRamWriteLong (u32 addr, u32 val)
   //LOG("SoundRamWriteLong %08X:%08X", addr, val);
   C68K_NATIVE_GUARD;
   T2WriteLong (SoundRam, addr, val);
+  SCSP_EARLY_WRITTEN(addr, 4);
   M68K->WriteNotify (addr, 4);
   //SyncSh2And68k();
 
@@ -5486,6 +5670,9 @@ ScspDeInit (void)
 #if defined(ASYNC_SCSP)
   //if (q_scsp_finish) YabAddEventQueue(q_scsp_finish, 0);
   if (q_scsp_frame_start)YabAddEventQueue(q_scsp_frame_start, 0);
+#ifdef VITA_SCSP_EARLY_FRAME
+  if (early_decision) YabAddEventQueue(early_decision, 0);
+#endif
   YabThreadWait(YAB_THREAD_SCSP);
 #endif
 
@@ -5515,6 +5702,8 @@ ScspDeInit (void)
 void
 M68KStart (void)
 {
+  SCSP_MIX_GATE();
+  SCSP_MAIN_GATE();
   M68K->Reset ();
   //ScspReset();
   savedcycles = 0;
@@ -5526,6 +5715,8 @@ M68KStart (void)
 void
 M68KStop (void)
 {
+  SCSP_MIX_GATE();
+  SCSP_MAIN_GATE();
   M68K->Reset();
   //ScspReset();
   IsM68KRunning = 0;
@@ -5536,6 +5727,8 @@ M68KStop (void)
 void
 ScspReset (void)
 {
+  SCSP_MIX_GATE();
+  SCSP_MAIN_GATE();
   g_scsp_lock = 1;
   YabThreadUSleep(100000);
   scsp_reset();
@@ -5890,6 +6083,7 @@ void new_scsp_update_samples(s32 *bufL, s32 *bufR, int scspsoundlen)
 }
 
 void ScspLockThread() {
+  SCSP_MAIN_GATE();
   g_scsp_lock = 1;
   YabThreadUSleep(16666*2);
 }
@@ -5938,6 +6132,110 @@ static inline void ScspCpuFrameEnd(void) {
   OrbitMaterialize(); /* exact 68000 state before the SH-2s resume */
 #endif
 }
+#ifdef VITA_SCSP_EARLY_FRAME
+enum { EARLY_CHUNKS = 188160 / 256 };
+/* Everything a legacy frame (68000 + timers + its register writes) writes. */
+typedef struct {
+  u8 ram[0x80000];
+  c68k_struc cpu;
+  scsp_t scsp;
+  u8 reg[0x1000];
+  ScspDsp dsp;
+  u32 timing1, timing2;
+  s32 savedcycles;
+#ifdef VITA_M68K_IDLE_ORBIT
+  C68kIdleOrbit orbit;
+  unsigned cooldown, backoff, explore;
+#endif
+} ScspEarlySnapshot;
+static ScspEarlySnapshot *early_snap;
+static void ScspEarlySave(void) {
+  ScspEarlySnapshot *e = early_snap;
+  for (unsigned w = 0; w < sizeof(early_stale) / sizeof(early_stale[0]); ++w) {
+    for (u32 m = early_stale[w]; m; m &= m - 1) {
+      const unsigned p = w * 32 + __builtin_ctz(m);
+      memcpy(e->ram + (p << 12), SoundRam + (p << 12), 0x1000);
+    }
+    early_stale[w] = 0;
+  }
+#ifdef A9_DIAG_EARLY_VERIFY
+  {
+    extern u32 g_early_verify[2];
+    if (memcmp(SoundRam, e->ram, sizeof(e->ram))) ++g_early_verify[1];
+  }
+#endif
+  memset(early_dirty, 0, sizeof(early_dirty));
+  e->cpu = C68K; e->scsp = scsp; memcpy(e->reg, scsp_reg, sizeof(e->reg)); e->dsp = scsp_dsp;
+  e->timing1 = ScspInternalVars->scsptiming1; e->timing2 = ScspInternalVars->scsptiming2;
+  e->savedcycles = savedcycles;
+#ifdef VITA_M68K_IDLE_ORBIT
+  e->orbit = orbit; e->cooldown = orbit_cooldown; e->backoff = orbit_backoff; e->explore = orbit_explore;
+#endif
+}
+static u8 *ScspEarlySnapRam(u32 *mem4b) {
+  *mem4b = early_snap->scsp.mem4b;
+  return early_snap->ram;
+}
+static void ScspEarlyRestore(void) {
+  const ScspEarlySnapshot *e = early_snap;
+  for (unsigned w = 0; w < sizeof(early_dirty) / sizeof(early_dirty[0]); ++w)
+    for (u32 m = early_dirty[w]; m; m &= m - 1) {
+      const unsigned p = w * 32 + __builtin_ctz(m);
+      memcpy(SoundRam + (p << 12), e->ram + (p << 12), 0x1000);
+    }
+#ifdef A9_DIAG_EARLY_VERIFY
+  {
+    extern u32 g_early_verify[2];
+    ++g_early_verify[0];
+    if (memcmp(SoundRam, e->ram, sizeof(e->ram))) ++g_early_verify[1];
+  }
+#endif
+  C68K = e->cpu; scsp = e->scsp; memcpy(scsp_reg, e->reg, sizeof(e->reg)); scsp_dsp = e->dsp;
+  ScspInternalVars->scsptiming1 = e->timing1; ScspInternalVars->scsptiming2 = e->timing2;
+  savedcycles = e->savedcycles;
+#ifdef VITA_M68K_IDLE_ORBIT
+  orbit = e->orbit; orbit_cooldown = e->cooldown; orbit_backoff = e->backoff; orbit_explore = e->explore;
+#endif
+}
+/* Worker, on a request with no budget published yet: runs the next frame
+ * early. Returns 1 once it is committed (the caller mixes it), 0 after a
+ * rollback (the state is as before; the frame runs at VBlank-in instead). */
+static int ScspEarlyRun(void) {
+  int s = EARLY_REQUESTED;
+  if (!atomic_compare_exchange_strong(&early_state, &s, EARLY_RUNNING)) return 0;
+  if (!early_decision) early_decision = YabThreadCreateQueue(1);
+  if (!early_decision || (!early_snap && !(early_snap = malloc(sizeof(*early_snap))))) {
+    atomic_store_explicit(&early_state, EARLY_BLOCKED, memory_order_release);
+    return 0;
+  }
+  ScspEarlySave();
+  atomic_store_explicit(&early_snap_ok, 1, memory_order_release);
+  early_in_frame = 1;
+  for (int c = 0; c < EARLY_CHUNKS; ++c) {
+    ScspCpuChunk();
+    if (early_self_abort ||
+        atomic_load_explicit(&early_state, memory_order_acquire) == EARLY_ABORT) goto rollback;
+  }
+  ScspCpuFrameEnd();
+  early_in_frame = 0;
+  if (early_self_abort) goto rollback;
+  s = EARLY_RUNNING;
+  if (!atomic_compare_exchange_strong(&early_state, &s, EARLY_DONE)) goto rollback;
+  ++g_early_stats[4];
+  YabWaitEventQueue(early_decision);
+  s = atomic_load_explicit(&early_state, memory_order_acquire);
+  atomic_store_explicit(&early_snap_ok, 0, memory_order_release);
+  if (s == EARLY_COMMIT) return 1;
+rollback:
+  atomic_store_explicit(&early_snap_ok, 0, memory_order_release);
+  early_in_frame = 0;
+  ScspEarlyRestore();
+  if (early_self_abort) ++g_early_stats[2];
+  atomic_store_explicit(&early_state, early_self_abort ? EARLY_BLOCKED : EARLY_IDLE, memory_order_release);
+  early_self_abort = 0;
+  return 0;
+}
+#endif
 void ScspAsynMainCpuTime( void * p ){
   VT_SCOPE(VT_SCSP);
   VitaM68kNativeStart();
@@ -5982,11 +6280,36 @@ void ScspAsynMainCpuTime( void * p ){
       if (!VitaSoundBudgetWait(pre_m68k_cycle, &m68k_integer_part)) break;
       m68k_cycle = m68k_integer_part - pre_m68k_cycle;
     } else { VT_SCOPE(VT_SOUND_SYNC);
+#ifdef VITA_SCSP_EARLY_FRAME
+    int early = 0;
+#endif
     do {
       m68k_integer_part = getM68KCounter() >> SCSP_FRACTIONAL_BITS;
       m68k_cycle = m68k_integer_part - pre_m68k_cycle;
       if (thread_running == 0) break;
+#ifdef VITA_SCSP_EARLY_FRAME
+      if (m68k_cycle == 0 && frame == 0 && m68k_inc == 0 &&
+          atomic_load_explicit(&early_state, memory_order_acquire) == EARLY_REQUESTED &&
+          ScspEarlyRun()) { early = 1; break; }
+#endif
     } while (m68k_cycle == 0);
+#ifdef VITA_SCSP_EARLY_FRAME
+    if (early) {
+      /* Committed at VBlank-in: the main side set scsp_mix_busy and resumed. */
+      VitaM68kNativePark();
+      scsp_defer_output = 1;
+      ScspExecAsync();
+      scsp_defer_output = 0;
+      atomic_store_explicit(&scsp_mix_busy, 0, memory_order_release);
+      ScspFlushOutput();
+      YabWaitEventQueue(q_scsp_frame_start);
+      atomic_store_explicit(&early_state, EARLY_IDLE, memory_order_release);
+      VitaM68kNativeResume();
+      pre_m68k_cycle = 0;
+      setM68kDoneCounter(pre_m68k_cycle);
+      continue;
+    }
+#endif
     }
 
     m68k_inc += m68k_cycle;
@@ -5996,13 +6319,11 @@ void ScspAsynMainCpuTime( void * p ){
     while (m68k_inc >= samplecnt) {
       m68k_inc = m68k_inc - samplecnt;
       //LOG("[SCSP] MM68KExec %d", samplecnt);
-      MM68KExec(samplecnt);
       if (use_new_scsp) {
+        MM68KExec(samplecnt);
         new_scsp_exec((samplecnt << 1));
       }
-      else {
-        scsp_update_timer(1);
-      }
+      else ScspCpuChunk();
       hzcheck++;
 
       frame += samplecnt;
@@ -6360,6 +6681,7 @@ void ScspExecAsync() {
 void
 M68KWriteNotify (u32 address, u32 size)
 {
+  SCSP_EARLY_WRITTEN(address, size);
   M68K->WriteNotify (address, size);
 }
 
@@ -6548,6 +6870,8 @@ M68KClearCodeBreakpoints ()
 int
 SoundSaveState (FILE *fp)
 {
+  SCSP_MIX_GATE();
+  SCSP_MAIN_GATE();
   int i;
   u32 temp;
   int offset;
@@ -6841,6 +7165,8 @@ SoundSaveState (FILE *fp)
 int
 SoundLoadState (FILE *fp, int version, int size)
 {
+  SCSP_MIX_GATE();
+  SCSP_MAIN_GATE();
   C68K_NATIVE_GUARD;
   int i, i2;
   u32 temp;

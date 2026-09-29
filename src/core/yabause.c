@@ -811,6 +811,9 @@ int YabauseEmulate(void) {
          PROFILE_STOP("SCSP");
          yabsys.DecilineCount = 0;
          yabsys.LineCount++;
+#ifdef VITA_SCSP_EARLY_FRAME
+         ScspEarlyLine();
+#endif
 
          if (yabsys.LineCount == yabsys.VBlankLineCount) {
 
@@ -996,6 +999,9 @@ void SyncCPUtoSCSP() {
   if (g_scsp_main_mode == 0) {
 #ifdef VITA
     u64 sound_wait_start = YabauseGetTicks();
+#endif
+#ifdef VITA_SCSP_EARLY_FRAME
+    if (!ScspEarlyCommit())
 #endif
     YabWaitEventQueue(q_scsp_finish);
     VitaM68kNativePublish();

@@ -728,6 +728,12 @@ int main(void) {
         memset(g_orbit_abort, 0, sizeof(g_orbit_abort));
       }
 #endif
+#ifdef VITA_SCSP_EARLY_FRAME
+      { extern u32 g_early_stats[5];
+        YuiMsg("scsp_early commits=%u rollbacks=%u self_rollbacks=%u commit_waits=%u completed=%u",
+               g_early_stats[0], g_early_stats[1], g_early_stats[2], g_early_stats[3], g_early_stats[4]);
+        memset(g_early_stats, 0, sizeof(g_early_stats)); }
+#endif
       YuiMsg("progress frames=%u elapsed_us=%llu fps=%.3f presentation_us=%llu copy_us=%llu master_pc=%08x slave_pc=%08x",
         frames, now-start, batch * 1000000.0/(now-last), present_us, copy_us,
         SH2Core->GetPC(MSH2), SH2Core->GetPC(SSH2));

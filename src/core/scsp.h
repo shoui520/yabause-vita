@@ -154,6 +154,24 @@ void FASTCALL scsp_w_d(u32, u32);
 u8 FASTCALL scsp_r_b(u32);
 u16 FASTCALL scsp_r_w(u32);
 u32 FASTCALL scsp_r_d(u32);
+#ifdef VITA_SCSP_EARLY_FRAME
+u8 FASTCALL ScspMainRamReadByte(u32);
+u16 FASTCALL ScspMainRamReadWord(u32);
+u32 FASTCALL ScspMainRamReadLong(u32);
+void FASTCALL ScspMainRamWriteByte(u32, u8);
+void FASTCALL ScspMainRamWriteWord(u32, u16);
+void FASTCALL ScspMainRamWriteLong(u32, u32);
+u8 FASTCALL ScspMainRegReadByte(u32);
+u16 FASTCALL ScspMainRegReadWord(u32);
+u32 FASTCALL ScspMainRegReadLong(u32);
+void FASTCALL ScspMainRegWriteByte(u32, u8);
+void FASTCALL ScspMainRegWriteWord(u32, u16);
+void FASTCALL ScspMainRegWriteLong(u32, u32);
+#endif
+#ifdef VITA_SCSP_EARLY_FRAME
+void ScspEarlyLine(void);
+int ScspEarlyCommit(void);
+#endif
 
 void scsp_init(u8 *scsp_ram, void (*sint_hand)(u32), void (*mint_hand)(void));
 void scsp_shutdown(void);

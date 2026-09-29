@@ -694,6 +694,12 @@ void MappedMemoryInit()
                                 &Cs2WriteByte,
                                 &Cs2WriteWord,
                                 &Cs2WriteLong);
+#ifdef VITA_SCSP_EARLY_FRAME
+   FillMemoryArea(0x5A0, 0x5AF, &ScspMainRamReadByte, &ScspMainRamReadWord, &ScspMainRamReadLong,
+                                &ScspMainRamWriteByte, &ScspMainRamWriteWord, &ScspMainRamWriteLong);
+   FillMemoryArea(0x5B0, 0x5BF, &ScspMainRegReadByte, &ScspMainRegReadWord, &ScspMainRegReadLong,
+                                &ScspMainRegWriteByte, &ScspMainRegWriteWord, &ScspMainRegWriteLong);
+#else
    FillMemoryArea(0x5A0, 0x5AF, &SoundRamReadByte,
                                 &SoundRamReadWord,
                                 &SoundRamReadLong,
@@ -706,6 +712,7 @@ void MappedMemoryInit()
                                 &scsp_w_b,
                                 &scsp_w_w,
                                 &scsp_w_d);
+#endif
    FillMemoryArea(0x5C0, 0x5C7, &Vdp1RamReadByte,
                                 &Vdp1RamReadWord,
                                 &Vdp1RamReadLong,
