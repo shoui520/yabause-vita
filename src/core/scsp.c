@@ -5568,6 +5568,49 @@ __attribute__((noinline))
 #endif
 static s32 FASTCALL M68KExecBP (s32 cycles);
 
+#ifdef VITA_M68K_IDLE_ORBIT
+/* Exact idle fast-forward for the CPU-paced legacy worker. During its frame
+ * window the SH-2s are stopped in SyncCPUtoSCSP, so only the 68000 itself
+ * and scsp_update_timer (between 256-cycle chunks) change what the 68000
+ * can observe. M68KC68KOrbitProbe proves, on a copy, that the 68000 is on a
+ * periodic orbit of P cycles that reads only sound RAM / SCIPD and writes
+ * nothing that changes memory. Chunk budgets are then deferred. Before any
+ * timer step that could change SCIPD or the interrupt line, and before the
+ * frame hand-off, the deferred budget is executed from the orbit's start:
+ * whole periods are skipped (identical state), the remainder runs for real.
+ * C68K carries each chunk's overshoot (savedcycles), so one execution of
+ * the summed budget stops at the same instruction and overshoot as the
+ * chunked executions would (no interrupt can be taken in between). */
+#include "c68k/idle_orbit.h"
+extern s32 M68KC68KOrbitProbe(s32 max_cycles);
+extern int M68KC68KOrbitEligible(void);
+extern void M68KC68KOrbitEnter(C68kIdleOrbit *o, s32 period, s32 saved, s32 cycles);
+extern s32 M68KC68KOrbitCandidate(void);
+extern s32 M68KC68KOrbitRevalidate(void);
+static C68kIdleOrbit orbit;
+static unsigned orbit_cooldown, orbit_backoff, orbit_explore;
+u32 g_orbit_stats[7]; /* probes, found, deferred chunks, skipped periods, materialized, failed, revalidated */
+enum { ORBIT_COOLDOWN = 2, ORBIT_EXPLORE = 256 };
+static void OrbitMaterialize(void) {
+  if (!orbit.active) return;
+  ++g_orbit_stats[4];
+  savedcycles = C68kOrbitMaterialize(&orbit, SoundRam, m68kexecptr, &g_orbit_stats[3]);
+}
+/* Would the next scsp_update_timer(1) change anything the 68000 can observe
+ * (SCIPD bits, or its interrupt line)? Conservative: any timer overflow, the
+ * first setting of the 1-sample bit, or an enabled 1-sample interrupt. */
+static int OrbitTimerStepVisible(void) {
+  /* Mirrors scsp_update_timer(1): SCIPD bits it would set. SCIPD is the only
+   * SCSP register an orbit may read; its value changes only if a bit is new,
+   * and scsp_trigger_sound_interrupt runs only for bits enabled in SCIEB. */
+  u32 set = 0x400;
+  if (scsp.timacnt + (s32)(1u << (8 - scsp.timasd)) >= 0xFF00) set |= 0x40;
+  if (scsp.timbcnt + (s32)(1u << (8 - scsp.timbsd)) >= 0xFF00) set |= 0x80;
+  if (scsp.timccnt + (s32)(1u << (8 - scsp.timcsd)) >= 0xFF00) set |= 0x100;
+  return (set & ~scsp.scipd) || (set & scsp.scieb);
+}
+#endif
+
 #if defined(ASYNC_SCSP)
 void M68KExec(s32 cycles){}
 void MM68KExec(s32 cycles)
@@ -5575,6 +5618,44 @@ void MM68KExec(s32 cycles)
 void M68KExec(s32 cycles)
 #endif
 {
+#ifdef VITA_M68K_IDLE_ORBIT
+  if (orbit.active) { orbit.deferred += cycles; ++g_orbit_stats[2]; return; }
+  if (g_scsp_main_mode == 0 && !use_new_scsp && IsM68KRunning &&
+      m68kexecptr == M68K->Exec && M68KC68KOrbitEligible()) {
+    /* Policy only (exactness never depends on it): at addresses of passes
+     * that closed before, first re-validate the recorded pass (cheap), then
+     * dry-run a probe bounded by that orbit's period; elsewhere, a rare
+     * short exploratory probe discovers new orbits. */
+    VT_STACK_BEGIN(VT_M68K_ORBIT);
+    const s32 known = M68KC68KOrbitCandidate();
+    s32 period = 0;
+    int probed = 0;
+    if (known) {
+      period = M68KC68KOrbitRevalidate();
+      if (period > 0) ++g_orbit_stats[6];
+      else if (orbit_cooldown) --orbit_cooldown;
+      else { probed = 1; period = M68KC68KOrbitProbe(known + 64); }
+    } else if (++orbit_explore >= ORBIT_EXPLORE) {
+      orbit_explore = 0;
+      probed = 1; period = M68KC68KOrbitProbe(1024);
+    } else { VT_STACK_END(); goto no_probe; }
+    VT_STACK_END();
+    g_orbit_stats[0] += probed;
+    if (period > 0) {
+      if (probed) ++g_orbit_stats[1];
+      ++g_orbit_stats[2];
+      M68KC68KOrbitEnter(&orbit, period, savedcycles, cycles);
+      orbit_backoff = 0;
+      return;
+    }
+    if (probed) {
+      /* Exponential backoff while the driver is busy; reset on success. */
+      orbit_backoff = orbit_backoff ? (orbit_backoff < 64 ? orbit_backoff * 2 : 64) : ORBIT_COOLDOWN;
+      orbit_cooldown = orbit_backoff; ++g_orbit_stats[5];
+    }
+  }
+no_probe:
+#endif
 #ifdef VITA_STACK_PROFILE
   { /* Diagnostic: 68K PC at each 256-cycle chunk boundary (fixed-cycle sampling). */
     extern u32 M68K_GetPC_Diag(void); extern void YuiMsg(const char *, ...);
@@ -5837,6 +5918,26 @@ void ScspExec(){
 #include <inttypes.h>
 #define __STDC_FORMAT_MACROS
 
+/* One 256-cycle step of the CPU-paced legacy frame: the 68000, then the
+ * SCSP timers (one sample). */
+static inline void ScspCpuChunk(void) {
+  MM68KExec(256);
+#ifdef VITA_M68K_IDLE_ORBIT
+  if (orbit.active && OrbitTimerStepVisible()) {
+    VT_STACK_BEGIN(VT_M68K_ORBIT); OrbitMaterialize(); VT_STACK_END();
+  }
+#endif
+  VT_STACK_BEGIN(VT_SCSP_TIMER);
+  scsp_update_timer(1);
+  VT_STACK_END();
+}
+static inline void ScspCpuFrameEnd(void) {
+  ScspInternalVars->scsptiming2 = 0;
+  ScspInternalVars->scsptiming1 = scsplines;
+#ifdef VITA_M68K_IDLE_ORBIT
+  OrbitMaterialize(); /* exact 68000 state before the SH-2s resume */
+#endif
+}
 void ScspAsynMainCpuTime( void * p ){
   VT_SCOPE(VT_SCSP);
   VitaM68kNativeStart();
@@ -5907,12 +6008,32 @@ void ScspAsynMainCpuTime( void * p ){
       frame += samplecnt;
       if (frame >= framecnt) {
         frame = frame - framecnt;
-        ScspInternalVars->scsptiming2 = 0;
-        ScspInternalVars->scsptiming1 = scsplines;
+        ScspCpuFrameEnd();
+#ifdef VITA_SCSP_MIX_AFTER_SYNC
+        VitaM68kNativePark();
+        atomic_store_explicit(&scsp_mix_busy, 1, memory_order_release);
+        YabAddEventQueue( q_scsp_finish , 0);
+        scsp_defer_output = 1;
         ScspExecAsync();
+        scsp_defer_output = 0;
+        atomic_store_explicit(&scsp_mix_busy, 0, memory_order_release);
+#else
+#ifdef VITA_SCSP_OUTPUT_AFTER_SYNC
+        scsp_defer_output = 1;
+        ScspExecAsync();
+        scsp_defer_output = 0;
+#else
+        ScspExecAsync();
+#endif
 
         VitaM68kNativePark();
         YabAddEventQueue( q_scsp_finish , 0);
+#endif
+#ifdef VITA_SCSP_OUTPUT_AFTER_SYNC
+        /* The main CPU resumes now; this worker still finishes output before
+         * waiting for the next frame and before its next mix. */
+        ScspFlushOutput();
+#endif
         pre_m68k_cycle = 0;
         m68k_inc = 0;
         //LOG("[SCSP] WAIT SH2");

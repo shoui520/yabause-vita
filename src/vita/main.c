@@ -713,6 +713,21 @@ int main(void) {
         YuiMsg("scsp_mix_gate waits=%u spins=%u", g_scsp_mix_waits, g_scsp_mix_spins);
         g_scsp_mix_waits = g_scsp_mix_spins = 0; }
 #endif
+#ifdef VITA_M68K_IDLE_ORBIT
+      {
+        extern u32 g_orbit_stats[7];
+        YuiMsg("m68k_orbit probes=%u found=%u revalidated=%u deferred_chunks=%u skipped_periods=%u materialized=%u failed=%u",
+          g_orbit_stats[0], g_orbit_stats[1], g_orbit_stats[6], g_orbit_stats[2], g_orbit_stats[3], g_orbit_stats[4], g_orbit_stats[5]);
+        memset(g_orbit_stats, 0, sizeof(g_orbit_stats));
+        extern u32 g_orbit_abort[16], g_orbit_abort_addr[16];
+        YuiMsg("m68k_orbit_abort ok=%u rb=%u/%06x rw=%u/%06x wb=%u/%06x ww=%u/%06x irq=%u bad=%u long=%u/%06x overlay=%u changed=%u/%06x",
+          g_orbit_abort[0], g_orbit_abort[1], g_orbit_abort_addr[1], g_orbit_abort[2], g_orbit_abort_addr[2],
+          g_orbit_abort[3], g_orbit_abort_addr[3], g_orbit_abort[4], g_orbit_abort_addr[4],
+          g_orbit_abort[5], g_orbit_abort[6], g_orbit_abort[7], g_orbit_abort_addr[7],
+          g_orbit_abort[8], g_orbit_abort[9], g_orbit_abort_addr[9]);
+        memset(g_orbit_abort, 0, sizeof(g_orbit_abort));
+      }
+#endif
       YuiMsg("progress frames=%u elapsed_us=%llu fps=%.3f presentation_us=%llu copy_us=%llu master_pc=%08x slave_pc=%08x",
         frames, now-start, batch * 1000000.0/(now-last), present_us, copy_us,
         SH2Core->GetPC(MSH2), SH2Core->GetPC(SSH2));

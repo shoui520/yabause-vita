@@ -27,6 +27,9 @@
 #include "c68k/native_source.h"
 #include "memory.h"
 #include "yabause.h"
+#ifdef VITA_M68K_IDLE_ORBIT
+#include "scsp.h" /* SoundRam */
+#endif
 
 /**
  * PROFILE_68K: Perform simple profiling of the 68000 emulation, reporting
@@ -95,6 +98,50 @@ static s32 FASTCALL M68KC68KExec(s32 cycle) {
 u32 M68K_GetPC_Diag(void) { return C68k_Get_PC(&C68K); }
 #endif
 
+#ifdef VITA_M68K_IDLE_ORBIT
+#include "c68k/idle_orbit.h"
+/* See c68k/idle_orbit.h and scsp.c: probes a copy of the live CPU. */
+int M68KC68KOrbitEligible(void) { return C68kOrbitEligible(&C68K); }
+u32 g_orbit_abort[16], g_orbit_abort_addr[16];
+static C68kOrbitProbeEnv envs[2];
+static int rec;                  /* envs[rec]: last closed pass; probes use the other */
+#define env envs[rec]
+/* Probe policy data only (never affects exactness): instruction addresses of
+ * passes that closed before, as candidate starting points. */
+static u32 orbit_pcs[1024]; /* open addressing, value pc + 1, 0 empty */
+static s32 orbit_pc_period[1024]; /* longest closed period through that address */
+static int OrbitPcSlot(u32 pc) {
+  u32 h = (pc * 2654435761u) >> 22;
+  for (unsigned n = 0; n < 1024; ++n, h = (h + 1) & 1023)
+    if (!orbit_pcs[h] || orbit_pcs[h] == pc + 1) return (int)h;
+  return -1;
+}
+/* Period of a known orbit through the current address, or 0. */
+s32 M68KC68KOrbitCandidate(void) {
+  const int h = OrbitPcSlot(C68k_Get_PC(&C68K));
+  return h >= 0 && orbit_pcs[h] ? orbit_pc_period[h] : 0;
+}
+void M68KC68KOrbitEnter(C68kIdleOrbit *o, s32 period, s32 saved, s32 cycles) {
+  C68kOrbitEnter(o, &env, period, saved, cycles);
+  for (unsigned i = 0; i < env.step; ++i) {
+    const int h = OrbitPcSlot(env.step_pc[i]);
+    if (h < 0) continue;
+    orbit_pcs[h] = env.step_pc[i] + 1;
+    if (orbit_pc_period[h] < period) orbit_pc_period[h] = period;
+  }
+}
+s32 M68KC68KOrbitRevalidate(void) {
+  return C68kOrbitRevalidate(&C68K, &env, SoundRam, (u16)C68K.Read_Word(0x100420));
+}
+s32 M68KC68KOrbitProbe(s32 max_cycles) {
+  C68kOrbitProbeEnv *scratch = &envs[1 - rec];
+  scratch->ram = SoundRam; scratch->read_b = C68K.Read_Byte; scratch->read_w = C68K.Read_Word;
+  const s32 period = C68kOrbitProbe(&C68K, scratch, max_cycles);
+  ++g_orbit_abort[scratch->abort & 15]; g_orbit_abort_addr[scratch->abort & 15] = scratch->abort_addr;
+  if (period > 0) rec = 1 - rec;
+  return period;
+}
+#endif
 static void M68KC68KSync(void) {
 }
 
