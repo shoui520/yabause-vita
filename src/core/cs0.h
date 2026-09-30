@@ -91,6 +91,7 @@ extern cartridge_struct *CartridgeArea;
 
 int CartInit(const char *filename, int);
 void CartFlush(void);
+extern u8 CartBupRamWritten;
 void CartDeInit(void);
 
 int CartSaveState(FILE *fp);

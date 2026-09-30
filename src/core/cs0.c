@@ -847,6 +847,7 @@ static u32 FASTCALL BUP4MBITCs1ReadLong(u32 addr)
 static void FASTCALL BUP4MBITCs1WriteByte(u32 addr, u8 val)
 {
    T1WriteByte(CartridgeArea->bupram, addr & 0xFFFFF, val);
+   CartBupRamWritten = 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -854,6 +855,7 @@ static void FASTCALL BUP4MBITCs1WriteByte(u32 addr, u8 val)
 static void FASTCALL BUP4MBITCs1WriteWord(u32 addr, u16 val)
 {
    T1WriteWord(CartridgeArea->bupram, addr & 0xFFFFF, val);
+   CartBupRamWritten = 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -861,6 +863,7 @@ static void FASTCALL BUP4MBITCs1WriteWord(u32 addr, u16 val)
 static void FASTCALL BUP4MBITCs1WriteLong(u32 addr, u32 val)
 {
    T1WriteLong(CartridgeArea->bupram, addr & 0xFFFFF, val);
+   CartBupRamWritten = 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -891,6 +894,7 @@ static u32 FASTCALL BUP8MBITCs1ReadLong(u32 addr)
 static void FASTCALL BUP8MBITCs1WriteByte(u32 addr, u8 val)
 {
    T1WriteByte(CartridgeArea->bupram, addr & 0x1FFFFF, val);
+   CartBupRamWritten = 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -898,6 +902,7 @@ static void FASTCALL BUP8MBITCs1WriteByte(u32 addr, u8 val)
 static void FASTCALL BUP8MBITCs1WriteWord(u32 addr, u16 val)
 {
    T1WriteWord(CartridgeArea->bupram, addr & 0x1FFFFF, val);
+   CartBupRamWritten = 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -905,6 +910,7 @@ static void FASTCALL BUP8MBITCs1WriteWord(u32 addr, u16 val)
 static void FASTCALL BUP8MBITCs1WriteLong(u32 addr, u32 val)
 {
    T1WriteLong(CartridgeArea->bupram, addr & 0x1FFFFF, val);
+   CartBupRamWritten = 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -935,6 +941,7 @@ static u32 FASTCALL BUP16MBITCs1ReadLong(u32 addr)
 static void FASTCALL BUP16MBITCs1WriteByte(u32 addr, u8 val)
 {
    T1WriteByte(CartridgeArea->bupram, addr & 0x3FFFFF, val);
+   CartBupRamWritten = 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -942,6 +949,7 @@ static void FASTCALL BUP16MBITCs1WriteByte(u32 addr, u8 val)
 static void FASTCALL BUP16MBITCs1WriteWord(u32 addr, u16 val)
 {
    T1WriteWord(CartridgeArea->bupram, addr & 0x3FFFFF, val);
+   CartBupRamWritten = 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -949,6 +957,7 @@ static void FASTCALL BUP16MBITCs1WriteWord(u32 addr, u16 val)
 static void FASTCALL BUP16MBITCs1WriteLong(u32 addr, u32 val)
 {
    T1WriteLong(CartridgeArea->bupram, addr & 0x3FFFFF, val);
+   CartBupRamWritten = 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -979,6 +988,7 @@ static u32 FASTCALL BUP32MBITCs1ReadLong(u32 addr)
 static void FASTCALL BUP32MBITCs1WriteByte(u32 addr, u8 val)
 {
    T1WriteByte(CartridgeArea->bupram, addr & 0x7FFFFF, val);
+   CartBupRamWritten = 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -986,6 +996,7 @@ static void FASTCALL BUP32MBITCs1WriteByte(u32 addr, u8 val)
 static void FASTCALL BUP32MBITCs1WriteWord(u32 addr, u16 val)
 {
    T1WriteWord(CartridgeArea->bupram, addr & 0x7FFFFF, val);
+   CartBupRamWritten = 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -993,6 +1004,7 @@ static void FASTCALL BUP32MBITCs1WriteWord(u32 addr, u16 val)
 static void FASTCALL BUP32MBITCs1WriteLong(u32 addr, u32 val)
 {
    T1WriteLong(CartridgeArea->bupram, addr & 0x7FFFFF, val);
+   CartBupRamWritten = 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1042,6 +1054,10 @@ static void FASTCALL ROM16MBITCs0WriteLong(u32 addr, u32 val)
 //////////////////////////////////////////////////////////////////////////////
 // General Cart functions
 //////////////////////////////////////////////////////////////////////////////
+
+/* Set when a backup RAM cartridge is written, for frontends that save it
+ * while running (CartFlush). */
+u8 CartBupRamWritten;
 
 int CartInit(const char * filename, int type)
 {

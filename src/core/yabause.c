@@ -266,6 +266,7 @@ int YabauseInit(yabauseinit_struct *init)
 
    }
    else {
+     bupfilename = init->buppath;   /* saved at exit and by YabSaveBackups */
      if ((BupRam = T1MemoryInit(0x10000)) == NULL)
        return -1;
 
@@ -483,6 +484,20 @@ void YabFlushBackups(void)
     }
   }
   CartFlush();
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+int YabSaveBackups(void)
+{
+  int result = 0;
+  BupRamWritten = 0;
+  CartBupRamWritten = 0;
+  if (BupRam && !yabsys.extend_backup && bupfilename &&
+      T123Save(BupRam, 0x10000, 1, bupfilename) != 0)
+    result = -1;
+  CartFlush();
+  return result;
 }
 
 //////////////////////////////////////////////////////////////////////////////

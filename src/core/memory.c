@@ -591,6 +591,7 @@ static void FASTCALL BupRamMemoryWriteByte(u32 addr, u8 val)
   }
   //printf("BupRamMemoryWriteByte %08X\n",addr);
   T1WriteByte(BupRam, addr|0x1, val);
+  BupRamWritten = 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////

@@ -102,6 +102,9 @@ void print_usage(const char *program_name);
 void YabauseChangeTiming(int freqtype);
 int YabauseInit(yabauseinit_struct *init);
 void YabFlushBackups(void);
+/* Writes the internal backup RAM and a backup RAM cartridge to their files
+ * while running, and clears BupRamWritten and CartBupRamWritten. */
+int YabSaveBackups(void);
 void YabauseDeInit(void);
 void YabauseSetDecilineMode(int on);
 void YabauseResetNoLoad(void);
