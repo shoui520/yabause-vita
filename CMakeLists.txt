@@ -1473,7 +1473,7 @@ set(YABAUSE_PAF_SDK "" CACHE PATH "VitaSDK prefix with the PAF component (YABAUS
 set(YABAUSE_PSP2CXML "" CACHE FILEPATH "psp2cxml-tool executable (YABAUSE_PAF_UI)")
 set(VITA_TITLE_ID "YABA00001" CACHE STRING "Title ID of the package")
 set(VITA_TITLE_NAME "Yabause Vita" CACHE STRING "Name of the package")
-set(vpk_files)
+set(vpk_files FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/vita/sce_sys/icon0.png" sce_sys/icon0.png)
 if(YABAUSE_PAF_UI)
   if(NOT YABAUSE_VITAGL)
     message(FATAL_ERROR "The in-game menu draws into vitaGL's frames")
