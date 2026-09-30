@@ -121,11 +121,17 @@ void VitaDiagTimersReport(void) {
 #include "osdcore.h"
 #include "peripheral.h"
 #include "memory.h"
+#include "cs0.h"
 #include "present.h"
 #include "frame_capture.h"
 #include "input_replay.h"
 #include "log_writer.h"
 #include "vdp2.h"
+#include "config.h"
+#include "game_list.h"
+#ifdef YABAUSE_PAF_UI
+#include "ui/paf_ui.h"
+#endif
 static unsigned capture_frame, presented_frames;
 int YuiCapturePending(void) {
   return capture_frame && presented_frames + 1 == capture_frame;
@@ -499,14 +505,15 @@ VideoInterface_struct *VIDCoreList[] = {
 #endif
   &VIDSoft, NULL};
 
+/* SCE_CTRL_* per Saturn input (config.h order: Up Right Down Left R C B A
+ * Y Z L Start X), from the pad_* settings. */
+static unsigned buttons[VITA_SATURN_BUTTONS];
+
 static void input(unsigned frame) {
-  static const unsigned buttons[] = {SCE_CTRL_UP, SCE_CTRL_RIGHT, SCE_CTRL_DOWN,
-    SCE_CTRL_LEFT, 0, SCE_CTRL_RTRIGGER, SCE_CTRL_CIRCLE,
-    SCE_CTRL_CROSS, SCE_CTRL_TRIANGLE, SCE_CTRL_LTRIGGER, 0,
-    SCE_CTRL_START, SCE_CTRL_SQUARE};
-  /* Saturn order: Up Right Down Left R C B A Y Z L Start X.
-   * Physical shoulders are Z/C; Saturn L/R remain unbound. */
   SceCtrlData ctrl = {0}; sceCtrlPeekBufferPositive(0, &ctrl, 1);
+  /* The right stick's directions past half travel, as buttons. */
+  if (ctrl.rx < 64) ctrl.buttons |= VITA_CTRL_RSTICK_LEFT;
+  else if (ctrl.rx > 191) ctrl.buttons |= VITA_CTRL_RSTICK_RIGHT;
   unsigned replay_mask = 0, previous = input_replay.next;
   int scripted = VitaInputReplayMask(&input_replay, frame, &replay_mask);
   if (input_replay.next != previous)
@@ -520,6 +527,33 @@ static void input(unsigned frame) {
 
 /* Lists the saves in internal backup RAM: 64-byte blocks of the odd bytes;
  * a save's first block starts 0x80000000, then its 11-byte name. */
+static int file_exists(const char *path) {
+  SceIoStat stat;
+  return sceIoGetstat(path, &stat) >= 0;
+}
+
+/* The first 64 KiB of the earlier bkram.bin (YabaSanshiro's extended backup
+ * image) are the internal backup RAM: copied once into memory/. The old file
+ * is left as it is. */
+static void migrate_internal_backup(void) {
+  static unsigned char internal[0x10000];
+  if (file_exists(VITA_INTERNAL_BACKUP)) return;
+  FILE *old = fopen(DATA "bkram.bin", "rb");
+  if (!old) return;
+  const size_t read = fread(internal, 1, sizeof(internal), old);
+  fclose(old);
+  if (read != sizeof(internal)) return;
+  FILE *file = fopen(VITA_INTERNAL_BACKUP ".tmp", "wb");
+  if (!file) return;
+  const size_t written = fwrite(internal, 1, sizeof(internal), file);
+  if (fclose(file) != 0 || written != sizeof(internal) ||
+      rename(VITA_INTERNAL_BACKUP ".tmp", VITA_INTERNAL_BACKUP) != 0) {
+    remove(VITA_INTERNAL_BACKUP ".tmp");
+    return;
+  }
+  YuiMsg("backup_migrated from=" DATA "bkram.bin");
+}
+
 static void VitaLogBackupRam(const char *path) {
   unsigned saves = 0;
   if (!BupRam) return;
@@ -539,7 +573,118 @@ static void VitaLogBackupRam(const char *path) {
   YuiMsg("backup_ram path=%s saves=%u", path, saves);
 }
 
-int main(void) {
+/* The game list starts the emulator again with "--game <path>"; the
+ * in-game menu returns to the list with "--list". */
+static const char *launch_game(int argc, char **argv) {
+  for (int i = 0; i + 1 < argc; ++i)
+    if (argv[i] && !strcmp(argv[i], "--game")) return argv[i + 1];
+  return NULL;
+}
+
+#ifdef YABAUSE_PAF_UI
+static int launch_list(int argc, char **argv) {
+  for (int i = 0; i < argc; ++i)
+    if (argv[i] && !strcmp(argv[i], "--list")) return 1;
+  return 0;
+}
+#endif
+
+/* The disc's file name without its extension ("bios" without a disc). */
+static void disc_name(const char *disc, char *name, size_t size) {
+  const char *base = strrchr(disc, '/');
+  base = base ? base + 1 : disc[0] ? disc : "bios";
+  snprintf(name, size, "%.*s", (int)strcspn(base, "."), base);
+}
+
+#ifdef YABAUSE_PAF_UI
+static void menu_frame(void) {
+#ifdef VITA_RENDER_THREAD
+  extern int VitaRenderCall(void (*)(void));
+  if (VitaRenderCall(VitaUiMenuFrame) == 0) return;   /* vitaGL's thread */
+#endif
+  VitaUiMenuFrame();
+}
+
+enum { MENU_RESUME, MENU_QUIT, MENU_RESTART };
+
+/* Settings the emulator takes only as it starts. */
+static int boot_settings_changed(const VitaConfig *boot, const VitaConfig *settings) {
+  return strcmp(boot->bios, settings->bios) || boot->region != settings->region ||
+         boot->cartridge != settings->cartridge || boot->backup_slot != settings->backup_slot;
+}
+
+/* The SELECT menu, over the paused game. Returns MENU_QUIT for Quit to
+ * Game List, MENU_RESTART for a Reset that needs the emulator started
+ * again with the changed settings. */
+static int run_menu(const char *disc, VitaConfig *settings, const VitaConfig *boot) {
+  char name[160], state[256], status[64];
+  disc_name(disc, name, sizeof(name));
+  YuiMsg("menu_open");
+  VitaUiMenuOpen();
+  unsigned held = SCE_CTRL_SELECT;
+  int quit = MENU_RESUME, done = 0;
+  while (!done) {
+    menu_frame();
+    SceCtrlData pad = {0};
+    sceCtrlPeekBufferPositive(0, &pad, 1);
+    const unsigned pressed = pad.buttons & ~held;
+    held = pad.buttons;
+    if ((pressed & SCE_CTRL_SELECT) && !VitaUiMenuSettingsShown()) done = 1;
+    switch (VitaUiMenuPoll()) {
+    case VITA_UI_RESUME: done = 1; break;
+    case VITA_UI_SAVE_STATE: {
+      const int slot = VitaUiMenuSlot();
+      VitaConfigStatePath(state, sizeof(state), name, slot);
+      sceIoMkdir(DATA "states", 0777);
+      const int rc = YabSaveState(state);
+      YuiMsg("menu_state_saved rc=%d path=%s", rc, state);
+      if (rc == 0) snprintf(status, sizeof(status), "Saved to slot %d.", slot);
+      else snprintf(status, sizeof(status), "Slot %d could not be saved.", slot);
+      VitaUiMenuSetStatus(status);
+      break;
+    }
+    case VITA_UI_LOAD_STATE: {
+      const int slot = VitaUiMenuSlot();
+      VitaConfigStatePath(state, sizeof(state), name, slot);
+      FILE *file = fopen(state, "rb");
+      if (!file) {
+        snprintf(status, sizeof(status), "Slot %d is empty.", slot);
+        VitaUiMenuSetStatus(status);
+        break;
+      }
+      fclose(file);
+      const int rc = YabLoadState(state);
+      YuiMsg("menu_state_loaded rc=%d path=%s", rc, state);
+      if (rc == 0) done = 1;
+      else {
+        snprintf(status, sizeof(status), "Slot %d could not be loaded.", slot);
+        VitaUiMenuSetStatus(status);
+      }
+      break;
+    }
+    case VITA_UI_RESET:
+      if (boot_settings_changed(boot, settings)) quit = MENU_RESTART;
+      else YabauseReset();
+      YuiMsg("menu_reset restart=%d", quit == MENU_RESTART);
+      done = 1;
+      break;
+    case VITA_UI_QUIT: quit = MENU_QUIT; done = 1; break;
+    default: break;
+    }
+    if (VitaUiMenuTakeConfigChange())
+      for (unsigned i = 0; i < VITA_SATURN_BUTTONS; ++i)
+        buttons[i] = VitaConfigButtonMask(settings->pad[i]);
+  }
+  VitaUiMenuClose();
+  /* Buttons still down from the menu are not game input. */
+  for (SceCtrlData pad = {0}; sceCtrlPeekBufferPositive(0, &pad, 1), pad.buttons; )
+    sceDisplayWaitVblankStart();
+  YuiMsg("menu_closed quit=%d", quit);
+  return quit;
+}
+#endif
+
+int main(int argc, char **argv) {
   SceAppUtilInitParam ap = {0}; SceAppUtilBootParam bp = {0};
   sceAppUtilInit(&ap, &bp);
   sceIoMkdir(DATA, 0777);
@@ -557,6 +702,41 @@ int main(void) {
   if (receipt) { fgets(run_id, sizeof(run_id), receipt); fclose(receipt); }
   run_id[strcspn(run_id, "\r\n")] = 0;
   YuiMsg("run_id=%s", run_id);
+  VitaConfig settings;
+#ifdef YABAUSE_PAF_UI
+  int quit_to_list = 0;   /* the in-game menu's Quit to Game List */
+  int restart_game = 0;   /* its Reset after the settings changed */
+#endif
+  const int settings_missing = VitaConfigLoad(&settings, DATA "config.ini");
+#ifdef YABAUSE_PAF_UI
+  const VitaConfig boot_settings = settings;   /* the ones the emulator starts with */
+#endif
+  YuiMsg("settings=%s", settings_missing ? "defaults" : "config.ini");
+  for (unsigned i = 0; i < VITA_SATURN_BUTTONS; ++i)
+    buttons[i] = VitaConfigButtonMask(settings.pad[i]);
+  sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);   /* the right stick can be bound */
+  /* The game: the game list's launch argument, else boot-path.txt (the
+   * development harness writes it), else the game list itself. */
+  const char *launched = launch_game(argc, argv);
+  char disc[1024] = {0};
+  if (launched) snprintf(disc, sizeof(disc), "%s", launched);
+  else {
+    FILE *boot_path = fopen(DATA "boot-path.txt", "r");
+    if (boot_path) {
+      if (!fgets(disc, sizeof(disc), boot_path)) disc[0] = 0;
+      fclose(boot_path);
+      disc[strcspn(disc, "\r\n")] = 0;
+    }
+  }
+#ifdef YABAUSE_PAF_UI
+  if (launch_list(argc, argv)) disc[0] = 0;
+  if (!disc[0]) {
+    VitaUiRunLauncher(&settings, DATA "config.ini");   /* returns on failure */
+    YuiMsg("launcher_failed");
+    log_close();
+    sceAppUtilShutdown(); sceKernelExitProcess(0); return 1;
+  }
+#endif
   if (!VitaTelemetryCheckThreadIsolation()) {
     YuiMsg("thread_isolation_failed: refusing shared thread-local state");
     log_close();
@@ -700,9 +880,6 @@ int main(void) {
   }
   memset(screens, 0, 2 * 512 * 272 * 4);
 #endif
-  char disc[1024] = {0};
-  FILE *config = fopen(DATA "boot-path.txt", "r");
-  if (config) { fgets(disc, sizeof(disc), config); fclose(config); disc[strcspn(disc, "\r\n")] = 0; }
   yabauseinit_struct init = {0};
   init.sh2coretype = 0; init.vidcoretype = VIDCORE_SOFT; init.sndcoretype = 1;
 #ifdef YABAUSE_VITAGL
@@ -713,21 +890,41 @@ int main(void) {
 #endif
   init.percoretype = 0; init.m68kcoretype = M68KCORE_C68K;
   init.cdcoretype = disc[0] ? CDCORE_ISO : CDCORE_DUMMY;
-  init.biospath = DATA "bios.bin"; init.cdpath = disc[0] ? disc : NULL;
-  /* A YabaSanshiro internal backup image (bkram.bin, 8 MiB extended format:
-   * the standard interleaved layout, grown) is used when present. Its first
-   * 64 KiB are the standard 32 KiB internal backup RAM, which T123Load reads. */
-  FILE *bkram = fopen(DATA "bkram.bin", "rb");
-  if (bkram) fclose(bkram);
-  init.buppath = bkram ? DATA "bkram.bin" : DATA "backup.bin"; init.carttype = 0;
-  /* Region from the disc header (Japan without one); the BIOS rejects a
-   * disc whose area code does not match. Video stays NTSC. */
-  init.regionid = REGION_AUTODETECT; init.videoformattype = VIDEOFORMATTYPE_NTSC;
+  /* A configured BIOS that is missing falls back to the BIOS folder's. */
+  char bios[256];
+  if (VitaBiosResolve(bios, sizeof(bios), settings.bios, VITA_BIOS_DIR) != 0)
+    snprintf(bios, sizeof(bios), "%s", settings.bios);
+  init.biospath = bios; init.cdpath = disc[0] ? disc : NULL;
+  /* Backup memory in memory/: the internal 32 KiB, and the cartridge slot's
+   * 4 Mbit Backup Memory file when that cartridge is chosen. Missing files are
+   * written formatted once the core has started. */
+  static const int cart_types[VITA_CARTS] = {
+    CART_NONE, CART_BACKUPRAM4MBIT, CART_DRAM8MBIT, CART_DRAM32MBIT
+  };
+  char cartridge[256] = {0};
+  sceIoMkdir(VITA_MEMORY_DIR, 0777);
+  migrate_internal_backup();
+  init.buppath = VITA_INTERNAL_BACKUP;
+  init.carttype = cart_types[settings.cartridge];
+  if (settings.cartridge == VITA_CART_BACKUP_4MBIT) {
+    VitaConfigBackupPath(cartridge, sizeof(cartridge), settings.backup_slot);
+    init.cartpath = cartridge;
+  }
+  const int backups_missing = !file_exists(VITA_INTERNAL_BACKUP) ||
+                              (cartridge[0] && !file_exists(cartridge));
+  YuiMsg("backup internal=%s cartridge=%s file=%s", VITA_INTERNAL_BACKUP,
+         VitaConfigCartName(settings.cartridge), cartridge[0] ? cartridge : "none");
+  /* Region from the settings; auto takes it from the disc header (Japan
+   * without one). The BIOS rejects a disc whose area code does not match.
+   * Video stays NTSC. */
+  init.regionid = settings.region; init.videoformattype = VIDEOFORMATTYPE_NTSC;
   init.clocksync = 1; init.basetime = 946684800; init.numthreads = 1;
   init.scsp_sync_count_per_frame = 1;
-  YuiMsg("init sh2=%s renderer=%s audio=enabled disc=%s",
+  YuiMsg("init sh2=%s renderer=%s audio=enabled disc=%s source=%s bios=%s region=%s",
     init.sh2coretype == 3 ? "arm-dynarec" : "interpreter",
-    init.vidcoretype == VIDCORE_SOFT ? "software" : "vitagl", disc[0] ? "yes" : "no");
+    init.vidcoretype == VIDCORE_SOFT ? "software" : "vitagl", disc[0] ? "yes" : "no",
+    launched ? "game-list" : disc[0] ? "boot-path" : "none", bios,
+    VitaConfigRegionName(settings.region));
 #ifdef YABAUSE_GXM_PROBE
   int gxm_result = VitaGxmProbe();
   if (gxm_result < 0) { YuiMsg("gxm_resource_probe_failed=%08x", gxm_result); goto done; }
@@ -738,6 +935,7 @@ int main(void) {
   VitaRotationRouteInit(&rotation_route);
 #endif
   VitaLogBackupRam(init.buppath);
+  if (backups_missing) YuiMsg("backup_created rc=%d", YabSaveBackups());
 #ifdef YABAUSE_VITAGL
 #ifdef VITA_RENDER_THREAD
   if (VIDCore != &VIDProxy || VIDProxy.ColorRamWriteWord == NULL) {   /* the proxy forwards to YglOnUpdateColorRamWord */
@@ -771,6 +969,13 @@ int main(void) {
 #endif
   if (VitaC68kReadTest() != 0) { YabauseDeInit(); goto done; }
   YuiMsg("init_complete");
+#ifdef YABAUSE_PAF_UI
+  {
+    char title[160];
+    disc_name(disc, title, sizeof(title));
+    if (VitaUiMenuInit(&settings, DATA "config.ini", title) != 0) YuiMsg("menu_unavailable");
+  }
+#endif
   YuiMsg("core_timer frequency=%llu frame_ticks=%llu", yabsys.tickfreq, yabsys.OneFrameTime);
   pad = PerPadAdd(&PORTDATA1);
   const unsigned keys[] = {PERPAD_UP,PERPAD_RIGHT,PERPAD_DOWN,PERPAD_LEFT,
@@ -789,6 +994,7 @@ int main(void) {
   }
   uint64_t start = sceKernelGetProcessTimeWide(), last = start;
   uint64_t benchmark_start = start;
+  unsigned backup_due = 0;   /* the frame the backup memory is saved at */
   VitaTelemetryThread("emulation");
   VitaTelemetryEnter(VT_FRONTEND);
   while (1) {
@@ -805,22 +1011,38 @@ int main(void) {
     VitaTelemetryLeave(VT_SCHEDULER);
     if (exec_result < 0) { YuiMsg("execution_failed"); break; }
     ++frames; ++batch;
+    /* A game's save reaches its file a second after its last write. */
+    if (BupRamWritten || CartBupRamWritten) {
+      BupRamWritten = CartBupRamWritten = 0;
+      backup_due = frames + 60;
+    } else if (backup_due && frames >= backup_due) {
+      backup_due = 0;
+      YuiMsg("backup_saved frame=%u rc=%d", frames, YabSaveBackups());
+    }
     if (save_state_frame && frames == save_state_frame) {
       const int rc = YabSaveState(DATA "state.yss");
       YuiMsg("state_saved frame=%u rc=%d", frames, rc);
       save_state_frame = 0;
     }
-    /* SELECT on its own (not the exit chord): save a state after this frame
-     * as states/<disc name>-<frame>.yss, once per press. */
+    /* SELECT on its own (not the exit chord): the in-game menu, or without
+     * it a state saved after this frame as states/<disc name>-<frame>.yss,
+     * once per press. */
     {
       static int select_held;
       const unsigned others = SCE_CTRL_START | SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER;
       const int select = (exit_input.buttons & SCE_CTRL_SELECT) && !(exit_input.buttons & others);
+#ifdef YABAUSE_PAF_UI
+      if (select && !select_held && VitaUiMenuAvailable()) {
+        select_held = 1;
+        const int menu = run_menu(disc, &settings, &boot_settings);
+        if (menu == MENU_QUIT) { quit_to_list = 1; break; }
+        if (menu == MENU_RESTART) { restart_game = 1; break; }
+        continue;
+      }
+#endif
       if (select && !select_held) {
-        const char *base = strrchr(disc, '/');
-        base = base ? base + 1 : disc[0] ? disc : "bios";
         char name[160];
-        snprintf(name, sizeof(name), "%.*s", (int)strcspn(base, "."), base);
+        disc_name(disc, name, sizeof(name));
         char path[256];
         snprintf(path, sizeof(path), DATA "states/%s-%u.yss", name, frames);
         sceIoMkdir(DATA "states", 0777);
@@ -944,5 +1166,15 @@ done:
 #endif
   YuiMsg("exit");
   log_close();
+#ifdef YABAUSE_PAF_UI
+  if (quit_to_list) {
+    char *const list_args[] = {"--list", NULL};
+    sceAppMgrLoadExec("app0:eboot.bin", list_args, NULL);
+  }
+  if (restart_game) {
+    char *const game_args[] = {"--game", disc, NULL};
+    sceAppMgrLoadExec("app0:eboot.bin", game_args, NULL);
+  }
+#endif
   sceAppUtilShutdown(); sceKernelExitProcess(0); return 0;
 }

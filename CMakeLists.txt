@@ -335,7 +335,7 @@ add_executable(yabause-vita ${CORE_SOURCES} src/core/titan/titan.c
   third_party/libchdr/deps/lzma-19.00/src/LzmaEnc.c
   third_party/libchdr/deps/lzma-19.00/src/LzFind.c
   src/vita/main.c src/vita/threads.c src/vita/present.c src/vita/stack_guard.c
-  src/vita/telemetry.c src/vita/c68k_read_test.c)
+  src/vita/telemetry.c src/vita/c68k_read_test.c src/vita/config.c src/vita/game_list.c)
 option(VITA_ASYNC_AUDIO_OUTPUT "Decouple host PCM playback from the SCSP completion barrier" OFF)
 if(VITA_ASYNC_AUDIO_OUTPUT)
   target_sources(yabause-vita PRIVATE src/vita/audio_output_queue.c)
