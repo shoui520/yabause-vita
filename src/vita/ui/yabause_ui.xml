@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- PAF resources of the game list and the in-game menu (paf_ui.cpp).
+     Compiled to yabause_ui.rco with psp2cxml-tool. Text is set from code. -->
+<resource version="0.1" type="normal" id="yabause_ui">
+  <pagetable>
+    <page id="page_games">
+      <plane texture="tex_background" id="games_background">
+        <layout_hint size="960, 544" />
+      </plane>
+      <template_ref id="games_title_ref" template="template_title_bar" />
+      <list_view style="style_list_view" id="games_list">
+        <layout_hint align="0, 1" size="960, 448" pos="0, -272" />
+      </list_view>
+      <text style="style_text_empty" id="games_empty">
+        <layout_hint size="820, 160" pos="0, -20" />
+      </text>
+      <corner_button style="_common_style_corner_bottom_right" id="games_settings" />
+    </page>
+
+    <page id="page_menu">
+      <plane style="_common_style_plane_transparent" id="menu_root">
+        <layout_hint size="960, 544" />
+      </plane>
+      <template_ref id="menu_title_ref" template="template_title_bar" />
+      <list_view style="style_list_view" id="menu_list">
+        <layout_hint size="600, 420" pos="0, -10" />
+      </list_view>
+      <text style="style_text_status" id="menu_status">
+        <layout_hint size="760, 32" pos="0, -240" />
+      </text>
+      <corner_button style="_common_style_corner_bottom_left" id="menu_back" />
+    </page>
+
+    <page id="page_slots">
+      <plane style="_common_style_plane_transparent" id="slots_root">
+        <layout_hint size="960, 544" />
+      </plane>
+      <template_ref id="slots_title_ref" template="template_title_bar" />
+      <list_view style="style_list_view" id="slots_list">
+        <layout_hint size="600, 420" pos="0, -10" />
+      </list_view>
+      <corner_button style="_common_style_corner_bottom_left" id="slots_back" />
+    </page>
+  </pagetable>
+
+  <templatetable>
+    <template fast_open="1" id="template_title_bar">
+      <plane style="_common_style_plane_transparent" id="title_bar">
+        <layout_hint align="0, 2" size="960, 64" pos="0, 272" />
+        <text style="style_text_title" id="title_text">
+          <layout_hint size="860, 64" />
+        </text>
+        <plane texture="_common_texture_ruled_line" id="title_separator">
+          <layout_hint size="960, 2" anchor="0, 1" />
+        </plane>
+      </plane>
+    </template>
+
+    <template fast_open="1" id="template_game_row">
+      <list_item style="style_list_item" id="game_row">
+        <layout_hint size="960, 80" />
+        <button sound="_common_sound_button_enter" style="style_row_button" id="game_button">
+          <layout_hint size="840, 80" />
+          <focus_hint focus_shape="3" />
+        </button>
+      </list_item>
+    </template>
+
+    <template fast_open="1" id="template_menu_row">
+      <list_item style="style_list_item" id="menu_row">
+        <layout_hint size="600, 70" />
+        <button sound="_common_sound_button_enter" style="style_row_button_centered" id="menu_button">
+          <layout_hint size="560, 70" />
+          <focus_hint focus_shape="3" />
+        </button>
+      </list_item>
+    </template>
+
+    <template fast_open="1" id="template_slot_row">
+      <list_item style="style_list_item" id="slot_row">
+        <layout_hint size="600, 70" />
+        <button sound="_common_sound_button_enter" style="style_row_button" id="slot_button">
+          <layout_hint size="560, 70" />
+          <focus_hint focus_shape="3" />
+        </button>
+      </list_item>
+    </template>
+  </templatetable>
+
+  <styletable>
+    <style_text textobj="title_obj" id="style_text_title">
+      <textobj font_size="32" bold="1" align_x="1" align_y="1" ellipsis="1" id="title_obj" />
+    </style_text>
+    <style_text textobj="empty_obj" id="style_text_empty">
+      <textobj font_size="26" color="0.85, 0.88, 0.95, 1" align_x="1" align_y="1" text_align="1" word_wrap="1" id="empty_obj" />
+    </style_text>
+    <style_text textobj="status_obj" id="style_text_status">
+      <textobj font_size="22" color="0.92, 0.94, 1, 1" align_x="1" align_y="1" ellipsis="1" id="status_obj" />
+    </style_text>
+    <style_list_view color="0, 0, 0, 0" sbar_v_margin="6, 80, 9" id="style_list_view" />
+    <style_list_item color="1, 1, 1, 0" id="style_list_item" />
+    <style_button left_margin="28" right_margin="28" bg_obj="row_bg" glow_obj="row_glow" label_obj="row_label" id="style_row_button">
+      <planeobj texture0="_common_texture_list_70px" id="row_bg" />
+      <planeobj texture0="_common_texture_list_glow_70px" blend="2" id="row_glow" />
+      <textobj font_size="28" bold="1" align_x="0" align_y="1" ellipsis="1" id="row_label" />
+    </style_button>
+    <style_button bg_obj="menu_bg" glow_obj="menu_glow" label_obj="menu_label" id="style_row_button_centered">
+      <planeobj texture0="_common_texture_list_70px" id="menu_bg" />
+      <planeobj texture0="_common_texture_list_glow_70px" blend="2" id="menu_glow" />
+      <textobj font_size="28" bold="1" align_x="1" align_y="1" ellipsis="1" id="menu_label" />
+    </style_button>
+  </styletable>
+
+  <stringtable />
+  <texturetable>
+    <texture src="assets/background.png" type="texture/png" id="tex_background" />
+  </texturetable>
+  <filetable>
+    <file src="settings.xml" type="application/xml" id="file_settings" />
+  </filetable>
+</resource>

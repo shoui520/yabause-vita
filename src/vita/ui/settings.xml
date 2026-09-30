@@ -1,0 +1,253 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- sce::AppSettings pages. Titles come from the onGetStringCb callback
+     (src/vita/ui/paf_ui.cpp); values mirror config.ini. -->
+<application_settings version="1.0" bg_color="20.0, 32.0, 66.0, 255.0">
+  <setting_list id="settings_root" title="msg_settings">
+    <setting_list id="system_setting" title="msg_system" icon="tex_spanner">
+      <!-- Automatic; an item per BIOS image found is added when loaded -->
+      <list id="bios" title="msg_bios" key="bios" default_value="0">
+        <list_item id="bios_00" title="msg_bios_00" value="0" />
+      </list>
+      <list id="region" title="msg_region" key="region" default_value="0">
+        <list_item id="region_00" title="msg_region_00" value="0" />
+        <list_item id="region_01" title="msg_region_01" value="1" />
+        <list_item id="region_02" title="msg_region_02" value="2" />
+        <list_item id="region_03" title="msg_region_03" value="3" />
+        <list_item id="region_04" title="msg_region_04" value="4" />
+        <list_item id="region_05" title="msg_region_05" value="5" />
+        <list_item id="region_06" title="msg_region_06" value="6" />
+        <list_item id="region_07" title="msg_region_07" value="7" />
+        <list_item id="region_08" title="msg_region_08" value="8" />
+      </list>
+      <list id="cartridge" title="msg_cartridge" key="cartridge" default_value="1">
+        <list_item id="cartridge_00" title="msg_cartridge_00" value="0" />
+        <list_item id="cartridge_01" title="msg_cartridge_01" value="1" />
+        <list_item id="cartridge_02" title="msg_cartridge_02" value="2" />
+        <list_item id="cartridge_03" title="msg_cartridge_03" value="3" />
+      </list>
+      <!-- Shown only while the 4 Mbit Backup Memory is the cartridge (onCheckVisible). -->
+      <list id="backup_slot" title="msg_backup_slot" key="backup_slot" default_value="1">
+        <list_item id="backup_slot_01" title="msg_backup_slot_01" value="1" />
+        <list_item id="backup_slot_02" title="msg_backup_slot_02" value="2" />
+        <list_item id="backup_slot_03" title="msg_backup_slot_03" value="3" />
+        <list_item id="backup_slot_04" title="msg_backup_slot_04" value="4" />
+        <list_item id="backup_slot_05" title="msg_backup_slot_05" value="5" />
+        <list_item id="backup_slot_06" title="msg_backup_slot_06" value="6" />
+        <list_item id="backup_slot_07" title="msg_backup_slot_07" value="7" />
+        <list_item id="backup_slot_08" title="msg_backup_slot_08" value="8" />
+        <list_item id="backup_slot_09" title="msg_backup_slot_09" value="9" />
+        <list_item id="backup_slot_10" title="msg_backup_slot_10" value="10" />
+      </list>
+    </setting_list>
+    <setting_list id="controls_setting" title="msg_controls" icon="tex_spanner">
+      <list id="pad_up" title="msg_pad_up" key="pad_up" default_value="1">
+        <list_item id="pad_up_00" title="msg_button_00" value="0" />
+        <list_item id="pad_up_01" title="msg_button_01" value="1" />
+        <list_item id="pad_up_02" title="msg_button_02" value="2" />
+        <list_item id="pad_up_03" title="msg_button_03" value="3" />
+        <list_item id="pad_up_04" title="msg_button_04" value="4" />
+        <list_item id="pad_up_05" title="msg_button_05" value="5" />
+        <list_item id="pad_up_06" title="msg_button_06" value="6" />
+        <list_item id="pad_up_07" title="msg_button_07" value="7" />
+        <list_item id="pad_up_08" title="msg_button_08" value="8" />
+        <list_item id="pad_up_09" title="msg_button_09" value="9" />
+        <list_item id="pad_up_10" title="msg_button_10" value="10" />
+        <list_item id="pad_up_11" title="msg_button_11" value="11" />
+        <list_item id="pad_up_12" title="msg_button_12" value="12" />
+        <list_item id="pad_up_13" title="msg_button_13" value="13" />
+      </list>
+      <list id="pad_down" title="msg_pad_down" key="pad_down" default_value="3">
+        <list_item id="pad_down_00" title="msg_button_00" value="0" />
+        <list_item id="pad_down_01" title="msg_button_01" value="1" />
+        <list_item id="pad_down_02" title="msg_button_02" value="2" />
+        <list_item id="pad_down_03" title="msg_button_03" value="3" />
+        <list_item id="pad_down_04" title="msg_button_04" value="4" />
+        <list_item id="pad_down_05" title="msg_button_05" value="5" />
+        <list_item id="pad_down_06" title="msg_button_06" value="6" />
+        <list_item id="pad_down_07" title="msg_button_07" value="7" />
+        <list_item id="pad_down_08" title="msg_button_08" value="8" />
+        <list_item id="pad_down_09" title="msg_button_09" value="9" />
+        <list_item id="pad_down_10" title="msg_button_10" value="10" />
+        <list_item id="pad_down_11" title="msg_button_11" value="11" />
+        <list_item id="pad_down_12" title="msg_button_12" value="12" />
+        <list_item id="pad_down_13" title="msg_button_13" value="13" />
+      </list>
+      <list id="pad_left" title="msg_pad_left" key="pad_left" default_value="4">
+        <list_item id="pad_left_00" title="msg_button_00" value="0" />
+        <list_item id="pad_left_01" title="msg_button_01" value="1" />
+        <list_item id="pad_left_02" title="msg_button_02" value="2" />
+        <list_item id="pad_left_03" title="msg_button_03" value="3" />
+        <list_item id="pad_left_04" title="msg_button_04" value="4" />
+        <list_item id="pad_left_05" title="msg_button_05" value="5" />
+        <list_item id="pad_left_06" title="msg_button_06" value="6" />
+        <list_item id="pad_left_07" title="msg_button_07" value="7" />
+        <list_item id="pad_left_08" title="msg_button_08" value="8" />
+        <list_item id="pad_left_09" title="msg_button_09" value="9" />
+        <list_item id="pad_left_10" title="msg_button_10" value="10" />
+        <list_item id="pad_left_11" title="msg_button_11" value="11" />
+        <list_item id="pad_left_12" title="msg_button_12" value="12" />
+        <list_item id="pad_left_13" title="msg_button_13" value="13" />
+      </list>
+      <list id="pad_right" title="msg_pad_right" key="pad_right" default_value="2">
+        <list_item id="pad_right_00" title="msg_button_00" value="0" />
+        <list_item id="pad_right_01" title="msg_button_01" value="1" />
+        <list_item id="pad_right_02" title="msg_button_02" value="2" />
+        <list_item id="pad_right_03" title="msg_button_03" value="3" />
+        <list_item id="pad_right_04" title="msg_button_04" value="4" />
+        <list_item id="pad_right_05" title="msg_button_05" value="5" />
+        <list_item id="pad_right_06" title="msg_button_06" value="6" />
+        <list_item id="pad_right_07" title="msg_button_07" value="7" />
+        <list_item id="pad_right_08" title="msg_button_08" value="8" />
+        <list_item id="pad_right_09" title="msg_button_09" value="9" />
+        <list_item id="pad_right_10" title="msg_button_10" value="10" />
+        <list_item id="pad_right_11" title="msg_button_11" value="11" />
+        <list_item id="pad_right_12" title="msg_button_12" value="12" />
+        <list_item id="pad_right_13" title="msg_button_13" value="13" />
+      </list>
+      <list id="pad_x" title="msg_pad_x" key="pad_x" default_value="7">
+        <list_item id="pad_x_00" title="msg_button_00" value="0" />
+        <list_item id="pad_x_01" title="msg_button_01" value="1" />
+        <list_item id="pad_x_02" title="msg_button_02" value="2" />
+        <list_item id="pad_x_03" title="msg_button_03" value="3" />
+        <list_item id="pad_x_04" title="msg_button_04" value="4" />
+        <list_item id="pad_x_05" title="msg_button_05" value="5" />
+        <list_item id="pad_x_06" title="msg_button_06" value="6" />
+        <list_item id="pad_x_07" title="msg_button_07" value="7" />
+        <list_item id="pad_x_08" title="msg_button_08" value="8" />
+        <list_item id="pad_x_09" title="msg_button_09" value="9" />
+        <list_item id="pad_x_10" title="msg_button_10" value="10" />
+        <list_item id="pad_x_11" title="msg_button_11" value="11" />
+        <list_item id="pad_x_12" title="msg_button_12" value="12" />
+        <list_item id="pad_x_13" title="msg_button_13" value="13" />
+      </list>
+      <list id="pad_y" title="msg_pad_y" key="pad_y" default_value="8">
+        <list_item id="pad_y_00" title="msg_button_00" value="0" />
+        <list_item id="pad_y_01" title="msg_button_01" value="1" />
+        <list_item id="pad_y_02" title="msg_button_02" value="2" />
+        <list_item id="pad_y_03" title="msg_button_03" value="3" />
+        <list_item id="pad_y_04" title="msg_button_04" value="4" />
+        <list_item id="pad_y_05" title="msg_button_05" value="5" />
+        <list_item id="pad_y_06" title="msg_button_06" value="6" />
+        <list_item id="pad_y_07" title="msg_button_07" value="7" />
+        <list_item id="pad_y_08" title="msg_button_08" value="8" />
+        <list_item id="pad_y_09" title="msg_button_09" value="9" />
+        <list_item id="pad_y_10" title="msg_button_10" value="10" />
+        <list_item id="pad_y_11" title="msg_button_11" value="11" />
+        <list_item id="pad_y_12" title="msg_button_12" value="12" />
+        <list_item id="pad_y_13" title="msg_button_13" value="13" />
+      </list>
+      <list id="pad_z" title="msg_pad_z" key="pad_z" default_value="9">
+        <list_item id="pad_z_00" title="msg_button_00" value="0" />
+        <list_item id="pad_z_01" title="msg_button_01" value="1" />
+        <list_item id="pad_z_02" title="msg_button_02" value="2" />
+        <list_item id="pad_z_03" title="msg_button_03" value="3" />
+        <list_item id="pad_z_04" title="msg_button_04" value="4" />
+        <list_item id="pad_z_05" title="msg_button_05" value="5" />
+        <list_item id="pad_z_06" title="msg_button_06" value="6" />
+        <list_item id="pad_z_07" title="msg_button_07" value="7" />
+        <list_item id="pad_z_08" title="msg_button_08" value="8" />
+        <list_item id="pad_z_09" title="msg_button_09" value="9" />
+        <list_item id="pad_z_10" title="msg_button_10" value="10" />
+        <list_item id="pad_z_11" title="msg_button_11" value="11" />
+        <list_item id="pad_z_12" title="msg_button_12" value="12" />
+        <list_item id="pad_z_13" title="msg_button_13" value="13" />
+      </list>
+      <list id="pad_a" title="msg_pad_a" key="pad_a" default_value="5">
+        <list_item id="pad_a_00" title="msg_button_00" value="0" />
+        <list_item id="pad_a_01" title="msg_button_01" value="1" />
+        <list_item id="pad_a_02" title="msg_button_02" value="2" />
+        <list_item id="pad_a_03" title="msg_button_03" value="3" />
+        <list_item id="pad_a_04" title="msg_button_04" value="4" />
+        <list_item id="pad_a_05" title="msg_button_05" value="5" />
+        <list_item id="pad_a_06" title="msg_button_06" value="6" />
+        <list_item id="pad_a_07" title="msg_button_07" value="7" />
+        <list_item id="pad_a_08" title="msg_button_08" value="8" />
+        <list_item id="pad_a_09" title="msg_button_09" value="9" />
+        <list_item id="pad_a_10" title="msg_button_10" value="10" />
+        <list_item id="pad_a_11" title="msg_button_11" value="11" />
+        <list_item id="pad_a_12" title="msg_button_12" value="12" />
+        <list_item id="pad_a_13" title="msg_button_13" value="13" />
+      </list>
+      <list id="pad_b" title="msg_pad_b" key="pad_b" default_value="6">
+        <list_item id="pad_b_00" title="msg_button_00" value="0" />
+        <list_item id="pad_b_01" title="msg_button_01" value="1" />
+        <list_item id="pad_b_02" title="msg_button_02" value="2" />
+        <list_item id="pad_b_03" title="msg_button_03" value="3" />
+        <list_item id="pad_b_04" title="msg_button_04" value="4" />
+        <list_item id="pad_b_05" title="msg_button_05" value="5" />
+        <list_item id="pad_b_06" title="msg_button_06" value="6" />
+        <list_item id="pad_b_07" title="msg_button_07" value="7" />
+        <list_item id="pad_b_08" title="msg_button_08" value="8" />
+        <list_item id="pad_b_09" title="msg_button_09" value="9" />
+        <list_item id="pad_b_10" title="msg_button_10" value="10" />
+        <list_item id="pad_b_11" title="msg_button_11" value="11" />
+        <list_item id="pad_b_12" title="msg_button_12" value="12" />
+        <list_item id="pad_b_13" title="msg_button_13" value="13" />
+      </list>
+      <list id="pad_c" title="msg_pad_c" key="pad_c" default_value="10">
+        <list_item id="pad_c_00" title="msg_button_00" value="0" />
+        <list_item id="pad_c_01" title="msg_button_01" value="1" />
+        <list_item id="pad_c_02" title="msg_button_02" value="2" />
+        <list_item id="pad_c_03" title="msg_button_03" value="3" />
+        <list_item id="pad_c_04" title="msg_button_04" value="4" />
+        <list_item id="pad_c_05" title="msg_button_05" value="5" />
+        <list_item id="pad_c_06" title="msg_button_06" value="6" />
+        <list_item id="pad_c_07" title="msg_button_07" value="7" />
+        <list_item id="pad_c_08" title="msg_button_08" value="8" />
+        <list_item id="pad_c_09" title="msg_button_09" value="9" />
+        <list_item id="pad_c_10" title="msg_button_10" value="10" />
+        <list_item id="pad_c_11" title="msg_button_11" value="11" />
+        <list_item id="pad_c_12" title="msg_button_12" value="12" />
+        <list_item id="pad_c_13" title="msg_button_13" value="13" />
+      </list>
+      <list id="pad_start" title="msg_pad_start" key="pad_start" default_value="11">
+        <list_item id="pad_start_00" title="msg_button_00" value="0" />
+        <list_item id="pad_start_01" title="msg_button_01" value="1" />
+        <list_item id="pad_start_02" title="msg_button_02" value="2" />
+        <list_item id="pad_start_03" title="msg_button_03" value="3" />
+        <list_item id="pad_start_04" title="msg_button_04" value="4" />
+        <list_item id="pad_start_05" title="msg_button_05" value="5" />
+        <list_item id="pad_start_06" title="msg_button_06" value="6" />
+        <list_item id="pad_start_07" title="msg_button_07" value="7" />
+        <list_item id="pad_start_08" title="msg_button_08" value="8" />
+        <list_item id="pad_start_09" title="msg_button_09" value="9" />
+        <list_item id="pad_start_10" title="msg_button_10" value="10" />
+        <list_item id="pad_start_11" title="msg_button_11" value="11" />
+        <list_item id="pad_start_12" title="msg_button_12" value="12" />
+        <list_item id="pad_start_13" title="msg_button_13" value="13" />
+      </list>
+      <list id="pad_l" title="msg_pad_l" key="pad_l" default_value="12">
+        <list_item id="pad_l_00" title="msg_button_00" value="0" />
+        <list_item id="pad_l_01" title="msg_button_01" value="1" />
+        <list_item id="pad_l_02" title="msg_button_02" value="2" />
+        <list_item id="pad_l_03" title="msg_button_03" value="3" />
+        <list_item id="pad_l_04" title="msg_button_04" value="4" />
+        <list_item id="pad_l_05" title="msg_button_05" value="5" />
+        <list_item id="pad_l_06" title="msg_button_06" value="6" />
+        <list_item id="pad_l_07" title="msg_button_07" value="7" />
+        <list_item id="pad_l_08" title="msg_button_08" value="8" />
+        <list_item id="pad_l_09" title="msg_button_09" value="9" />
+        <list_item id="pad_l_10" title="msg_button_10" value="10" />
+        <list_item id="pad_l_11" title="msg_button_11" value="11" />
+        <list_item id="pad_l_12" title="msg_button_12" value="12" />
+        <list_item id="pad_l_13" title="msg_button_13" value="13" />
+      </list>
+      <list id="pad_r" title="msg_pad_r" key="pad_r" default_value="13">
+        <list_item id="pad_r_00" title="msg_button_00" value="0" />
+        <list_item id="pad_r_01" title="msg_button_01" value="1" />
+        <list_item id="pad_r_02" title="msg_button_02" value="2" />
+        <list_item id="pad_r_03" title="msg_button_03" value="3" />
+        <list_item id="pad_r_04" title="msg_button_04" value="4" />
+        <list_item id="pad_r_05" title="msg_button_05" value="5" />
+        <list_item id="pad_r_06" title="msg_button_06" value="6" />
+        <list_item id="pad_r_07" title="msg_button_07" value="7" />
+        <list_item id="pad_r_08" title="msg_button_08" value="8" />
+        <list_item id="pad_r_09" title="msg_button_09" value="9" />
+        <list_item id="pad_r_10" title="msg_button_10" value="10" />
+        <list_item id="pad_r_11" title="msg_button_11" value="11" />
+        <list_item id="pad_r_12" title="msg_button_12" value="12" />
+        <list_item id="pad_r_13" title="msg_button_13" value="13" />
+      </list>
+    </setting_list>
+  </setting_list>
+</application_settings>

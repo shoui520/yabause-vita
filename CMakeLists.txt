@@ -1465,6 +1465,68 @@ if(VITA_PGO STREQUAL "generate")
   target_sources(yabause-vita PRIVATE src/vita/pgo_dump.c)
   set_property(SOURCE src/vita/pgo_dump.c APPEND PROPERTY COMPILE_OPTIONS -fno-profile-arcs)
 endif()
+# Game list and in-game menu on libpaf (src/vita/ui/paf_ui.cpp). The PAF
+# headers and stubs come from a VitaSDK prefix with the PAF component; the
+# resource file is compiled with psp2cxml-tool.
+option(YABAUSE_PAF_UI "Game list and in-game menu on libpaf" OFF)
+set(YABAUSE_PAF_SDK "" CACHE PATH "VitaSDK prefix with the PAF component (YABAUSE_PAF_UI)")
+set(YABAUSE_PSP2CXML "" CACHE FILEPATH "psp2cxml-tool executable (YABAUSE_PAF_UI)")
+set(VITA_TITLE_ID "YABA00001" CACHE STRING "Title ID of the package")
+set(VITA_TITLE_NAME "Yabause Vita" CACHE STRING "Name of the package")
+set(vpk_files)
+if(YABAUSE_PAF_UI)
+  if(NOT YABAUSE_VITAGL)
+    message(FATAL_ERROR "The in-game menu draws into vitaGL's frames")
+  endif()
+  set(paf_include "${YABAUSE_PAF_SDK}/arm-vita-eabi/include")
+  set(paf_stub_source "${YABAUSE_PAF_SDK}/arm-vita-eabi/lib/libScePaf_stub_weak.a")
+  if(NOT EXISTS "${paf_include}/paf.h" OR NOT EXISTS "${paf_stub_source}")
+    message(FATAL_ERROR "YABAUSE_PAF_SDK must name a VitaSDK prefix with the PAF component")
+  endif()
+  if(NOT EXISTS "${YABAUSE_PSP2CXML}")
+    message(FATAL_ERROR "YABAUSE_PSP2CXML must name the psp2cxml-tool executable")
+  endif()
+  target_sources(yabause-vita PRIVATE src/vita/ui/paf_ui.cpp)
+  set_property(SOURCE src/vita/main.c APPEND PROPERTY COMPILE_DEFINITIONS YABAUSE_PAF_UI)
+  # PAF strings are UTF-16. Standard headers still come from this SDK.
+  set_property(SOURCE src/vita/ui/paf_ui.cpp APPEND PROPERTY COMPILE_OPTIONS
+    -fshort-wchar -fno-rtti -fno-exceptions "-D__declspec(x)=" -idirafter "${paf_include}"
+    -idirafter "${PROJECT_SOURCE_DIR}/src/vita/ui/compat")
+  # The PAF stub also exports libc and C++ runtime entry points (memcpy,
+  # exit, operator new, __cxa_*); those must stay newlib's and libstdc++'s.
+  set(paf_libc_members)
+  foreach(symbol __aeabi_atexit __cxa_atexit __cxa_finalize __cxa_guard_acquire
+      __cxa_guard_release __cxa_guard_abort __cxa_deleted_virtual __cxa_pure_virtual
+      __cxa_set_dso_handle_main exit abort _Znaj _Znajj _Znwj _Znwjj _ZdaPv _ZdaPvjj
+      _ZdlPv _ZdlPvjj _stdinit_stdio _fflush_readbuff write_to_stdout
+      read_char_from_stdin memcpy memset)
+    list(APPEND paf_libc_members ScePaf_ScePafStdc_${symbol}.S.obj)
+  endforeach()
+  set(paf_stub "${CMAKE_CURRENT_BINARY_DIR}/libScePafUi_stub_weak.a")
+  add_custom_command(OUTPUT "${paf_stub}"
+    COMMAND ${CMAKE_COMMAND} -E copy "${paf_stub_source}" "${paf_stub}"
+    COMMAND ${CMAKE_AR} d "${paf_stub}" ${paf_libc_members}
+    DEPENDS "${paf_stub_source}" VERBATIM)
+  add_custom_target(yabause-paf-stub DEPENDS "${paf_stub}")
+  add_dependencies(yabause-vita yabause-paf-stub)
+  # app_settings.suprx is loaded as a PAF plugin: its imports resolve then.
+  target_link_libraries(yabause-vita PRIVATE "${paf_stub}"
+    "${YABAUSE_PAF_SDK}/arm-vita-eabi/lib/libSceAppSettings_stub_weak.a" SceSysmodule_stub SceGxm_stub SceRtc_stub)
+  target_link_options(yabause-vita PRIVATE -Wl,--wrap=sceCommonDialogUpdate
+    -Wl,--no-wchar-size-warning)
+  set(ui_source "${PROJECT_SOURCE_DIR}/src/vita/ui")
+  set(ui_build "${CMAKE_CURRENT_BINARY_DIR}/ui")
+  add_custom_command(OUTPUT "${ui_build}/yabause_ui.rco"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${ui_build}/assets"
+    COMMAND ${CMAKE_COMMAND} -E copy "${ui_source}/yabause_ui.xml" "${ui_source}/settings.xml" "${ui_build}"
+    COMMAND ${CMAKE_COMMAND} -E copy "${ui_source}/assets/background.png" "${ui_build}/assets"
+    COMMAND "${YABAUSE_PSP2CXML}" ./yabause_ui.xml
+    WORKING_DIRECTORY "${ui_build}"
+    DEPENDS "${ui_source}/yabause_ui.xml" "${ui_source}/settings.xml"
+      "${ui_source}/assets/background.png"
+    VERBATIM)
+  list(APPEND vpk_files FILE "${ui_build}/yabause_ui.rco" yabause_ui.rco)
+endif()
 vita_create_self(eboot.bin yabause-vita UNSAFE)
-vita_create_vpk(yabause-vita.vpk YABA00001 eboot.bin
-  VERSION 00.10 NAME "Yabause Vita")
+vita_create_vpk(yabause-vita.vpk ${VITA_TITLE_ID} eboot.bin
+  VERSION 00.10 NAME "${VITA_TITLE_NAME}" ${vpk_files})
