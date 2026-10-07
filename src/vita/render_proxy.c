@@ -148,7 +148,7 @@ static int AreaAcquire(int a) {
 /* ---- commands --------------------------------------------------------- */
 enum { FN_INIT, FN_DEINIT, FN_RESIZE, FN_ISFULL, FN_V1RESET, FN_V1START, FN_V1END, FN_FBREAD, FN_FBWRITE,
        FN_ERASE, FN_FCHANGE, FN_V2RESET, FN_V2START, FN_V2END, FN_V2SCREENS, FN_GLSIZE, FN_SETTING, FN_SYNC,
-       FN_NATIVE, FN_DISPOFF, FN_CRAM, FN_CALL, FN_QUIT };
+       FN_NATIVE, FN_DISPOFF, FN_CRAM, FN_FBWRITES, FN_CALL, FN_QUIT };
 typedef struct {
   int fn, full;
   u32 a[6];
@@ -185,6 +185,19 @@ typedef struct { u32 addr, words, mode; } CramEntry;
 static CramEntry cram_log[CRAM_LOG];
 static unsigned cram_log_head, cram_run_start;  /* emulation thread only */
 static u32 rp_cram_writes;
+
+/* VDP1 framebuffer writes by the guest CPU, logged the same way and queued as
+ * one FN_FBWRITES command (with one VDP snapshot) per run: a game that draws
+ * through the framebuffer makes tens of thousands of these per frame, and a
+ * command with its own snapshot for each one held it under 1 fps. A run is
+ * flushed before any other command and before a colour RAM write is logged
+ * (and the colour RAM run before a framebuffer write), so every call keeps
+ * its order. */
+typedef struct { u32 type, addr, val; } FbEntry;
+#define FB_BATCH 2048
+#define FB_LOG (FB_BATCH * 64)
+static FbEntry fb_log[FB_LOG];
+static unsigned fb_log_head, fb_run_start;      /* emulation thread only */
 static int r_lines_buf = -1; static u32 r_lines_synced;
 
 
@@ -241,6 +254,12 @@ static void Execute(Cmd *c) {
     case FN_NATIVE: VIDOGL.GetNativeResolution((int *)c->p[0], (int *)c->p[1], (int *)c->p[2]); break;
     case FN_DISPOFF: VIDOGL.Vdp2DispOff(); break;
     case FN_CALL: ((void (*)(void))c->p[0])(); break;
+    case FN_FBWRITES:
+      for (u32 i = 0; i < c->a[1]; ++i) {
+        const FbEntry *e = &fb_log[(c->a[0] + i) % FB_LOG];
+        VIDOGL.Vdp1WriteFrameBuffer(e->type, e->addr, e->val);
+      }
+      break;
     case FN_CRAM: {
       /* Each write in order: the written word(s) and the colour mode of that write. */
       u8 *saved = rs_Vdp2ColorRam;
@@ -271,7 +290,7 @@ static uint64_t rp_fast_us;   /* every 64th fast read timed, x64 */
 void VitaRenderProxyReport(void) {
   static const char *names[FN_QUIT + 1] = {"init","deinit","resize","isfull","v1reset","v1start","v1end",
     "fbread","fbwrite","erase","fchange","v2reset","v2start","v2end","v2screens","glsize","setting","sync",
-    "native","dispoff","cram","call","quit"};
+    "native","dispoff","cram","fbwrites","call","quit"};
   char line[512]; int n = 0;
   for (int f = 0; f <= FN_QUIT; ++f)
     if (rp_calls[f] && n < (int)sizeof(line) - 48)
@@ -357,9 +376,15 @@ static void CramFlush(void) {
   cram_run_start = cram_log_head;
   Submit(FN_CRAM, 0, 0, a, 2, NULL, NULL, NULL);
 }
+static void FbFlush(void) {
+  const u32 a[2] = {fb_run_start, fb_log_head - fb_run_start};
+  fb_run_start = fb_log_head;
+  Submit(FN_FBWRITES, 1, 0, a, 2, NULL, NULL, NULL);
+}
 static int Submit(int fn, int full, int wait, const u32 *args, int nargs, void *p0, void *p1, void *p2) {
   volatile int result = 0;
   if (fn != FN_CRAM && cram_log_head != cram_run_start) CramFlush();
+  if (fn != FN_FBWRITES && fb_log_head != fb_run_start) FbFlush();
   rp_after_fbread = fn == FN_FBREAD;
 #ifdef VITA_STACK_PROFILE
   { extern u32 rp_fn_hist; rp_fn_hist = rp_fn_hist << 5 | (u32)fn; }
@@ -540,8 +565,12 @@ int VitaFbReadWord(u32 addr, u16 *out) {
 static void ProxyWriteFrameBuffer(u32 type, u32 addr, u32 val) {
   /* Nothing returned: queued in order like the draws (reads drain the
    * queue, so the core never observes a pending write). */
-  const u32 a[3] = {type, addr, val};
-  Submit(FN_FBWRITE, 1, 0, a, 3, NULL, NULL, NULL);
+  if (!render_running) return;
+  if (cram_log_head != cram_run_start) CramFlush();
+  FbEntry *e = &fb_log[fb_log_head % FB_LOG];
+  e->type = type; e->addr = addr; e->val = val;
+  rp_after_fbread = 0;   /* as when each write was its own command */
+  if (++fb_log_head - fb_run_start == FB_BATCH) FbFlush();
 }
 static void ProxyEraseWrite(void) { CALL(FN_ERASE); }
 static void ProxyFrameChange(void) { CALL(FN_FCHANGE); }
@@ -559,6 +588,7 @@ static void ProxyGetNativeResolution(int *w, int *h, int *i) { Submit(FN_NATIVE,
 static void ProxyDispOff(void) { CALL(FN_DISPOFF); }
 static void ProxyColorRamWriteWord(u32 addr) {
   if (!render_running || !Vdp2ColorRam) return;
+  if (fb_log_head != fb_run_start) FbFlush();
   CramEntry *e = &cram_log[cram_log_head % CRAM_LOG];
   e->addr = addr;
   memcpy(&e->words, Vdp2ColorRam + (addr & 0xFFC), 4);
