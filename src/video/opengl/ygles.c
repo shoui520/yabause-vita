@@ -1173,6 +1173,15 @@ static void Vdp1FrameBufferPixel(u32 addr, u32 *px, u32 *py) {
 
   *px = x; *py = y;
 }
+/* Whether (Line, Pix) lies inside the read-back image. The guest's system
+ * clip can exceed it (a clip wider or taller than the display), and indexing
+ * the read-back pixels there runs outside pFrameBuffer: the lazy read-back
+ * then copies into memory past the block. Such pixels are read like those
+ * outside the clip. */
+static int Vdp1PixelInReadback(u32 Line, u32 Pix) {
+  const u32 px = _Ygl->rwidth >= 640 ? Pix << 1 : Pix;
+  return Line < (u32)_Ygl->rheight && px < (u32)_Ygl->rwidth;
+}
 /* The guest value at (Line, Pix) from the read-back pixels (mutex held). */
 static void Vdp1FrameBufferFromPixels(u32 type, int Line, int Pix, void *out) {
   int index;
@@ -1256,7 +1265,8 @@ int VIDOGLVdp1ReadFrameBufferNoGL(u32 type, u32 addr, void * out) {
   Vdp1FrameBufferPixel(addr, &x, &y);
   const int Line = y;
   const int Pix = x;
-  if (_Ygl->cpu_framebuffer_write[_Ygl->drawframe] || (Pix >= Vdp1Regs->systemclipX2 || Line >= Vdp1Regs->systemclipY2)){
+  if (_Ygl->cpu_framebuffer_write[_Ygl->drawframe] || (Pix >= Vdp1Regs->systemclipX2 || Line >= Vdp1Regs->systemclipY2) ||
+      !Vdp1PixelInReadback(Line, Pix)){
     switch (type)
     {
     case 0:
@@ -1285,7 +1295,8 @@ int VIDOGLVdp1ReadFrameBufferNoGL(u32 type, u32 addr, void * out) {
 int VIDOGLVdp1ReadWordNoGL(u32 addr, u16 *out) {
   u32 x, y;
   Vdp1FrameBufferPixel(addr, &x, &y);
-  if (_Ygl->cpu_framebuffer_write[_Ygl->drawframe] || x >= Vdp1Regs->systemclipX2 || y >= Vdp1Regs->systemclipY2) {
+  if (_Ygl->cpu_framebuffer_write[_Ygl->drawframe] || x >= Vdp1Regs->systemclipX2 || y >= Vdp1Regs->systemclipY2 ||
+      !Vdp1PixelInReadback(y, x)) {
     *out = T1ReadWord(Vdp1FrameBuffer[_Ygl->drawframe], addr);
     return 1;
   }
@@ -1300,7 +1311,8 @@ void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void * out) {
   Vdp1FrameBufferPixel(addr, &x, &y);
   const int Line = y;
   const int Pix = x;
-  if (_Ygl->cpu_framebuffer_write[_Ygl->drawframe] || (Pix >= Vdp1Regs->systemclipX2 || Line >= Vdp1Regs->systemclipY2)){
+  if (_Ygl->cpu_framebuffer_write[_Ygl->drawframe] || (Pix >= Vdp1Regs->systemclipX2 || Line >= Vdp1Regs->systemclipY2) ||
+      !Vdp1PixelInReadback(Line, Pix)){
     switch (type)
     {
     case 0:
