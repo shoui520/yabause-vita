@@ -465,6 +465,7 @@ typedef struct {
    float * vertexAttribute;
    int currentQuad;
    int maxQuad;
+   int usedQuad;    /* floats drawn by the last VDP1 render (geometry sizing) */
    int vaid;
    char uClipMode;
    short ux1,uy1,ux2,uy2;

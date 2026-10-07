@@ -1947,6 +1947,23 @@ void YglDeInit(void) {
 static void YglTessDrain(void);
 #endif
 #include "geometry_buffer.inc"
+#include <malloc.h>
+
+/* Render thread only (vitaGL's pools are not thread-safe): the newlib heap,
+ * vitaGL's free pool space and the VDP1 geometry arena. */
+static void YglMemoryReport(const char *why) {
+  const struct mallinfo mi = mallinfo();
+  YuiMsg("render_memory why=%s heap_arena=%u heap_used=%u heap_free=%u vgl_ram_free=%u vgl_vram_free=%u"
+#ifdef VITA_GEOM_ARENA
+         " geom_live=%u geom_fences=%u geom_heap_fallbacks=%u"
+#endif
+         , why, (unsigned)mi.arena, (unsigned)mi.uordblks, (unsigned)mi.fordblks,
+         (unsigned)vglMemFree(VGL_MEM_RAM), (unsigned)vglMemFree(VGL_MEM_VRAM)
+#ifdef VITA_GEOM_ARENA
+         , (unsigned)ga_live, ga_count, (unsigned)ga_heap_fallbacks
+#endif
+         );
+}
 
 /* vitaGL loses the vertices of one glDrawArrays beyond a limit found on
  * hardware between 32769 and 65535 (a 98850-vertex VDP1 batch drew only its
@@ -2085,9 +2102,15 @@ YglProgram * YglGetProgram( YglSprite * input, int prg, unsigned needed )
    ga_want = level == &_Ygl->levels[_Ygl->depth];
 #endif
    if (YglReserveGeometry(program, needed) != 0) {
-     fprintf(stderr, "Cannot reserve draw geometry: used=%d needed=%u capacity=%d\n",
-             program->currentQuad, needed, program->maxQuad);
-     abort();
+     /* Out of memory: this primitive is dropped (every caller skips a NULL
+      * program) rather than ending the process. */
+     static unsigned failures;
+     if (failures++ < 8) {
+       YuiMsg("render_geometry_reserve_failed used=%d needed=%u capacity=%d failures=%u",
+              program->currentQuad, needed, program->maxQuad, failures);
+       YglMemoryReport("reserve_failed");
+     }
+     return NULL;
    }
    program->interuput_texture = 0;
    return program;
@@ -3881,6 +3904,7 @@ void YglRenderVDP1(void) {
   glBindTexture(GL_TEXTURE_2D, YglTM->textureID_in[YglTM->current] );
 
   for( j=0;j<(level->prgcurrent+1); j++ ) {
+    level->prg[j].usedQuad = level->prg[j].currentQuad;
     if( level->prg[j].prgid != cprg ) {
       cprg = level->prg[j].prgid;
       glUseProgram(level->prg[j].prg);
@@ -3995,6 +4019,8 @@ void YglRenderVDP1(void) {
 #ifdef VITA_GEOM_ARENA
   YglGeomRetireLevel(level);
 #endif
+  { static unsigned renders;
+    if (++renders % 600 == 0) YglMemoryReport("periodic"); }
 
 #ifdef YABAUSE_VITAGL
   /* Same-context GPU consumers retain order; only CPU observation waits. */

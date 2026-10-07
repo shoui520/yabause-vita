@@ -27,6 +27,7 @@ static struct { uint32_t end, bytes, frame; } ga_fence[GA_FENCES];
 static unsigned ga_first, ga_count;
 static uint32_t ga_pending;     /* bytes allocated since the last fence */
 static int ga_want;             /* set while reserving for the VDP1 level */
+static uint32_t ga_heap_fallbacks; /* VDP1 blocks that did not fit the arena */
 static GLuint ga_vbo;
 
 static int YglGeomOwned(const void *p) {
@@ -74,15 +75,28 @@ static void *YglGeomAlloc(uint32_t bytes) {
   ga_live += bytes + waste; ga_pending += bytes + waste;
   return ga_base + at;
 }
-/* After a VDP1 render: every VDP1-level block is now owned by the GPU. */
+/* After a VDP1 render: every VDP1-level block is now owned by the GPU.
+ * Each slot's next block is sized from what it drew in this render, not
+ * from the largest it ever grew to: slots are reassigned to whatever
+ * primitives come next, so inherited peaks would ratchet every slot up until
+ * a frame's reservations overflow the arena. Heap blocks (the copying draw
+ * path, already consumed by the draw) are returned for the same reason; they
+ * would otherwise keep their peak size in the heap indefinitely. */
 static void YglGeomRetireLevel(YglLevel *level) {
   int j;
   if (ga_state <= 0) return;
   for (j = 0; j < level->prgcount; j++) {
     YglProgram *p = &level->prg[j];
-    if (p->currentQuad == 0 && YglGeomOwned(p->quads)) {
-      p->quads = p->textcoords = p->vertexAttribute = NULL;
+    if (p->currentQuad != 0 || !p->quads) continue;
+    if (!YglGeomOwned(p->quads)) {
+      free(p->quads); free(p->textcoords); free(p->vertexAttribute);
     }
+    p->quads = p->textcoords = p->vertexAttribute = NULL;
+    {
+      unsigned hint = (unsigned)p->usedQuad + (unsigned)p->usedQuad / 4;
+      p->maxQuad = (int)(hint < 1024u ? 1024u : (hint + 1023u) & ~1023u);
+    }
+    p->usedQuad = 0;
   }
   if (!ga_pending) return;
   if (ga_count == GA_FENCES) {
@@ -141,6 +155,7 @@ static int YglReserveGeometry(YglProgram *program, unsigned needed) {
     if (capacity < required) capacity = required;
     float *block = YglGeomAlloc(capacity * 5 * sizeof(float));
     if (block) { positions = block; texcoords = block + capacity; attributes = block + capacity * 3; }
+    else ++ga_heap_fallbacks;
   }
   if (!positions)
 #endif
