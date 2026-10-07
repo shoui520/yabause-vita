@@ -183,12 +183,17 @@ extern "C" int VitaSh2CodeSmokeTest() {
   }
 }
 
+#ifdef VITA_SCSP_DSP_JIT
+static constexpr std::size_t scsp_dsp_code = 64 * 1024; /* the end of the 68K reserve */
+#else
+static constexpr std::size_t scsp_dsp_code = 0;
+#endif
 #ifdef VITA_SCU_DSP_JIT
 /* SCU DSP translator (scu_dsp_jit.h): the reserved 68K partition, published
  * with the same VM-domain sequence, on the emulation thread only. */
 static VitaM68kCodeWrite *dsp_code_write;
 extern "C" unsigned char *VitaDspCodeArena(std::size_t *capacity) {
-  *capacity = vitacode::Layout::M68k;
+  *capacity = vitacode::Layout::M68k - scsp_dsp_code;
   return VitaM68kCodeArena();
 }
 extern "C" void VitaDspCodeWriteBegin(void *p, std::size_t n) {
@@ -198,5 +203,30 @@ extern "C" void VitaDspCodeWriteEnd(void *p, std::size_t n) {
   (void)p; (void)n;
   delete dsp_code_write;
   dsp_code_write = nullptr;
+}
+#endif
+
+#ifdef VITA_SCSP_DSP_JIT
+/* SCSP DSP translator (scspdsp.c): published by the emulation thread only;
+ * the sound thread runs it. */
+static VitaM68kCodeWrite *scsp_dsp_code_write;
+extern "C" unsigned char *VitaScspDspCodeArena(std::size_t *capacity) {
+  *capacity = scsp_dsp_code;
+  unsigned char *reserve = VitaM68kCodeArena();
+  return reserve ? reserve + vitacode::Layout::M68k - scsp_dsp_code : nullptr;
+}
+extern "C" void VitaScspDspCodeWriteBegin(void *p, std::size_t n) {
+  scsp_dsp_code_write = new VitaM68kCodeWrite(p, n);
+}
+extern "C" void VitaScspDspCodeWriteEnd(void *p, std::size_t n) {
+  (void)p; (void)n;
+  delete scsp_dsp_code_write;
+  scsp_dsp_code_write = nullptr;
+}
+/* The sound thread, before it first runs code published by the emulation
+ * thread: makes that code visible to the instruction cache of its own core. */
+extern "C" void VitaScspDspCodeAdopt(void *p, std::size_t n) {
+  const int rc = sceKernelSyncVMDomain(arena_uid, p, n);
+  if (rc < 0) { YuiMsg("scsp_dsp_jit_sync_error=%08x", rc); sceKernelExitProcess(1); }
 }
 #endif

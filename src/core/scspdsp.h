@@ -184,6 +184,20 @@ union ScspDspInstruction {
 
 void ScspDspDisasm(u8 addr, char *outstring);
 void ScspDspExec(ScspDsp* dsp, int addr, u8 * sound_ram);
+#ifdef VITA_SCSP_DSP_JIT
+/* Emulation thread, once per frame: translates a program the mixer asked for. */
+void ScspDspJitService(void);
+#endif
+#ifdef VITA_SCSP_DSP
+/* Program length, decoding it first if MPRO/COEF/MADRS changed. */
+int ScspDspSteps(const ScspDsp *dsp);
+/* len samples: MIXS bus b of sample i is mix[b][i] (the sum of the slot
+ * outputs routed there at the 16-bit level, i.e. MIXS >> 4), EXTS n is
+ * ext[n][i] (CD audio); EFREG e is added to bufL/bufR shifted right by
+ * out_l[e]/out_r[e] (31: not added). */
+void ScspDspRun(ScspDsp *dsp, u8 *sound_ram, const s32 *const mix[16], const s16 *const ext[2],
+                u32 len, s32 *bufL, s32 *bufR, const u8 out_l[16], const u8 out_r[16]);
+#endif
 
 extern ScspDsp scsp_dsp;
 

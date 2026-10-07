@@ -1030,6 +1030,9 @@ void SyncCPUtoSCSP() {
     g_vita_sound_wait = 0;
 #endif
     VitaM68kNativePublish();
+#ifdef VITA_SCSP_DSP_JIT
+    ScspDspJitService();
+#endif
 #ifdef VITA
     vita_sound_wait_us += YabauseGetTicks() - sound_wait_start;
 #endif

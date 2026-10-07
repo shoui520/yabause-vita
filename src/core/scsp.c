@@ -1588,6 +1588,7 @@ void new_scsp_reset(struct Scsp* s)
    new_scsp_cycles = 0;
 }
 
+
 void scsp_set_use_new(int which)
 {
    if (which && !use_new_scsp)
@@ -3342,16 +3343,50 @@ scsp_get_w (u32 a)
 
 ////////////////////////////////////////////////////////////////
 
+/* Loop wrap: keep the position past LEA (the loop period is LEA - LSA), so
+ * short looped waveforms keep their pitch. */
+#ifdef VITA_SCSP_INTERP
+#define SCSP_LOOP_WRAP(f, lea, lsa) ((f) - (lea) + (lsa) > (lea) ? (lsa) : (f) - (lea) + (lsa))
+#else
+#define SCSP_LOOP_WRAP(f, lea, lsa) (lsa)
+#endif
+/* 8-bit sample i of a slot on a little-endian host, where sound RAM holds
+ * byte-swapped 16-bit words: the swap applies to the absolute address, so a
+ * sample starting at an odd address reads correctly too. */
+#define SCSP_RAM8(buf8, i) (*(const s8 *)((uintptr_t)((buf8) + (i)) ^ 1))
+#ifdef VITA_SCSP_INTERP
+/* Linear interpolation between the sample and the next one, as the SCSP
+ * does; without it low-rate samples alias into metallic, hissing treble. */
+#define SCSP_INTERP(s0, s1, fcnt) \
+  ((s0) + ((((s1) - (s0)) * (s32)((fcnt) & ((1 << SCSP_FREQ_LB) - 1))) >> SCSP_FREQ_LB))
+/* SBCTL (as read from memory): bit 0 inverts the bits below the sign bit,
+ * bit 1 the sign bit. */
+static const u16 scsp_sbctl16[4] = { 0, 0x7FFF, 0x8000, 0xFFFF };
+static const u8 scsp_sbctl8[4] = { 0, 0x7F, 0x80, 0xFF };
+#ifdef WORDS_BIGENDIAN
+#define SCSP_8B_AT(buf8, i, sb) ((s32) (s8) ((buf8)[(i)] ^ scsp_sbctl8[sb]))
+#else
+#define SCSP_8B_AT(buf8, i, sb) ((s32) (s8) (SCSP_RAM8(buf8, i) ^ scsp_sbctl8[sb]))
+#endif
+#define SCSP_16B_AT(buf16, i, sb) ((s32) (s16) ((buf16)[(i)] ^ scsp_sbctl16[sb]))
+#define SCSP_GET_OUT_8B \
+  out = SCSP_INTERP(SCSP_8B_AT(slot->buf8, slot->fcnt >> SCSP_FREQ_LB, slot->sbctl), \
+                    SCSP_8B_AT(slot->buf8, (slot->fcnt >> SCSP_FREQ_LB) + 1, slot->sbctl), slot->fcnt);
+#define SCSP_GET_OUT_16B \
+  out = SCSP_INTERP(SCSP_16B_AT(slot->buf16, slot->fcnt >> SCSP_FREQ_LB, slot->sbctl), \
+                    SCSP_16B_AT(slot->buf16, (slot->fcnt >> SCSP_FREQ_LB) + 1, slot->sbctl), slot->fcnt);
+#else
 #ifdef WORDS_BIGENDIAN
 #define SCSP_GET_OUT_8B \
   out = (s32) slot->buf8[(slot->fcnt >> SCSP_FREQ_LB)];
 #else
 #define SCSP_GET_OUT_8B \
-  out = (s32) slot->buf8[(slot->fcnt >> SCSP_FREQ_LB) ^ 1];
+  out = (s32) SCSP_RAM8(slot->buf8, slot->fcnt >> SCSP_FREQ_LB);
 #endif
 
 #define SCSP_GET_OUT_16B \
   out = (s32) slot->buf16[slot->fcnt >> SCSP_FREQ_LB];
+#endif
 
 #define SCSP_GET_ENV \
   slot->env = scsp_env_table[slot->ecnt >> SCSP_ENV_LB] * slot->tl / 1024;
@@ -3410,7 +3445,7 @@ scsp_get_w (u32 a)
   {                                           \
     if (slot->lpctl)                          \
       {                                       \
-        slot->fcnt = slot->lsa;               \
+        slot->fcnt = SCSP_LOOP_WRAP(slot->fcnt, slot->lea, slot->lsa);               \
       }                                       \
     else                                      \
       {                                       \
@@ -3427,7 +3462,7 @@ scsp_get_w (u32 a)
     {                                                                \
       if (slot->lpctl)                                               \
         {                                                            \
-          slot->fcnt = slot->lsa;                                    \
+          slot->fcnt = SCSP_LOOP_WRAP(slot->fcnt, slot->lea, slot->lsa);                                    \
         }                                                            \
       else                                                           \
         {                                                            \
@@ -4077,8 +4112,14 @@ extern void YuiMsg(const char *, ...);
  * UPDATE_PHASE(_LFO), UPDATE_ENV, UPDATE_LFO. State is written back before
  * every envelope transition call (which may change ecnt/einc/ecmp/ecurp/enxt,
  * then reloaded) and on every exit, including the key-off return. */
+#ifdef VITA_SCSP_DSP
+#define SCSP_DSP_BATCH 1024
+/* MIXS bus of the slot being mixed with M set (scsp_update). */
+static s32 *scsp_dsp_bus;
+#endif
 static inline __attribute__((always_inline)) void
-scsp_fast_slot (slot_t *slot, const int fm, const int em, const int b16, const int L, const int R)
+scsp_fast_slot (slot_t *slot, const int fm, const int em, const int b16, const int L, const int R,
+                const int M)
 {
    u32 pos = scsp_buf_pos;
    const u32 len = scsp_buf_len;
@@ -4090,6 +4131,14 @@ scsp_fast_slot (slot_t *slot, const int fm, const int em, const int b16, const i
    s32 *einc = slot->einc;
    const s32 tl = slot->tl;
    const u8 disll = slot->disll, dislr = slot->dislr;
+#ifdef VITA_SCSP_INTERP
+   const unsigned sbctl = slot->sbctl & 3;
+#endif
+#ifdef VITA_SCSP_DSP
+   /* M: also into the slot's DSP input bus, at the IMXL level. */
+   s32 *const bus = scsp_dsp_bus;
+   const u8 imxl = slot->imxl;
+#endif
    u32 lfocnt = slot->lfocnt;
    const s32 lfoinc = slot->lfoinc;
    const s32 *const lfofmw = slot->lfofmw, *const lfoemw = slot->lfoemw;
@@ -4101,12 +4150,16 @@ scsp_fast_slot (slot_t *slot, const int fm, const int em, const int b16, const i
    for (; pos < len; pos++)
    {
       s32 out = 0;
-      if (L || R)
+      if (L || R || M)
       {
-#ifdef WORDS_BIGENDIAN
+#ifdef VITA_SCSP_INTERP
+         const u32 i = fcnt >> SCSP_FREQ_LB;
+         out = b16 ? SCSP_INTERP(SCSP_16B_AT(buf16, i, sbctl), SCSP_16B_AT(buf16, i + 1, sbctl), fcnt)
+                   : SCSP_INTERP(SCSP_8B_AT(buf8, i, sbctl), SCSP_8B_AT(buf8, i + 1, sbctl), fcnt);
+#elif defined(WORDS_BIGENDIAN)
          out = b16 ? (s32) buf16[fcnt >> SCSP_FREQ_LB] : (s32) buf8[fcnt >> SCSP_FREQ_LB];
 #else
-         out = b16 ? (s32) buf16[fcnt >> SCSP_FREQ_LB] : (s32) buf8[(fcnt >> SCSP_FREQ_LB) ^ 1];
+         out = b16 ? (s32) buf16[fcnt >> SCSP_FREQ_LB] : (s32) SCSP_RAM8(buf8, fcnt >> SCSP_FREQ_LB);
 #endif
       }
       if (em)
@@ -4114,17 +4167,20 @@ scsp_fast_slot (slot_t *slot, const int fm, const int em, const int b16, const i
                (lfoemw[(lfocnt >> SCSP_LFO_LB) & SCSP_LFO_MASK] >> lfoems);
       else
          env = scsp_env_table[ecnt >> SCSP_ENV_LB] * tl / 1024;
-      if ((L || R) && (out) && (env > 0))
+      if ((L || R || M) && (out) && (env > 0))
       {
          out *= env;
          if (L) bl[pos] += out >> (b16 ? disll : disll - 8);
          if (R) br[pos] += out >> (b16 ? dislr : dislr - 8);
+#ifdef VITA_SCSP_DSP
+         if (M) bus[pos] += out >> (b16 ? imxl : imxl - 8);
+#endif
       }
       if (fm)
          fcnt += ((lfofmw[(lfocnt >> SCSP_LFO_LB) & SCSP_LFO_MASK] << (lfofms-7)) >> (fsft+1));
       if ((fcnt += finc) > lea)
       {
-         if (lpctl) fcnt = lsa;
+         if (lpctl) fcnt = SCSP_LOOP_WRAP(fcnt, lea, lsa);
          else { ecnt = SCSP_ENV_DE; SCSP_FAST_SAVE(); return; }
       }
       if (einc) ecnt += *einc;
@@ -4141,7 +4197,7 @@ scsp_fast_slot (slot_t *slot, const int fm, const int em, const int b16, const i
 #undef SCSP_FAST_SAVE
 }
 #define SCSP_FAST_FN(name, fm, em, b16, l, r) \
-   static void name (slot_t *slot) { scsp_fast_slot(slot, fm, em, b16, l, r); }
+   static void name (slot_t *slot) { scsp_fast_slot(slot, fm, em, b16, l, r, 0); }
 SCSP_FAST_FN(scsp_fast_null, 0, 0, 1, 0, 0)
 SCSP_FAST_FN(scsp_fast_8B_L, 0, 0, 0, 1, 0)       SCSP_FAST_FN(scsp_fast_8B_R, 0, 0, 0, 0, 1)
 SCSP_FAST_FN(scsp_fast_8B_LR, 0, 0, 0, 1, 1)      SCSP_FAST_FN(scsp_fast_16B_L, 0, 0, 1, 1, 0)
@@ -4168,6 +4224,25 @@ static void (*scsp_fast_update_p[2][2][2][2][2])(slot_t *slot) = {
     { { { scsp_fast_null, scsp_fast_F_E_8B_R }, { scsp_fast_F_E_8B_L, scsp_fast_F_E_8B_LR } },
       { { scsp_fast_null, scsp_fast_F_E_16B_R }, { scsp_fast_F_E_16B_L, scsp_fast_F_E_16B_LR } } } }
 };
+#ifdef VITA_SCSP_DSP
+/* The same with M set, for slots whose IMXL is not 0 while the DSP runs;
+ * the no-output entries mix the bus only. */
+#define SCSP_DSP_FN(fm, em, b16, l, r) \
+   static void scsp_dsp_##fm##em##b16##l##r (slot_t *slot) { scsp_fast_slot(slot, fm, em, b16, l, r, 1); }
+#define SCSP_DSP_FN4(fm, em, b16) SCSP_DSP_FN(fm, em, b16, 0, 0) SCSP_DSP_FN(fm, em, b16, 0, 1) \
+   SCSP_DSP_FN(fm, em, b16, 1, 0) SCSP_DSP_FN(fm, em, b16, 1, 1)
+SCSP_DSP_FN4(0, 0, 0) SCSP_DSP_FN4(0, 0, 1) SCSP_DSP_FN4(0, 1, 0) SCSP_DSP_FN4(0, 1, 1)
+SCSP_DSP_FN4(1, 0, 0) SCSP_DSP_FN4(1, 0, 1) SCSP_DSP_FN4(1, 1, 0) SCSP_DSP_FN4(1, 1, 1)
+#define SCSP_DSP_LR(fm, em, b16) { { scsp_dsp_##fm##em##b16##00, scsp_dsp_##fm##em##b16##01 }, \
+                                   { scsp_dsp_##fm##em##b16##10, scsp_dsp_##fm##em##b16##11 } }
+static void (*scsp_dsp_update_p[2][2][2][2][2])(slot_t *slot) = {
+  { { SCSP_DSP_LR(0, 0, 0), SCSP_DSP_LR(0, 0, 1) }, { SCSP_DSP_LR(0, 1, 0), SCSP_DSP_LR(0, 1, 1) } },
+  { { SCSP_DSP_LR(1, 0, 0), SCSP_DSP_LR(1, 0, 1) }, { SCSP_DSP_LR(1, 1, 0), SCSP_DSP_LR(1, 1, 1) } }
+};
+#undef SCSP_DSP_LR
+#undef SCSP_DSP_FN4
+#undef SCSP_DSP_FN
+#endif
 
 /* Startup differential check of every table entry against the original on
  * randomized slot states (loop and key-off ends, every envelope phase and
@@ -4195,6 +4270,7 @@ static void ScspFastMixSelfTest (void)
       a.lsa = (64 + SCSP_RND() % 0x1000) << SCSP_FREQ_LB; /* FM steps stay >= 0 */
       a.lea = a.lsa + ((SCSP_RND() % 0x2000) << SCSP_FREQ_LB);
       a.lpctl = SCSP_RND() & 1;
+      a.sbctl = SCSP_RND() & 3;
       a.tl = SCSP_RND() % 1024;
       a.disll = SCSP_RND() & 1 ? 31 : 8 + SCSP_RND() % 23;
       a.dislr = SCSP_RND() & 1 ? 31 : 8 + SCSP_RND() % 23;
@@ -4248,6 +4324,18 @@ scsp_update (s32 *bufL, s32 *bufR, u32 len)
 {
    VT_SCOPE(VT_SCSP_MIX);
    slot_t *slot;
+#ifdef VITA_SCSP_DSP
+   /* MIXS buses of the batch (len <= one frame of samples), zeroed on use. */
+   static s32 dsp_bus[16][SCSP_DSP_BATCH];
+   static const s32 dsp_silence[SCSP_DSP_BATCH];
+   const s32 *bus_in[16];
+   u32 bus_used = 0;
+   const int dsp = len <= SCSP_DSP_BATCH && ScspDspSteps(&scsp_dsp) > 0;
+   /* CD audio (EXTS 0/1) of the batch; silence past what has arrived. */
+   static s16 cd_l[SCSP_DSP_BATCH], cd_r[SCSP_DSP_BATCH];
+   const s16 *const ext[2] = { cd_l, cd_r };
+   u32 cd_len = 0;
+#endif
 
    scsp_bufL = bufL;
    scsp_bufR = bufR;
@@ -4267,7 +4355,7 @@ scsp_update (s32 *bufL, s32 *bufR, u32 len)
          {
             if ((slot->fcnt += slot->finc) > slot->lea)
             {
-               if (slot->lpctl) slot->fcnt = slot->lsa;
+               if (slot->lpctl) slot->fcnt = SCSP_LOOP_WRAP(slot->fcnt, slot->lea, slot->lsa);
                else
                {
                   slot->ecnt = SCSP_ENV_DE;
@@ -4281,6 +4369,37 @@ scsp_update (s32 *bufL, s32 *bufR, u32 len)
 
       scsp_buf_len = len;
       scsp_buf_pos = 0;
+
+#ifdef VITA_SCSP_DSP
+      if (dsp)
+      {
+         /* The DSP's input instead of the direct-level substitute below. */
+         if (slot->imxl != 31)
+         {
+            const u32 isel = (scsp_isr[((u32)(slot - scsp.slot) << 5 | 0x15) ^ 3] >> 3) & 0xF;
+            if (!(bus_used & (1u << isel)))
+            {
+               memset(dsp_bus[isel], 0, len * sizeof(s32));
+               bus_used |= 1u << isel;
+            }
+            scsp_dsp_bus = dsp_bus[isel];
+            scsp_dsp_update_p
+               [(slot->lfofms == 31) ? 0 : 1]
+               [(slot->lfoems == 31) ? 0 : 1]
+               [(slot->pcm8b == 0) ? 1 : 0]
+               [(slot->disll == 31) ? 0 : 1]
+               [(slot->dislr == 31) ? 0 : 1](slot);
+         }
+         else
+            scsp_fast_update_p
+               [(slot->lfofms == 31) ? 0 : 1]
+               [(slot->lfoems == 31) ? 0 : 1]
+               [(slot->pcm8b == 0) ? 1 : 0]
+               [(slot->disll == 31) ? 0 : 1]
+               [(slot->dislr == 31) ? 0 : 1](slot);
+         continue;
+      }
+#endif
 
       // take effect sound volume if no direct sound volume...
       if ((slot->disll == 31) && (slot->dislr == 31))
@@ -4312,6 +4431,9 @@ scsp_update (s32 *bufL, s32 *bufR, u32 len)
          scsp_buf_len = len;
 
       scsp_buf_pos = 0;
+#ifdef VITA_SCSP_DSP
+      if (len <= SCSP_DSP_BATCH) cd_len = scsp_buf_len;
+#endif
 
       /* May need to wrap around the buffer, so use nested loops */
       while (scsp_buf_pos < scsp_buf_len)
@@ -4330,6 +4452,15 @@ scsp_update (s32 *bufL, s32 *bufR, u32 len)
          {
             s32 out;
 
+#ifdef VITA_SCSP_DSP
+            /* EXTS: to the DSP and out at slots 16/17's EFSDL/EFPAN below. */
+            if (len <= SCSP_DSP_BATCH)
+            {
+               cd_l[scsp_buf_pos] = (s16)((buf[1] << 8) | buf[0]);
+               cd_r[scsp_buf_pos] = (s16)((buf[3] << 8) | buf[2]);
+               continue;
+            }
+#endif
             out = (s32)(s16)((buf[1] << 8) | buf[0]);
 
             if (out)
@@ -4348,6 +4479,46 @@ scsp_update (s32 *bufL, s32 *bufR, u32 len)
    {
       SCSPLOG("WARNING: CDDA buffer underrun\n");
    }
+#ifdef VITA_SCSP_DSP
+   if (dsp)
+   {
+      VT_SCOPE(VT_SCSP_DSP);
+      /* EFREG n leaves at slot n's EFSDL/EFPAN, at the direct-sound scale. */
+      u8 out_l[16], out_r[16];
+      int i;
+      for (i = 0; i < 16; i++)
+      {
+         bus_in[i] = (bus_used & (1u << i)) ? dsp_bus[i] : dsp_silence;
+         out_l[i] = scsp.slot[i].efsll == 31 ? 31 : scsp.slot[i].efsll - SCSP_ENV_HB;
+         out_r[i] = scsp.slot[i].efslr == 31 ? 31 : scsp.slot[i].efslr - SCSP_ENV_HB;
+      }
+      scsp_dsp.rbl = scsp.rbl;
+      scsp_dsp.rbp = scsp.rbp / (4 * 1024 * 2); /* bytes here, 8 KB units there */
+      if (cd_len < len)
+      {
+         memset(cd_l + cd_len, 0, (len - cd_len) * sizeof(s16));
+         memset(cd_r + cd_len, 0, (len - cd_len) * sizeof(s16));
+      }
+      ScspDspRun(&scsp_dsp, scsp.scsp_ram, bus_in, ext, len, bufL, bufR, out_l, out_r);
+   }
+#endif
+
+#ifdef VITA_SCSP_DSP
+   {
+      /* As the new core: EXTS n at slot 16+n's EFSDL/EFPAN (direct scale). */
+      int n;
+      for (n = 0; n < 2 && cd_len; n++)
+      {
+         const slot_t *es = &scsp.slot[16 + n];
+         const s16 *cd = ext[n];
+         u32 q;
+         if (es->efsll != 31)
+            for (q = 0; q < cd_len; q++) bufL[q] += cd[q] >> (es->efsll - SCSP_ENV_HB);
+         if (es->efslr != 31)
+            for (q = 0; q < cd_len; q++) bufR[q] += cd[q] >> (es->efslr - SCSP_ENV_HB);
+      }
+   }
+#endif
 }
 
 void
@@ -5007,6 +5178,7 @@ scsp_reset (void)
   slot_t *slot;
 
   memset(scsp_reg, 0, 0x1000);
+  memset(&scsp_dsp, 0, sizeof(ScspDsp));
 
   scsp.mem4b     = 0;
   scsp.mvol      = 0;
