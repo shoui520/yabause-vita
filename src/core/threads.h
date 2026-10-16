@@ -110,6 +110,9 @@ void YabThreadFreeMutex( YabMutex * mtx );
 
 void YabThreadSetCurrentThreadAffinityMask(int mask);
 int YabThreadGetCurrentThreadAffinityMask();
+/* Raises the calling thread above the workers that share its core while
+ * on is set (no-op where nothing shares it). */
+void YabThreadBoostCurrent(int on);
 
 void YabThreadUSleep( unsigned int stime );
 

@@ -6523,12 +6523,16 @@ static int ScspEarlyRun(void) {
   ScspEarlySave();
   atomic_store_explicit(&early_snap_ok, 1, memory_order_release);
   early_in_frame = 1;
+  /* The 68000 frame is on the main side's path once its VBlank-in is near
+   * (a short frame waits for it); the mix after it is not. */
+  YabThreadBoostCurrent(1);
   for (int c = 0; c < EARLY_CHUNKS; ++c) {
     ScspCpuChunk();
     if (early_self_abort ||
         atomic_load_explicit(&early_state, memory_order_acquire) == EARLY_ABORT) goto rollback;
   }
   ScspCpuFrameEnd();
+  YabThreadBoostCurrent(0);
   early_in_frame = 0;
   if (early_self_abort) goto rollback;
 #ifdef VITA_SCSP_EARLY_MIX
@@ -6558,6 +6562,7 @@ static int ScspEarlyRun(void) {
   atomic_store_explicit(&early_snap_ok, 0, memory_order_release);
   if (s == EARLY_COMMIT) return 1;
 rollback:
+  YabThreadBoostCurrent(0);
   atomic_store_explicit(&early_snap_ok, 0, memory_order_release);
   early_in_frame = 0;
   ScspEarlyRestore();

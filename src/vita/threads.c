@@ -116,6 +116,22 @@ void YabThreadSetCurrentThreadAffinityMask(int mask) {
       (native != 0 && observed != native ? -EINVAL : 0);
   }
 }
+void YabThreadBoostCurrent(int on) {
+#ifdef VITA_ROTATION_SPLIT
+  /* The rotation worker sits one level above the sound thread on core 1. */
+  static _Thread_local int base;
+  if (on && !base) {
+    base = sceKernelGetThreadCurrentPriority();
+    if (base > 66 && base <= 191) sceKernelChangeThreadPriority(0, base - 2);
+    else base = 0;
+  } else if (!on && base) {
+    sceKernelChangeThreadPriority(0, base);
+    base = 0;
+  }
+#else
+  (void)on;
+#endif
+}
 int YabThreadGetCurrentThreadAffinityMask(void) {
   return VitaAffinityDecode(sceKernelGetThreadCpuAffinityMask(0));
 }
