@@ -78,6 +78,11 @@ public:
 #else
   static inline bool base_reg_enabled = false;
 #endif
+#ifdef VITA_SH2_MACW_RUNS
+  static inline bool macw_runs_enabled = true;
+#else
+  static inline bool macw_runs_enabled = false;
+#endif
   bool base11 = false;
   // r10 = s ^ region_base; branch to a cold path unless r10 < 0x100000 and
   // (width > 1) r10 is width-aligned. For width 2/4, ROR moves the alignment
@@ -284,6 +289,8 @@ public:
   std::array<bool, 16> hint_ok{};
   std::array<uint32_t, 16> hint_val{};
   bool EmitOp(uint16_t op, uint32_t pc) {
+    if (!mac_shadow.empty() && !(op == mac_run_op && mac_run.size() < 16 && CanMacWord(op)))
+      CloseMacRun();
     if (div_chain_enabled && !resident_loop) {
       const unsigned n = (op >> 8) & 15, m = (op >> 4) & 15;
       const bool div = (op & 0xf00f) == 0x3004, rot = (op & 0xf0ff) == 0x4024;
@@ -432,7 +439,8 @@ public:
       return true;
     }
     if (CanMacLong(op) || CanMacWord(op)) {
-      MacMemory(op, IsMacWord(op));
+      if (macw_runs_enabled && IsMacWord(op) && ((op >> 8) & 15) != ((op >> 4) & 15)) MacWordRun(op);
+      else MacMemory(op, IsMacWord(op));
       ++instructions;
       extra_cycles += Cycles(op) - 1;
       return true;
@@ -588,6 +596,7 @@ public:
   // Only call once.
   // Chunk immediates so every emitted ADD uses an unrotated 8-bit constant.
   void Finish() {
+    CloseMacRun();
     Flush();
     Advance();
     if (cold.empty() && cold_owed) ++legacy_words;  // the branch over it
@@ -609,6 +618,7 @@ public:
   // which appends every region's cold code after the block's exits so the
   // block's hot code stays contiguous. Encode branches with Branch().
   void FinishHot() {
+    CloseMacRun();
     Flush();
     Advance();
     if (cold.empty() && cold_owed) ++legacy_words;  // the caller's branch over it
@@ -618,6 +628,14 @@ public:
   }
   // Words this region will occupy once finished (hot, branch-over, cold).
   size_t PendingWords() const {
+    if (!mac_shadow.empty()) {
+      const int shadow = int(mac_shadow[0].PendingWords()) + mac_shadow[0].legacy_words - legacy_words;
+      const int own = int(RawPendingWords() + MacRunOwedWords());
+      return size_t(shadow > own ? shadow : own);
+    }
+    return RawPendingWords();
+  }
+  size_t RawPendingWords() const {
     return code.size() + (cold.empty() && !cold_owed ? 0 : cold.size() + 1) + (div_open ? 28 : 0);
   }
 
@@ -947,14 +965,15 @@ private:
     code.push_back(0);
     code.swap(cold);
   }
-  void Pending(uint32_t add_or_sub) {
-    for (unsigned left = instructions - accounted; left;) {
+  void Pending(uint32_t add_or_sub) { PendingFor(add_or_sub, instructions - accounted, extra_cycles); }
+  void PendingFor(uint32_t add_or_sub, unsigned insns, unsigned extra) {
+    for (unsigned left = insns; left;) {
       const unsigned k = left > 127 ? 127 : left;
       code.push_back(add_or_sub | 0x00088000u | (k * 2));
       code.push_back(add_or_sub | 0x00099000u | k);
       left -= k;
     }
-    for (unsigned left = extra_cycles; left;) {
+    for (unsigned left = extra; left;) {
       const unsigned k = left > 255 ? 255 : left;
       code.push_back(add_or_sub | 0x00099000u | k);
       left -= k;
@@ -1249,6 +1268,165 @@ private:
   // their order, saturation) with live PC/cycles, then reloads every
   // resident mapping. All four mappings are marked dirty after that edge, so
   // it stores only what was already dirty.
+  // Runs of the same MAC.W @Rm+,@Rn+ (m != n) with nothing between them, as
+  // in 3x3 matrix rows and dot products (a run may be one MAC.W), emitted
+  // when the run closes. One S test and one range test per pointer cover the
+  // whole run: both pointers' first and last reads in work RAM. Cached high
+  // work RAM is the straight path; a cold stub per pointer accepts
+  // cache-through high RAM and (2-aligned) cached/cache-through low RAM,
+  // whose memGetWord reads are the same T2 reads plus 2/4 memory cycles
+  // each, added by the stub (and taken back if the other pointer then fails).
+  // Each MAC.W is LDRH/LDRH/SMLABB on MACL and only the last forms MACH (MOV
+  // hi,lo,ASR #31 + SMLALBB, as MacMemory; every MAC.W recomputes MACH from
+  // MACL, so the earlier ones' MACH is dead). Anything else leaves state
+  // untouched and one cold stub runs the template once per MAC.W with that
+  // instruction's PC/cycles. mac_shadow is this region with MacMemory's
+  // emission of the same instructions: on close the region takes its state
+  // (slots, clocks, counters) and owes the size difference as legacy words
+  // when this code is smaller, so block boundaries are those of MacMemory's.
+  std::vector<RegisterRegion> mac_shadow;    // 0 or 1
+  uint16_t mac_run_op = 0;
+  struct MacRunStep { unsigned insns, extra; };
+  std::vector<MacRunStep> mac_run;
+  std::array<Slot, 7> mac_run_slots{};
+  unsigned mac_run_first = 0, mac_run_second = 0, mac_run_lo = 0, mac_run_hi = 0, mac_run_hb = 11;
+  // Worst-case words still to come for an open run (hot code and stubs).
+  unsigned MacRunOwedWords() const { return 110 + 17 * unsigned(mac_run.size()); }
+  void MacWordRun(uint16_t op) {
+    const MacRunStep step{instructions - accounted, extra_cycles};
+    if (mac_shadow.empty()) {
+      mac_shadow.push_back(*this);
+      mac_run_op = op;
+      mac_run.clear();
+      PublishSR();
+      for (unsigned g = 0; g < known.size(); ++g)
+        if (known[g]) (void)Get(g, true);
+      const unsigned n = (op >> 8) & 15, m = (op >> 4) & 15;
+      const unsigned first = Get(m, true), second = Get(n, true, first);
+      const unsigned lo = Get(20, true, second), hi = Get(19, false, lo);
+      mac_run_hb = HighBase();
+      mac_run_slots = slots;
+      mac_run_first = first; mac_run_second = second; mac_run_lo = lo; mac_run_hi = hi;
+    }
+    mac_run.push_back(step);
+    RegisterRegion &sh = mac_shadow[0];
+    sh.MacMemory(op, true);
+    ++sh.instructions;
+    sh.extra_cycles += Cycles(op) - 1;
+  }
+  void CloseMacRun() {
+    if (mac_shadow.empty()) return;
+    RegisterRegion sh = std::move(mac_shadow[0]);
+    mac_shadow.clear();
+    const auto hints = hint_ok; const auto hint_values = hint_val;
+    const unsigned k = unsigned(mac_run.size()), d = 2 * (k - 1), hb = mac_run_hb;
+    const unsigned first = mac_run_first, second = mac_run_second, lo = mac_run_lo, hi = mac_run_hi;
+    const unsigned guest[2] = {first, second}, host[2] = {10, 14}, scratch[2] = {14, 12};
+    // (H | H + d) < 0x100000 proves H and H + d (H = guest ^ area).
+    auto range = [&](unsigned H, unsigned S) {
+      if (!d) { code.push_back(0xe3500601u | (H << 16)); return; }   // CMP H,#0x100000
+      code.push_back(0xe2800000u | (H << 16) | (S << 12) | d);       // ADD S,H,#d
+      code.push_back(0xe1800000u | (S << 16) | (S << 12) | H);       // ORR S,S,H
+      code.push_back(0xe3500601u | (S << 16));                       // CMP S,#0x100000
+    };
+    code.push_back(0xe597c040u);                   // LDR ip,[r7,#64] (SR)
+    code.push_back(0xe31c0002u);                   // TST ip,#2 (S)
+    const unsigned s_fail = code.size(); code.push_back(0); // BNE slow
+    unsigned p_bhs[2], p_back[2];
+    for (unsigned p = 0; p < 2; ++p) {
+      code.push_back(0xe2200406u | (guest[p] << 16) | (host[p] << 12)); // EOR H,g,#0x06000000
+      range(host[p], scratch[p]);
+      p_bhs[p] = code.size(); code.push_back(0);   // BHS stub p
+      p_back[p] = code.size();
+    }
+    HighBaseIp(hb);
+    code.push_back(0xe08aa000u | hb);              // ADD r10,r10,hb
+    code.push_back(0xe08ee000u | hb);              // ADD lr,lr,hb
+    for (unsigned i = 0; i + 1 < k; ++i) {
+      const uint32_t imm = (((2 * i) >> 4) << 8) | ((2 * i) & 15);
+      code.push_back(0xe1dac0b0u | imm);                             // LDRH ip,[r10,#2i]
+      code.push_back(0xe1de00b0u | (hi << 12) | imm);                // LDRH hi,[lr,#2i]
+      code.push_back(0xe1000080u | (lo << 16) | (lo << 12) | (hi << 8) | 12u); // SMLABB lo,ip,hi,lo
+    }
+    const uint32_t imm = ((d >> 4) << 8) | (d & 15);
+    code.push_back(0xe1dac0b0u | imm);             // LDRH ip,[r10,#d]
+    code.push_back(0xe1dea0b0u | imm);             // LDRH r10,[lr,#d]
+    code.push_back(0xe1a00fc0u | (hi << 12) | lo); // MOV hi,lo,ASR #31
+    code.push_back(0xe1400a8cu | (hi << 16) | (lo << 12)); // SMLALBB lo,hi,ip,r10
+    code.push_back(0xe2800000u | (first << 16) | (first << 12) | (2 * k));    // ADD first,#2k
+    code.push_back(0xe2800000u | (second << 16) | (second << 12) | (2 * k));  // ADD second,#2k
+    const unsigned done = code.size();
+    // Slow stub: the template once per MAC.W of the run. slow_undo first
+    // takes back the first pointer's cache-through cycles (its stub passed).
+    BeginCold({s_fail}, {0x10000000u});            // BNE
+    const unsigned slow_undo = code.size();
+    code.push_back(0xe3100202u | (first << 16));   // TST first,#0x20000000
+    code.push_back(0x0a000004u);                   // BEQ slow
+    code.push_back(0xe597c0a0u);                   // LDR ip,[r7,#160] (memcycle)
+    code.push_back(0xe3100404u | (first << 16));   // TST first,#0x04000000 (high RAM)
+    code.push_back(0x124cc000u | (2 * k));         // SUBNE ip,ip,#2k
+    code.push_back(0x024cc000u | (4 * k));         // SUBEQ ip,ip,#4k
+    code.push_back(0xe587c0a0u);                   // STR ip,[r7,#160]
+    const unsigned slow = code.size();
+    to_cold.back().target = slow;                  // the BNE skips the undo
+    const auto live = slots;
+    slots = mac_run_slots;
+    for (unsigned h = 0; h < slots.size(); ++h) Store(h);
+    const unsigned n = (mac_run_op >> 8) & 15, m = (mac_run_op >> 4) & 15;
+    for (const MacRunStep &st : mac_run) {
+      PendingFor(0xe2800000u, st.insns, st.extra);
+      code.push_back(0xe3a00000u | (m * 4));       // MOV r0,#Rm*4
+      code.push_back(0xe3a01000u | (n * 4));       // MOV r1,#Rn*4
+      Constant(12, macw_helper);
+      code.push_back(0xe12fff3cu);                 // BLX ip
+      PendingFor(0xe2400000u, st.insns, st.extra);
+    }
+    for (unsigned h = 0; h < slots.size(); ++h)
+      if (slots[h].guest >= 0)
+        code.push_back(0xe5970000u | (h << 12) | (unsigned(slots[h].guest) * 4));
+    slots = live;
+    EndCold(done);
+    // Pointer stubs: cache-through high RAM (+2 cycles a read), then low RAM
+    // (+4 if cache-through; H = offset + low_ram - high_ram, so the common
+    // base add forms its host address).
+    for (unsigned p = 0; p < 2; ++p) {
+      const unsigned g = guest[p], H = host[p], S = scratch[p];
+      const unsigned fail = p ? slow_undo : slow;
+      auto to = [&](uint32_t cond, unsigned target) {   // cold to cold
+        code.push_back(cond | 0x0a000000u | (uint32_t(int32_t(target) - int32_t(code.size()) - 2) & 0xffffffu));
+      };
+      BeginCold({p_bhs[p]}, {0x20000000u});        // BHS
+      code.push_back(0xe3c00202u | (g << 16) | (H << 12));   // BIC H,g,#0x20000000
+      code.push_back(0xe2200406u | (H << 16) | (H << 12));   // EOR H,H,#0x06000000
+      range(H, S);
+      const unsigned low = code.size(); code.push_back(0);   // BHS low
+      code.push_back(0xe59700a0u | (S << 12));       // LDR S,[r7,#160]
+      code.push_back(0xe2800000u | (S << 16) | (S << 12) | (2 * k)); // ADD S,S,#2k
+      code.push_back(0xe58700a0u | (S << 12));       // STR S,[r7,#160]
+      ColdJumpHot(p_back[p]);
+      code[low] = 0x2a000000u | ((uint32_t(code.size()) - low - 2) & 0xffffffu);
+      code.push_back(0xe2200662u | (H << 16) | (H << 12));   // EOR H,H,#0x06200000
+      code.push_back(0xe3100001u | (g << 16));               // TST g,#1
+      to(0x10000000u, fail);                                 // BNE
+      range(H, S);
+      to(0x20000000u, fail);                                 // BHS
+      Constant(S, low_ram - high_ram);
+      code.push_back(0xe0800000u | (H << 16) | (H << 12) | S); // ADD H,H,S
+      code.push_back(0xe3100202u | (g << 16));               // TST g,#0x20000000
+      code.push_back(0x159700a0u | (S << 12));       // LDRNE S,[r7,#160]
+      code.push_back(0x12800000u | (S << 16) | (S << 12) | (4 * k)); // ADDNE S,S,#4k
+      code.push_back(0x158700a0u | (S << 12));       // STRNE S,[r7,#160]
+      ColdJumpHot(p_back[p]);
+      code.swap(cold);
+    }
+    // Take the shadow's state; keep this code and owe the difference.
+    const int owed = int(sh.PendingWords()) + sh.legacy_words - int(RawPendingWords());
+    sh.code = std::move(code); sh.cold = std::move(cold);
+    sh.to_cold = std::move(to_cold); sh.to_hot = std::move(to_hot);
+    sh.legacy_words = owed > 0 ? owed : 0;
+    *this = std::move(sh);
+    hint_ok = hints; hint_val = hint_values;
+  }
   void MacMemory(uint16_t op, bool word) {
     PublishSR();
     for (unsigned g = 0; g < known.size(); ++g)

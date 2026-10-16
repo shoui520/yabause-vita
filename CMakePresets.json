@@ -99,6 +99,7 @@
         "VITA_SH2_LINK": "OFF",
         "VITA_SH2_MACL_WRAM": "ON",
         "VITA_SH2_MACW_WRAM": "ON",
+        "VITA_SH2_MACW_RUNS": "ON",
         "VITA_SH2_MAC_REGIONS": "ON",
         "VITA_SH2_NATIVE_CHAIN": "OFF",
         "VITA_SH2_NATIVE_DISPATCH": "ON",
