@@ -6524,7 +6524,9 @@ static int ScspEarlyRun(void) {
   atomic_store_explicit(&early_snap_ok, 1, memory_order_release);
   early_in_frame = 1;
   /* The 68000 frame is on the main side's path once its VBlank-in is near
-   * (a short frame waits for it); the mix after it is not. */
+   * (a short frame waits for it), and so is the mix after the commit: while
+   * it runs, CD audio sectors wait and the next early frame cannot be
+   * requested. The boost lasts until the mix is done. */
   YabThreadBoostCurrent(1);
   for (int c = 0; c < EARLY_CHUNKS; ++c) {
     ScspCpuChunk();
@@ -6532,7 +6534,6 @@ static int ScspEarlyRun(void) {
         atomic_load_explicit(&early_state, memory_order_acquire) == EARLY_ABORT) goto rollback;
   }
   ScspCpuFrameEnd();
-  YabThreadBoostCurrent(0);
   early_in_frame = 0;
   if (early_self_abort) goto rollback;
 #ifdef VITA_SCSP_EARLY_MIX
@@ -6655,6 +6656,7 @@ void ScspAsynMainCpuTime( void * p ){
       atomic_store(&early_spec, 0);
 #endif
       atomic_store_explicit(&scsp_mix_busy, 0, memory_order_release);
+      YabThreadBoostCurrent(0);
       /* The next frame may be requested now: this worker takes the request
        * only after its output and the frame start, and output can wait for
        * audio pacing well into the next frame. */
@@ -6669,6 +6671,9 @@ void ScspAsynMainCpuTime( void * p ){
 #endif
     }
 
+    /* The main side waits for this frame at VBlank-in: run it, and its mix,
+     * above the rotation worker sharing this core. */
+    YabThreadBoostCurrent(1);
     m68k_inc += m68k_cycle;
     pre_m68k_cycle = m68k_integer_part;
 
@@ -6699,6 +6704,7 @@ void ScspAsynMainCpuTime( void * p ){
         ScspExecAsync();
         scsp_defer_output = 0;
         atomic_store_explicit(&scsp_mix_busy, 0, memory_order_release);
+        YabThreadBoostCurrent(0);
 #else
 #ifdef VITA_SCSP_OUTPUT_AFTER_SYNC
         scsp_defer_output = 1;
@@ -6710,6 +6716,7 @@ void ScspAsynMainCpuTime( void * p ){
 
         VitaM68kNativePark();
         YabAddEventQueue( q_scsp_finish , 0);
+        YabThreadBoostCurrent(0);
 #endif
 #ifdef VITA_SCSP_OUTPUT_AFTER_SYNC
         /* The main CPU resumes now; this worker still finishes output before
