@@ -1943,7 +1943,7 @@ int ScspCpuSliceIsQuiescent(void) {
  * a completed frame is committed and the SH-2s go on without waiting. */
 enum { EARLY_IDLE, EARLY_REQUESTED, EARLY_RUNNING, EARLY_DONE, EARLY_ABORT,
        EARLY_COMMIT, EARLY_BLOCKED };
-enum { EARLY_START_LINE = 40, EARLY_LAST_LINE = 200, EARLY_QUIET_LINES = 16 };
+enum { EARLY_START_LINE = 8, EARLY_LAST_LINE = 200, EARLY_QUIET_LINES = 8 };
 static _Atomic int early_state;
 /* Set by the worker once the snapshot of its running frame is complete and
  * cleared before that frame commits or rolls back: while set, the snapshot
