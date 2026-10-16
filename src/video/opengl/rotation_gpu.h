@@ -4,6 +4,8 @@
 /* CPU producer methods make no GL calls; the atlas flush owns submission. */
 int YglVitaRotationBegin(RBGDrawInfo *, vdp2rotationparameter_struct *, const unsigned char *);
 void YglVitaRotationRow(int, int, const vdp2rotationparameter_struct *);
+/* Nonzero when the job reads a coefficient per dot (rows carry KtablV). */
+int YglVitaRotationDotK(int);
 void YglVitaRotationFlush(YglTextureManager *);
 void YglVitaRotationReset(void);
 void YglVitaRotationShutdown(void);

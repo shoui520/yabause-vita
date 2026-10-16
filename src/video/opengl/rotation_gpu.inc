@@ -56,6 +56,8 @@ typedef struct {
   float planes[512]; /* one texture row: first 16 entries are plane addresses */
   float step[4], bitmap[4], pixel[3];
   float map[4], pattern[4], palette[4], special[4];
+  /* Per-dot coefficients: table address, deltaKAx, entry shift, enabled. */
+  float dotk[4];
   unsigned x, y, width, height;
 #if defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
   uint32_t map_generation;
@@ -154,7 +156,7 @@ static int YglVitaRotationOutputEqual(const VitaRotationJob *a,
 #endif
 typedef struct {
   GLuint program;
-  GLint step, bitmap, pixel, map, pattern, palette, special;
+  GLint step, bitmap, pixel, map, pattern, palette, special, dotk;
 #ifdef VITA_ROTATION_PATTERN_CACHE
   GLint pattern_size;
 #endif
@@ -170,7 +172,7 @@ typedef struct {
 } VitaRotationProgram;
 /* 28 immutable specializations plus generic fallback/control. */
 #ifdef VITA_ROTATION_COEFF_PAIR
-static VitaRotationProgram vita_rotation_programs[114];
+static VitaRotationProgram vita_rotation_programs[118];
 #elif defined(VITA_ROTATION_PATTERN_CACHE)
 static VitaRotationProgram vita_rotation_programs[58];
 #elif defined(VITA_ROTATION_MAP_CACHE)
@@ -327,10 +329,18 @@ int YglVitaRotationBegin(RBGDrawInfo *rbg, vdp2rotationparameter_struct *p,
       (!info->isbitmap && (info->patternwh < 1 || info->patternwh > 2 ||
                           info->patterndatasize < 1 || info->patterndatasize > 2)) ||
       p->screenover == OVERMODE_SELPATNAME || p->coefmode == 3 ||
-      (p->coefenab && p->deltaKAx != 0.0f) ||
       rbg->rotate_mval_h != 1.0f || rbg->rotate_mval_v != 1.0f ||
       rbg->hres <= 0 || rbg->vres <= 0 || rbg->vres > VITA_ROTATION_MAX_ROWS ||
       vita_rotation_count == VITA_ROTATION_JOBS) return -1;
+  /* Per-dot coefficients: the shader reads each dot's VRAM table entry.
+   * Only bitmaps of parameter A or B alone, scaling both axes. */
+  const int dot_k = p->coefenab && p->deltaKAx != 0.0f;
+#ifdef VITA_ROTATION_DOT_K_BINARIES
+  if (dot_k && (!info->isbitmap || rbg->rgb_type != 0 || p->k_mem_type != 0 ||
+                p->coefmode != 0)) return -1;
+#else
+  if (dot_k) return -1;
+#endif
   int alpha = info->alpha, specialcolormode = info->specialcolormode;
   if (info->colornumber < 3 && specialcolormode == 3) {
     if (Vdp2Internal.ColorMode > 2) return -1;
@@ -413,6 +423,8 @@ int YglVitaRotationBegin(RBGDrawInfo *rbg, vdp2rotationparameter_struct *p,
   job->palette[2] = specialcolormode; job->palette[3] = info->specialcode;
   job->special[0] = info->specialprimode; job->special[1] = info->priority;
   job->special[2] = info->specialfunction; job->special[3] = info->specialcolorfunction;
+  job->dotk[0] = dot_k ? p->coeftbladdr : 0; job->dotk[1] = dot_k ? p->deltaKAx : 0;
+  job->dotk[2] = dot_k ? (p->coefdatasize == 2 ? 1 : 2) : 0; job->dotk[3] = dot_k;
   if (!info->isbitmap) {
     job->bitmap[1] = p->MaxH; job->bitmap[2] = p->MaxV;
     for (unsigned i = 0; i < 16; ++i) job->planes[i] = p->PlaneAddrv[i];
@@ -422,10 +434,14 @@ int YglVitaRotationBegin(RBGDrawInfo *rbg, vdp2rotationparameter_struct *p,
 }
 
 void YglVitaRotationRow(int slot, int y, const vdp2rotationparameter_struct *p) {
-  float *row = vita_rotation_jobs[slot]->rows[y];
+  VitaRotationJob *job = vita_rotation_jobs[slot];
+  float *row = job->rows[y];
   row[0] = p ? p->Xsp : 0.0f; row[1] = p ? p->Ysp : 0.0f;
+  if (job->dotk[3] != 0.0f) { row[2] = p->KtablV; row[3] = 0.0f; return; }
   row[2] = p ? p->kx : -2000000.0f; row[3] = p ? p->ky : 0.0f;
 }
+
+int YglVitaRotationDotK(int slot) { return vita_rotation_jobs[slot]->dotk[3] != 0.0f; }
 
 #ifdef VITA_ROTATION_TARGET
 int YglVitaRotationTarget(unsigned x, unsigned y, unsigned w, unsigned h) {
@@ -444,6 +460,7 @@ int YglVitaRotationTarget(unsigned x, unsigned y, unsigned w, unsigned h) {
 /* kx/ky are uniform only if every row carries bit-identical values (this
  * includes the all-transparent case, whose sentinel the shader still tests). */
 static int YglVitaRotationConstK(const VitaRotationJob *job) {
+  if (job->dotk[3] != 0.0f) return 0;
   for (unsigned y = 1; y < job->height; ++y)
     if (memcmp(&job->rows[y][2], &job->rows[0][2], 2 * sizeof(float))) return 0;
   return 1;
@@ -689,6 +706,15 @@ static VitaRotationProgram *YglVitaRotationProgram(const VitaRotationJob *job, i
     index=86+variant;
   }
 #endif
+#ifdef VITA_ROTATION_DOT_K_BINARIES
+  /* Begin admits per-dot coefficients only on bitmaps, layout 0 of a group. */
+  if (job->dotk[3] != 0.0f) {
+    if (variant < 0 || variant % 7) abort();
+    binary=vita_rotation_dotk_binaries[variant/7].data;
+    binary_size=vita_rotation_dotk_binaries[variant/7].size;
+    index=114+variant/7;
+  }
+#endif
 #else
   (void)job;
 #endif
@@ -730,6 +756,7 @@ static VitaRotationProgram *YglVitaRotationProgram(const VitaRotationJob *job, i
   p->pattern = glGetUniformLocation(p->program, "u_pattern");
   p->palette = glGetUniformLocation(p->program, "u_palette");
   p->special = glGetUniformLocation(p->program, "u_special");
+  p->dotk = glGetUniformLocation(p->program, "u_dotk");
 #ifdef VITA_ROTATION_UNIFORMS
   p->k = glGetUniformLocation(p->program, "u_k");
 #ifdef VITA_ROTATION_PLANE_UNIFORMS
@@ -1084,7 +1111,8 @@ void YglVitaRotationFlush(YglTextureManager *tm) {
       unsigned upload_rows=261;
 #ifdef VITA_ROTATION_BYTE_VRAM
       int byte_vram=(p>=&vita_rotation_programs[58] && p<&vita_rotation_programs[72]) ||
-                    (p>=&vita_rotation_programs[86] && p<&vita_rotation_programs[100]);
+                    (p>=&vita_rotation_programs[86] && p<&vita_rotation_programs[100]) ||
+                    (p>=&vita_rotation_programs[114] && p<&vita_rotation_programs[116]);
       if (byte_vram) upload_rows=256;
 #endif
 #ifdef VITA_ROTATION_BYTE_RESIDENT
@@ -1184,6 +1212,7 @@ void YglVitaRotationFlush(YglTextureManager *tm) {
     glUniform4fv(p->pattern, 1, job->pattern);
     glUniform4fv(p->palette, 1, job->palette);
     glUniform4fv(p->special, 1, job->special);
+    if (p->dotk != -1) glUniform3fv(p->dotk, 1, job->dotk);
     if (job->palette[2] == 3) {
       glActiveTexture(GL_TEXTURE3);
       glBindTexture(GL_TEXTURE_2D, _Ygl->cram_tex);

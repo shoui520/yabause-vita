@@ -6754,7 +6754,10 @@ static void Vdp2DrawRotation_in(RBGDrawInfo * rbg) {
       info, fixVdp2Regs->RPMD | rgb_type, (int)j, rbg->hres, &row_parameter);
 #ifdef YABAUSE_VITAGL
     if (gpu_rotation >= 0) {
-      if (!row_constant) abort();
+      if (!row_constant) {
+        if (!YglVitaRotationDotK(gpu_rotation)) abort();
+        row_parameter = rotation_mode == 0 ? &paraA : &paraB;
+      }
       YglVitaRotationRow(gpu_rotation, jj, row_parameter);
       texture->textdata += rbg->hres + texture->w;
       j += vstep;

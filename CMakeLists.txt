@@ -552,10 +552,12 @@ if(YABAUSE_PSP2CGC OR YABAUSE_RUNTIME_SHADERS)
   set(pattern_table "")
   set(pair_table "")
   set(rowk_table "")
+  set(dotk_table "")
   if(VITA_ROTATION_COEFF_PAIR)
     set(pair_table "static const VitaRotationBinary vita_rotation_pair_binaries[] = {\n")
     if(NOT VITA_ROTATION_COEFF_VARYING AND NOT VITA_ROTATION_COEFF_LINEAR)
       set(rowk_table "#define VITA_ROTATION_ROW_K_BINARIES 1\nstatic const VitaRotationBinary vita_rotation_rowk_binaries[] = {\n")
+      set(dotk_table "#define VITA_ROTATION_DOT_K_BINARIES 1\nstatic const VitaRotationBinary vita_rotation_dotk_binaries[] = {\n")
     endif()
   endif()
   if(VITA_ROTATION_PATTERN_CACHE)
@@ -649,6 +651,26 @@ if(YABAUSE_PSP2CGC OR YABAUSE_RUNTIME_SHADERS)
             list(APPEND YABAUSE_VITAGL_HEADERS "${rowk_header}")
             string(APPEND rotation_includes "#include \"${rowk_name}.h\"\n")
             string(APPEND rowk_table "{ygl_vita_${rowk_name}, sizeof(ygl_vita_${rowk_name})},\n")
+            if(layout EQUAL 0)
+              set(dotk_name "rotation_dotk_${format}_f")
+              set(dotk_header "${CMAKE_CURRENT_BINARY_DIR}/vitagl/${dotk_name}.h")
+              add_custom_command(OUTPUT "${dotk_header}"
+                BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/vitagl/${dotk_name}.${shader_product_extension}"
+                COMMAND "${HOST_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/compile_shader.py"
+                  ${shader_mode_args} --profile sce_fp_psp2
+                  --source "${CMAKE_CURRENT_SOURCE_DIR}/src/video/opengl/shaders/rotation_bitmap_f.cg"
+                  --output "${dotk_header}" --symbol "ygl_vita_${dotk_name}"
+                  --define "ROTATION_PATTERN_CACHE=1" --define "ROTATION_COEFF_PAIR=1"
+                  --define "ROTATION_ROW_K=1" --define "ROTATION_DOT_K=1"
+                  --define "ROTATION_FORMAT=${format}" --define "ROTATION_BITMAP=${bitmap}"
+                  --define "ROTATION_CELLS=${cells}" --define "ROTATION_WORDS=${words}"
+                  --define "ROTATION_AUX=${aux}" ${rotation_variant_defines} ${rotation_pair_defines}
+                DEPENDS src/video/opengl/shaders/rotation_bitmap_f.cg
+                  src/video/opengl/shaders/packed_texture.h ${runtime_shader_deps} tools/compile_shader.py VERBATIM)
+              list(APPEND YABAUSE_VITAGL_HEADERS "${dotk_header}")
+              string(APPEND rotation_includes "#include \"${dotk_name}.h\"\n")
+              string(APPEND dotk_table "{ygl_vita_${dotk_name}, sizeof(ygl_vita_${dotk_name})},\n")
+            endif()
           endif()
         endif()
       endif()
@@ -662,9 +684,12 @@ if(YABAUSE_PSP2CGC OR YABAUSE_RUNTIME_SHADERS)
     if(rowk_table)
       string(APPEND rowk_table "};\n")
     endif()
+    if(dotk_table)
+      string(APPEND dotk_table "};\n")
+    endif()
   endif()
   file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/vitagl/rotation_variants.h"
-    CONTENT "${rotation_includes}${rotation_table}};\n${pattern_table}${pair_table}${rowk_table}")
+    CONTENT "${rotation_includes}${rotation_table}};\n${pattern_table}${pair_table}${rowk_table}${dotk_table}")
   add_custom_target(yabause-vitagl-shaders DEPENDS ${YABAUSE_VITAGL_HEADERS})
   if(NOT YABAUSE_RUNTIME_SHADERS)
   add_library(yabause-gxm OBJECT src/vita/gxm/device.c src/vita/gxm/texture.c ${YABAUSE_GXM_HEADERS})
