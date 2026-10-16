@@ -119,7 +119,7 @@ sh2_block_exit:
 // Block exit with PC/count stored and all guest state in tagSH2 (r7). Enter
 // the next block directly, within the caller's frame, exactly when the C
 // lean loop would do nothing but dispatch it natively:
-//   chain budget left (sampling cadence), no acceptable interrupt
+//   chaining allowed (chain_limit nonzero), no acceptable interrupt
 //   ((SR & 0xF0) >= pending level), the block just run is not a BLOCK_LOOP
 //   (idle inference), then memory cycles folded into the count, count below
 //   the slice target, and the PC is cached high work RAM with a compiled
@@ -130,12 +130,11 @@ sh2_block_exit:
 .global sh2_dispatch
 .type sh2_dispatch, %function
 sh2_dispatch:
-  ldr   r0, [r7, #148]      // chain_budget
-  ldr   r1, [r7, #128]      // exitcount = slice target
-  subs  r0, r0, #1
-  blo   .Ldispatch_exit     // budget was 0
+  ldr   r0, [r7, #148]      // chain count
+  ldr   r1, [r7, #172]      // chain_limit = slice target, or 0
+  add   r0, r0, #1
   cmp   r9, r1
-  bhs   .Ldispatch_exit     // count reached
+  bhs   .Ldispatch_exit     // count reached, or no chaining
   ldr   r2, [r7, #64]       // SR
   ldr   r3, [r7, #96]       // pending interrupt level
   and   r2, r2, #0xF0
@@ -155,7 +154,7 @@ sh2_dispatch:
   mov   r3, #0
   str   r9, [r7, #92]       // count (the next block reloads r9 from it)
   str   r3, [r7, #160]
-  ldr   r1, [r7, #128]      // exitcount
+  ldr   r1, [r7, #172]      // chain_limit
   cmp   r9, r1
   bhs   .Ldispatch_exit     // count reached
 1:

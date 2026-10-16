@@ -194,15 +194,19 @@ struct tagSH2
   uintptr_t spec_pages;  // #140 CompileBlocks::code_pages
   // Native dispatch (VITA_SH2_NATIVE_DISPATCH): every block exit is
   // LDR pc,[r7,#144]. sh2_block_exit returns to C; sh2_dispatch enters the
-  // next cached high-RAM block directly while chain_budget allows it and the
+  // next cached high-RAM block directly while chain_limit allows it and the
   // C dispatcher would do nothing but look that block up.
   uintptr_t dispatch = reinterpret_cast<uintptr_t>(&sh2_block_exit); // #144
-  u32 chain_budget = 0;       // #148 further blocks sh2_dispatch may enter
+  u32 chain_budget = 0;       // #148 blocks entered by sh2_dispatch and link_check (counts up)
   uintptr_t chain_table = 0;  // #152 CompileBlocks::LookupTable (high RAM)
   uintptr_t chain_cur = 0;    // #156 Block last entered (by C or sh2_dispatch)
   u32 memcycle = 0;             // #160 DynarecSh2::memcycle_ itself (one load from r7)
   uintptr_t macw_saturate = 0;  // #164 sh2_macw_saturate (VITA_SH2_MACW_WRAM)
   uintptr_t macl_saturate = 0;  // #168 sh2_macl_saturate (VITA_SH2_MACL_WRAM)
+  // #172 Further blocks may be entered while the count is below this: the
+  // slice target while chaining is allowed and no interrupt is acceptable,
+  // otherwise 0 (set by C before each native call and by AddInterrupt).
+  u32 chain_limit = 0;
 };
 
 #ifdef VITA
@@ -697,7 +701,7 @@ public:
   inline void SET_PR(u32 v) { VITA_LAZY_SYNC(); VITA_IDLE_INVALIDATE(); m_pDynaSh2->SysReg[2] = v; }
   inline void SET_PC(u32 v) { VITA_LAZY_SYNC(); VITA_IDLE_INVALIDATE(); m_pDynaSh2->SysReg[3] = v; }
   inline void SET_COUNT(u32 v) { VITA_LAZY_SYNC(); m_pDynaSh2->SysReg[4] = v; } 
-  inline void SET_ICOUNT(u32 v) { VITA_LAZY_SYNC(); m_pDynaSh2->SysReg[5] = v; } 
+  inline void SET_ICOUNT(u32 v) { VITA_LAZY_SYNC(); m_pDynaSh2->SysReg[5] = v; m_pDynaSh2->chain_limit = 0; } 
   inline void SET_SR(u32 v) { VITA_LAZY_SYNC(); VITA_IDLE_INVALIDATE(); m_pDynaSh2->CtrlReg[0] = v; }
   inline void SET_GBR(u32 v) { VITA_LAZY_SYNC(); VITA_IDLE_INVALIDATE(); m_pDynaSh2->CtrlReg[1] = v; }
   inline void SET_VBR(u32 v) { VITA_LAZY_SYNC(); VITA_IDLE_INVALIDATE(); m_pDynaSh2->CtrlReg[2] = v; }  

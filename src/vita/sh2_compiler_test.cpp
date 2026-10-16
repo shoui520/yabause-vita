@@ -459,19 +459,19 @@ extern "C" int VitaSh2CompilerTest(void) {
                !std::memcmp(x.SysReg, y.SysReg, sizeof(x.SysReg));
       };
       bool ok = ref[1].SysReg[3] == pc + 0x40 && ref[2].SysReg[3] == pc + 0x80 && ref[3].SysReg[3] == 0x00001230;
-      // Chained runs: {budget, exitcount, memcycle, pending level, loop flag on A} -> blocks run.
-      struct Case { u32 budget, exitcount, memcycle, level; bool loop; unsigned expect; } cases[] = {
-        {100, 100000, 0, 0, false, 3}, {1, 100000, 0, 0, false, 2}, {0, 100000, 0, 0, false, 1},
-        {100, ref[1].SysReg[4], 0, 0, false, 1}, {100, ref[2].SysReg[4], 0, 0, false, 2},
+      // Chained runs: {chaining allowed, exitcount, memcycle, pending level, loop flag on A} -> blocks run.
+      struct Case { bool chain; u32 exitcount, memcycle, level; bool loop; unsigned expect; } cases[] = {
+        {true, 100000, 0, 0, false, 3}, {false, 100000, 0, 0, false, 1},
+        {true, ref[1].SysReg[4], 0, 0, false, 1}, {true, ref[2].SysReg[4], 0, 0, false, 2},
 #ifdef VITA_SH2_DISPATCH_MEMCYCLE
         // Memory cycles are folded into the count and the chain continues
         // while the sum stays below the target.
-        {100, 100000, 1, 0, false, 3}, {100, ref[1].SysReg[4] + 5, 5, 0, false, 1},
-        {100, ref[1].SysReg[4] + 6, 5, 0, false, 2},
+        {true, 100000, 1, 0, false, 3}, {true, ref[1].SysReg[4] + 5, 5, 0, false, 1},
+        {true, ref[1].SysReg[4] + 6, 5, 0, false, 2},
 #else
-        {100, 100000, 1, 0, false, 1},
+        {true, 100000, 1, 0, false, 1},
 #endif
-        {100, 100000, 0, 0x100, false, 1},
+        {true, 100000, 0, 0x100, false, 1},
         // No BLOCK_LOOP cases: loop blocks never link their exits (EmmitCode),
         // so link_check has no loop test and setting the flag on the linked
         // blocks here would describe an unreachable state.
@@ -479,7 +479,10 @@ extern "C" int VitaSh2CompilerTest(void) {
       for (const Case &k : cases) {
         tagSH2 st = start;
         st.dispatch = reinterpret_cast<uintptr_t>(&sh2_dispatch);
-        st.chain_budget = k.budget; st.exitcount = k.exitcount; st.SysReg[5] = k.level;
+        st.exitcount = k.exitcount; st.SysReg[5] = k.level;
+        // As the lean loop: no chaining past an acceptable interrupt.
+        st.chain_budget = 0;
+        st.chain_limit = k.chain && !((st.CtrlReg[0] & 0xF0) < st.SysReg[5]) ? k.exitcount : 0;
         st.chain_cur = reinterpret_cast<uintptr_t>(blk[0]);
         st.memcycle = k.memcycle;
         if (k.loop) blk[0]->flags |= BLOCK_LOOP;
@@ -488,17 +491,16 @@ extern "C" int VitaSh2CompilerTest(void) {
         // Memory cycles of the first block are folded into the count once.
         tagSH2 want = ref[k.expect]; want.SysReg[5] = k.level; 
 #ifdef VITA_SH2_DISPATCH_MEMCYCLE
-        const bool folded = k.memcycle && !k.loop && k.budget != 0;
+        const bool folded = k.memcycle && !k.loop && st.chain_limit != 0;
         if (folded) want.SysReg[4] += k.memcycle;
         const bool mem_ok = st.memcycle == (folded ? 0 : k.memcycle);
 #else
         const bool mem_ok = st.memcycle == k.memcycle;
 #endif
-        const u32 ran = k.budget - st.chain_budget + 1;
-        if (!same(st, want) || ran != k.expect || !mem_ok || st.chain_cur != reinterpret_cast<uintptr_t>(blk[k.expect - 1]) ||
-            (k.budget == 0 && st.chain_budget != 0)) {
-          YuiMsg("jit_dispatch_test_failed budget=%u exit=%u mem=%u level=%u loop=%u ran=%u pc=%08x want=%08x",
-                 k.budget, k.exitcount, k.memcycle, k.level, unsigned(k.loop), ran, st.SysReg[3], want.SysReg[3]);
+        const u32 ran = st.chain_budget + 1;
+        if (!same(st, want) || ran != k.expect || !mem_ok || st.chain_cur != reinterpret_cast<uintptr_t>(blk[k.expect - 1])) {
+          YuiMsg("jit_dispatch_test_failed chain=%u exit=%u mem=%u level=%u loop=%u ran=%u pc=%08x want=%08x",
+                 unsigned(k.chain), k.exitcount, k.memcycle, k.level, unsigned(k.loop), ran, st.SysReg[3], want.SysReg[3]);
           ok = false;
         }
       }

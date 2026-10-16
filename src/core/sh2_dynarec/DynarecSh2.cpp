@@ -50,7 +50,7 @@ static_assert(offsetof(tagSH2, exitcount) == 128 && offsetof(tagSH2, spec_bail) 
               offsetof(tagSH2, dispatch) == 144 && offsetof(tagSH2, chain_budget) == 148 &&
               offsetof(tagSH2, chain_table) == 152 && offsetof(tagSH2, chain_cur) == 156 &&
               offsetof(tagSH2, memcycle) == 160 && offsetof(tagSH2, macw_saturate) == 164 &&
-              offsetof(tagSH2, macl_saturate) == 168,
+              offsetof(tagSH2, macl_saturate) == 168 && offsetof(tagSH2, chain_limit) == 172,
               "offsets used by generated code and dynalib_arm.s");
 static_assert(offsetof(Block, code) == 0 && offsetof(Block, b_addr) == 4 && offsetof(Block, flags) == 16 &&
               offsetof(Block, link_pc) == 28 && BLOCK_LOOP == 1, "Block layout used by sh2_dispatch and link stubs");
@@ -972,30 +972,24 @@ void CompileBlocks::Init()
 #endif
 #ifdef VITA_SH2_LINK
   if (!link_check) {
-    // Called by linked exits (BL): the checks of sh2_dispatch before its
-    // lookup, in the same order, leaving r0 and ip untouched, except the
-    // BLOCK_LOOP test: only non-loop blocks link their exits, and with a
-    // nonzero budget chain_cur is always the block running. Returns with
-    // r1 = the decremented chain budget when the next block may be entered,
-    // otherwise continues into the dispatcher (which then returns to C)
-    // through BX LR: that consumes the return-stack entry of the BL, so the
-    // dispatcher's return to C and the C returns after it stay predicted.
+    // Called by linked exits (BL): sh2_dispatch's count and memory-cycle
+    // checks before its lookup, leaving r0 and ip untouched. chain_limit is 0
+    // whenever an interrupt may be acceptable (blocks writing SR never link),
+    // and only non-loop blocks link their exits, so with a nonzero limit
+    // chain_cur is always the block running. Returns with r1 = the
+    // incremented chain count when the next block may be entered, otherwise
+    // continues into the dispatcher (which then returns to C) through BX LR:
+    // that consumes the return-stack entry of the BL, so the dispatcher's
+    // return to C and the C returns after it stay predicted.
     static const u32 check[] = {
-      0xe5971094u,  // ldr   r1,[r7,#148]  chain_budget
-      0xe5972080u,  // ldr   r2,[r7,#128]  exitcount
-      0xe2511001u,  // subs  r1,r1,#1
-      0x3a000009u,  // blo   exit          budget was 0
-      0xe1590002u,  // cmp   r9,r2
-      0x2a000007u,  // bhs   exit          count reached
-      0xe5972040u,  // ldr   r2,[r7,#64]   SR
-      0xe5973060u,  // ldr   r3,[r7,#96]   pending interrupt level
-      0xe20220f0u,  // and   r2,r2,#0xF0
-      0xe1520003u,  // cmp   r2,r3
-      0x3a000002u,  // blo   exit          interrupt acceptable
-      0xe59720a0u,  // ldr   r2,[r7,#160]  memcycle_
-      0xe3520000u,  // cmp   r2,#0
-      0x012fff1eu,  // bxeq  lr            no memory cycles to account
-      0xe597e090u,  // exit: ldr lr,[r7,#144]
+      0xe59720acu,  // ldr   r2,[r7,#172]  chain_limit
+      0xe59730a0u,  // ldr   r3,[r7,#160]  memcycle_
+      0xe5971094u,  // ldr   r1,[r7,#148]  chain count
+      0xe1590002u,  // cmp   r9,r2         count reached, or no chaining
+      0x33530001u,  // cmpcc r3,#1         memory cycles to account
+      0xe2811001u,  // add   r1,r1,#1
+      0x312fff1eu,  // bxcc  lr
+      0xe597e090u,  // ldr   lr,[r7,#144]
       0xe12fff1eu,  // bx    lr
     };
     static_assert(sizeof(check) <= vitacode::Layout::Stubs, "link check fits the stub area");
@@ -1362,11 +1356,11 @@ int CompileBlocks::SmcSlot(u32 pc) {
 /* Exit into a statically known high-RAM PC, in place of BLOCK_RETURN once the
  * exit has stored the PC (held in pc_reg) and the count. Unlinked, word 0 is
  * BLOCK_RETURN. PatchLink makes word 0 BL link_check (sh2_dispatch's checks;
- * r1 = decremented budget), words 1-2 the target Block and word 9 a branch to
+ * r1 = incremented chain count), words 1-2 the target Block and word 9 a branch to
  * its body past the reload of r8/r9. The target is entered only while its
  * link_pc equals the PC, i.e. while sh2_dispatch's lookup would return it;
  * otherwise word 10 continues into sh2_dispatch.
- *   0 ldr pc,[r7,#144] | bl link_check    6 str r1,[r7,#148]  chain_budget
+ *   0 ldr pc,[r7,#144] | bl link_check    6 str r1,[r7,#148]  chain count
  *   1 movw r2,#block                      7 str r2,[r7,#156]  chain_cur
  *   2 movt r2,#block                      8 mov r8,pc_reg
  *   3 ldr r3,[r2,#28]  link_pc            9 b 10 | b target body
@@ -2588,8 +2582,15 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
   // recompile it): drop what an earlier pass registered first.
   UnlinkSlot(int(page - dCode));
   // BLOCK_LOOP blocks never chain (sh2_dispatch returns to C after them);
-  // poll fusion replaced the code the exits were recorded in.
-  if (!debug_mode_ && !(page->flags & (BLOCK_LOOP | BLOCK_POLL_FUSED))) {
+  // poll fusion replaced the code the exits were recorded in. A block writing
+  // SR (LDC SR ends it) may unmask a pending interrupt, which link_check does
+  // not test: its exits go through sh2_dispatch.
+  bool writes_sr = false;
+  for (u32 a = page->b_addr; a <= page->e_addr && !writes_sr; a += 2) {
+    const u16 w = MappedMemoryReadWord(a, NULL);
+    writes_sr = (w & 0xF0FF) == 0x400e || (w & 0xF0FF) == 0x4007 || w == 0x002b;
+  }
+  if (!debug_mode_ && !writes_sr && !(page->flags & (BLOCK_LOOP | BLOCK_POLL_FUSED))) {
     const int slot = int(page - dCode);
     for (unsigned k = 0; k < link_count; ++k) {
       link_out[slot][k] = links[k];
@@ -2672,7 +2673,7 @@ DynarecSh2::DynarecSh2() : m_pDynaSh2(new tagSH2()), memcycle_(m_pDynaSh2->memcy
   m_pDynaSh2->macl_saturate = (uintptr_t)&sh2_macl_saturate;
 #endif
 #ifdef VITA_SH2_NATIVE_DISPATCH
-  m_pDynaSh2->dispatch = (uintptr_t)&sh2_dispatch;  // chain_budget 0 = plain return
+  m_pDynaSh2->dispatch = (uintptr_t)&sh2_dispatch;  // chain_limit 0 = plain return
 #endif
 
   m_pCompiler = CompileBlocks::getInstance();
@@ -3579,18 +3580,19 @@ void DynarecSh2::ExecuteCountLeanFull(u32 Count) {
         slice_dirty = true;
         if (spin_rec) { spin_rec = false; spin_candidate_ = false; ++g_prof_spin[2]; }
       }
-      // Chain at most up to the next sampled (ExecuteBlock) call; recording
-      // observes every block boundary.
+      // Recording observes every block boundary.
 #ifdef VITA_SH2_SPIN_VERIFY
-      const u32 budget = (spin_rec || spin_pred) ? 0u : 1023u - (u32(returns) & 1023u);
+      const bool chain = !(spin_rec || spin_pred);
 #else
-      const u32 budget = spin_rec ? 0u : 1023u - (u32(returns) & 1023u);
+      const bool chain = !spin_rec;
 #endif
 #else
-      // Chain at most up to the next sampled (ExecuteBlock) call.
-      const u32 budget = 1023u - (u32(returns) & 1023u);
+      const bool chain = true;
 #endif
-      st->chain_budget = budget;
+      // No chaining past an acceptable interrupt: link_check does not test
+      // it (AddInterrupt clears the limit while the block runs).
+      st->chain_budget = 0;
+      st->chain_limit = chain && !((st->CtrlReg[0] & 0xF0) < st->SysReg[5]) ? st->exitcount : 0;
       st->chain_cur = reinterpret_cast<uintptr_t>(block);
 #endif
 #ifdef VITA_STACK_PROFILE
@@ -3629,10 +3631,10 @@ void DynarecSh2::ExecuteCountLeanFull(u32 Count) {
         const Block *last = reinterpret_cast<const Block *>(st->chain_cur);
         const u32 npc = st->SysReg[3];
         const Block *next = (npc & 0xfff00000u) == 0x06000000u && !(npc & 1) ? high[(npc & 0xfffffu) >> 1] : nullptr;
-        const unsigned why = st->chain_budget == 0 ? 0 : st->SysReg[4] >= st->exitcount ? 1 :
+        const unsigned why = !chain ? 0 : st->SysReg[4] >= st->exitcount ? 1 :
           (st->CtrlReg[0] & 0xF0) < st->SysReg[5] ? 2 : memcycle_ ? 3 : (last->flags & BLOCK_LOOP) ? 4 :
           (npc & 0xfff00000u) != 0x06000000u ? 5 : !next ? 6 : 7;
-        ++g_prof_dispatch[why]; g_prof_dispatch[8] += budget - st->chain_budget;
+        ++g_prof_dispatch[why]; g_prof_dispatch[8] += st->chain_budget;
       }
 #endif
 #ifdef VITA_SH2_SPIN_REASONS
@@ -3640,13 +3642,13 @@ void DynarecSh2::ExecuteCountLeanFull(u32 Count) {
         const Block *last = reinterpret_cast<const Block *>(st->chain_cur);
         const u32 npc = st->SysReg[3];
         const Block *next = (npc & 0xfff00000u) == 0x06000000u && !(npc & 1) ? high[(npc & 0xfffffu) >> 1] : nullptr;
-        const unsigned why = st->chain_budget == 0 ? 0 : st->SysReg[4] >= st->exitcount ? 1 :
+        const unsigned why = !chain ? 0 : st->SysReg[4] >= st->exitcount ? 1 :
           (st->CtrlReg[0] & 0xF0) < st->SysReg[5] ? 2 : memcycle_ ? 3 : (last->flags & BLOCK_LOOP) ? 4 :
           (npc & 0xfff00000u) != 0x06000000u ? 5 : !next ? 6 : 7;
-        u32 *w = g_chain_why[is_slave_ ? 1 : 0]; ++w[why]; w[8] += budget - st->chain_budget;
+        u32 *w = g_chain_why[is_slave_ ? 1 : 0]; ++w[why]; w[8] += st->chain_budget;
       }
 #endif
-      if (const u32 chained = budget - st->chain_budget) {
+      if (const u32 chained = st->chain_budget) {
         // sh2_dispatch entered `chained` further blocks; the checks below
         // concern the last one, exactly as if C had dispatched each.
         returns += chained;
@@ -3690,7 +3692,7 @@ void DynarecSh2::ExecuteCountLeanFull(u32 Count) {
       spin_rec = false; slice_dirty = true;
 #endif
 #ifdef VITA_SH2_NATIVE_DISPATCH
-      st->chain_budget = 0;
+      st->chain_limit = 0;
 #endif
       result = ExecuteBlock(block);
       returns = native_returns;
@@ -3699,7 +3701,7 @@ void DynarecSh2::ExecuteCountLeanFull(u32 Count) {
       spin_rec = false; slice_dirty = true;
 #endif
 #ifdef VITA_SH2_NATIVE_DISPATCH
-      st->chain_budget = 0;
+      st->chain_limit = 0;
 #endif
       result = Execute();
     }
@@ -3995,7 +3997,7 @@ void DynarecSh2::ExecuteCountLeanFull(u32 Count) {
     ++vita_diag_exec_n[is_slave_ ? 1 : 0]; }
 #endif
 #ifdef VITA_SH2_NATIVE_DISPATCH
-  st->chain_budget = 0;  // other entry paths return plainly
+  st->chain_limit = 0;  // other entry paths return plainly
 #endif
   CurrentSH2->cycles = st->SysReg[4];
   counted_slice_active_ = false;
@@ -4511,6 +4513,7 @@ void DynarecSh2::RemoveInterrupt(u8 Vector, u8 level) {
   else {
     m_pDynaSh2->SysReg[5] = 0x0000;
   }
+  m_pDynaSh2->chain_limit = 0;
   IntcUnlock(mtx_);
 }
 
@@ -4535,6 +4538,7 @@ void DynarecSh2::AddInterrupt( u8 Vector, u8 level )
   }
   m_bIntruptSort = true;
   m_pDynaSh2->SysReg[5] = m_IntruptTbl.begin()->level<<4;
+  m_pDynaSh2->chain_limit = 0;   // linked exits stop at the next block boundary
   IntcUnlock(mtx_);
 }
 
