@@ -274,7 +274,7 @@ typedef struct _YglCacheHash {
 
 #include "../video/opengl/atlas_extent.h"
 #include "../video/opengl/atlas_snapshot.h"
-typedef struct {
+typedef struct YglTextureManager {
   YglAtlasExtent vita_cpu_extent;
   YglAtlasSnapshot vita_snapshot;
 	unsigned int currentX;
@@ -288,6 +288,10 @@ typedef struct {
 	YglCacheHash CashLink[HASHSIZE * 2];
 	u32 CashLink_index;
 	u64 vita_cache_sig; /* order-dependent digest of every YglCacheAdd since the reset */
+	/* Adds whose results CashLink_index and vita_cache_sig already include;
+	 * vita_cache_flush makes them before the table is next used. */
+	unsigned vita_cache_pending;
+	void (*vita_cache_flush)(struct YglTextureManager *tm);
 
 	//GLuint textureID;
 	//GLuint pixelBufferID;

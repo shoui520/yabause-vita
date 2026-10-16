@@ -3801,7 +3801,7 @@ static void Vdp2PatternAddrPos(vdp2draw_struct *info, int planex, int x, int pla
       info->pagewh*y +
       x)*info->patterndatasize * 2;
 #ifdef VITA_VDP2_LAYER_REPLAY
-  if (vdp2_layer_rec) Vdp2ReplayRead(addr, info->patterndatasize * 2);
+  if (vdp2_layer_rec) Vdp2ReplayReadName(addr, info->patterndatasize * 2);
 #endif
 
   switch (info->patterndatasize)
@@ -4749,6 +4749,9 @@ static void Vdp2DrawMapTest(vdp2draw_struct *info, YglTexture *texture) {
 #ifdef VITA_VDP2_LAYER_REPLAY
   YglTextureManager *const replay_tm = _Ygl->texture_manager;
   Vdp2LayerRecord *replay_rec = NULL, *replay_hit = NULL;
+#ifdef VITA_VDP2_LAYER_REPLAY_VERIFY
+  Vdp2LayerRecord *replay_names = NULL;
+#endif
   if (Vdp2ReplayEligible(info)) {
     int key[VDP2_REPLAY_KEY_INTS];
     Vdp2ReplayKey(info, key);
@@ -4759,8 +4762,25 @@ static void Vdp2DrawMapTest(vdp2draw_struct *info, YglTexture *texture) {
 #endif
 #ifdef VITA_VDP2_LAYER_REPLAY_VERIFY
     replay_rec = replay_hit ? &vdp2_replay_check : Vdp2ReplaySlot(info->id);
+    if (!replay_hit) {
+      /* Patch and draw, then walk over it and compare. */
+      replay_names = Vdp2ReplayFindNames(info->id, key, replay_tm);
+      if (replay_names && Vdp2ReplayNames(replay_names, info, texture, replay_tm)) replay_rec = &vdp2_replay_check;
+      else replay_names = NULL;
+    }
+    if (replay_hit && replay_hit->patched)
+      Vdp2ReplaySaveTexels(replay_hit, replay_tm, info->patternpixelwh, (int)info->lineinc);
 #else
     if (replay_hit) { Vdp2ReplayEmit(replay_hit, info, replay_tm); return; }
+    {
+      Vdp2LayerRecord *names = Vdp2ReplayFindNames(info->id, key, replay_tm);
+      if (names && Vdp2ReplayNames(names, info, texture, replay_tm)) {
+#ifdef VITA_STACK_PROFILE
+        static unsigned np; if (!(++np & 15)) YuiMsg("vdp2_layer_replay names=%u", np);
+#endif
+        return;
+      }
+    }
     replay_rec = Vdp2ReplaySlot(info->id);
 #endif
     Vdp2ReplayBegin(replay_rec, info, key, replay_tm);
@@ -4837,6 +4857,10 @@ static void Vdp2DrawMapTest(vdp2draw_struct *info, YglTexture *texture) {
       info->PlaneAddr(info, info->mapwh * mapy + mapx, fixVdp2Regs);
       Vdp2PatternAddrPos(info, planex, pagex, planey, pagey);
       VT_STACK_END();
+#ifdef VITA_VDP2_LAYER_REPLAY
+      if (vdp2_layer_rec)
+        Vdp2ReplayAddPos(info->mapwh * mapy + mapx, planex, pagex, planey, pagey, h - charx, v - chary);
+#endif
       Vdp2DrawPatternPos(info, texture, h - charx, v - chary, 0, 0, info->lineinc);
 #ifdef VITA_STACK_PROFILE
       ++dm_cells[info->id & 7];
@@ -4852,12 +4876,20 @@ static void Vdp2DrawMapTest(vdp2draw_struct *info, YglTexture *texture) {
 #ifdef VITA_VDP2_LAYER_REPLAY_VERIFY
     if (replay_hit) {
       static unsigned verify[2];
-      ++verify[!Vdp2ReplaySame(replay_hit, replay_rec)];
+      ++verify[!(replay_hit->patched
+                     ? Vdp2ReplayNamesSame(replay_hit, replay_rec, replay_tm, info->patternpixelwh, (int)info->lineinc, 1)
+                     : Vdp2ReplaySame(replay_hit, replay_rec))];
       if (!((verify[0] + verify[1]) & 63))
         YuiMsg("vdp2_layer_replay_verify match=%u mismatch=%u", verify[0], verify[1]);
       const Vdp2LayerRecord fresh = *replay_rec;
       *replay_rec = *replay_hit;
       *replay_hit = fresh;
+    }
+    if (replay_names) {
+      static unsigned verify[2];
+      ++verify[!Vdp2ReplayNamesSame(replay_names, replay_rec, replay_tm, info->patternpixelwh, (int)info->lineinc, 0)];
+      if (!((verify[0] + verify[1]) & 15))
+        YuiMsg("vdp2_layer_replay_verify names match=%u mismatch=%u", verify[0], verify[1]);
     }
 #endif
   }

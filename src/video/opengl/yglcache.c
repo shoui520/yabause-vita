@@ -67,6 +67,7 @@ static YglCacheHash * YglgetNewCash(YglTextureManager * tm) {
 int YglIsCached(YglTextureManager * tm, u64 addr, YglCache * c) {
 
   u32 hashkey;
+  if (tm->vita_cache_pending) tm->vita_cache_flush(tm);
   hashkey = YglgetHash(addr);  /* get hash */
 
   if (tm->HashTable[hashkey] == NULL) {  /* Empty Hash */
@@ -94,6 +95,7 @@ void YglCacheAdd(YglTextureManager * tm, u64 addr, YglCache * c) {
 
   u32 hashkey;
   YglCacheHash *add;
+  if (tm->vita_cache_pending) tm->vita_cache_flush(tm);
   hashkey = YglgetHash(addr);
   {
     u32 xy[2];
@@ -138,6 +140,7 @@ void YglCacheReset(YglTextureManager * tm) {
 	memset(tm->HashTable, 0, sizeof(tm->HashTable));
 	tm->CashLink_index = 0;
 	tm->vita_cache_sig = 0;
+	tm->vita_cache_pending = 0;
 }
 
 //////////////////////////////////////////////////////////////////////////////
