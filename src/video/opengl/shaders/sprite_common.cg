@@ -22,7 +22,7 @@ uniform int u_fbohegiht; // Preserve upstream uniform spelling.
 #ifdef SPRITE_FETCH
 float4 YglSprite(float4 v_texcoord, float4 v_vtxcolor, float4 destination) {
 #else
-float4 main(float4 v_texcoord : TEXCOORD0, float4 v_vtxcolor : COLOR0,
+float4 main(float4 v_texcoord : TEXCOORD0, float4 v_vtxcolor : TEXCOORD1,
             float4 pixel : WPOS) : COLOR {
 #endif
   float4 color = tex2D(SPRITE_TEXTURE, v_texcoord.xy / v_texcoord.w);
@@ -63,7 +63,7 @@ float4 main(float4 v_texcoord : TEXCOORD0, float4 v_vtxcolor : COLOR0,
   return color;
 }
 #ifdef SPRITE_FETCH
-__nativecolor __regformat unsigned char4 main(float4 v_texcoord : TEXCOORD0, float4 v_vtxcolor : COLOR0,
+__nativecolor __regformat unsigned char4 main(float4 v_texcoord : TEXCOORD0, float4 v_vtxcolor : TEXCOORD1,
                                               __regformat unsigned char4 target : FRAGCOLOR) {
   float4 color = YglSprite(v_texcoord, v_vtxcolor, float4(target) / 255.0f);
   // The snapshot path stored its float result through a half register before
