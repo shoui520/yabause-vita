@@ -1883,9 +1883,13 @@ static void ScspMixBeginFrom(u32 left) {
   atomic_store_explicit(&scsp_mix_busy, 1, memory_order_release);
 }
 static void ScspMixBegin(void) { ScspMixBeginFrom(cdda_out_left); }
+static int ScspCddaPendHeld(void);
+static void ScspCddaPendRelease(void);
 static void ScspDeferApply(void) {
-  for (unsigned i = 0; i < cdda_pend_n; ++i) ScspCddaAppend(cdda_pend[i]);
-  cdda_pend_n = 0;
+  if (!ScspCddaPendHeld()) {
+    for (unsigned i = 0; i < cdda_pend_n; ++i) ScspCddaAppend(cdda_pend[i]);
+    cdda_pend_n = 0;
+  }
   const unsigned n = defer_n;
   defer_n = 0;
   for (unsigned i = 0; i < n; ++i)
@@ -1895,8 +1899,16 @@ static void ScspDeferApply(void) {
       default: SoundRamWriteLong(defer_log[i].addr, defer_log[i].val); break;
     }
 }
+/* At VBlank-in: sectors kept for an early frame's mix stay kept. */
+void ScspDeferFlushVBlank(void) {
+  if (!defer_n && !cdda_pend_n) return;
+  if (atomic_load_explicit(&scsp_mix_busy, memory_order_acquire)) ++g_scsp_defer_waits;
+  ScspWaitMix();
+  ScspDeferApply();
+}
 void ScspDeferFlush(void) {
   if (!defer_n && !cdda_pend_n) return;
+  ScspCddaPendRelease();
   if (atomic_load_explicit(&scsp_mix_busy, memory_order_acquire)) ++g_scsp_defer_waits;
   ScspWaitMix();
   ScspDeferApply();
@@ -1943,7 +1955,7 @@ int ScspCpuSliceIsQuiescent(void) {
  * a completed frame is committed and the SH-2s go on without waiting. */
 enum { EARLY_IDLE, EARLY_REQUESTED, EARLY_RUNNING, EARLY_DONE, EARLY_ABORT,
        EARLY_COMMIT, EARLY_BLOCKED };
-enum { EARLY_START_LINE = 8, EARLY_LAST_LINE = 200, EARLY_QUIET_LINES = 8 };
+enum { EARLY_START_LINE = 8, EARLY_LAST_LINE = 200, EARLY_QUIET_LINES = 16 };
 static _Atomic int early_state;
 /* Set by the worker once the snapshot of its running frame is complete and
  * cleared before that frame commits or rolls back: while set, the snapshot
@@ -1955,14 +1967,45 @@ static int early_in_frame, early_self_abort;   /* worker only */
 #if defined(VITA_SCSP_DEFER_MAIN_WRITES) && !defined(VITA_M68K_NATIVE_EXECUTION)
 /* The worker mixes a finished early frame while it waits for VBlank-in
  * instead of after the commit, so a short next frame need not wait for that
- * mix. The mix reads the CDDA ring as it is at VBlank-in, so it is only
- * tried while no CD audio plays, and a sector delivered from then until the
- * frame commits cancels the frame first (cdda_delivering and early_spec form
+ * mix. The mix reads the CDDA ring as it would at VBlank-in: a CD audio
+ * sector delivered from then until the frame commits is kept for after the
+ * mix when the mix reads none of it (the ring held a whole frame and the
+ * sector overwrites nothing unread), with its CD timing decided as before the
+ * mix; any other cancels the frame first (cdda_delivering and early_spec form
  * a Dekker pair). A rollback also restores what the mix moved. */
 #define VITA_SCSP_EARLY_MIX
 static _Atomic int early_spec, cdda_delivering;
 static int early_mixed;                         /* worker only */
 static u32 early_cdda_left0, early_genpos0, early_outleft0;
+static int cdda_pend_spec;                      /* main only: pends precede the mix */
+static void ScspEarlyCancel(void);
+static void ScspCddaTiming(u32 left);
+/* Kept sectors precede a mix that may be running: they wait for its commit. */
+static int ScspCddaPendHeld(void) {
+  if (cdda_pend_spec && atomic_load(&early_spec)) return 1;
+  cdda_pend_spec = 0;
+  return 0;
+}
+static void ScspCddaPendRelease(void) {
+  if (!cdda_pend_spec) return;
+  ScspEarlyCancel();
+  cdda_pend_spec = 0;
+}
+static int ScspCddaPendSpec(const u8 *sector) {
+  const u32 n = cdda_pend_n, left = early_cdda_left0 + n * 2352;
+  if (n >= CDDA_PEND_MAX || (n && !cdda_pend_spec) || early_cdda_left0 / 4 < scspsoundlen ||
+      left + 2352 > sizeof(cddabuf.data))
+    return 0;
+  ScspCddaTiming(left);
+  memcpy(cdda_pend[n], sector, 2352);
+  cdda_pend_n = n + 1;
+  cdda_pend_spec = 1;
+  ++g_scsp_defer_sectors;
+  return 1;
+}
+#elif defined(VITA_SCSP_DEFER_MAIN_WRITES)
+static int ScspCddaPendHeld(void) { return 0; }
+static void ScspCddaPendRelease(void) {}
 #endif
 /* 4 KB sound RAM pages written since the early frame's snapshot; every
  * writer reports through M68KWriteNotify. A rollback restores only these. */
@@ -2058,8 +2101,13 @@ int ScspEarlyCommit(void) {
     case EARLY_DONE:
 #ifdef VITA_SCSP_EARLY_MIX
       /* The worker may be mixing: its CDDA ring is read only as it was. */
-      if (atomic_load(&early_spec)) ScspMixBeginFrom(early_cdda_left0);
-      else
+      if (atomic_load(&early_spec)) {
+        ScspMixBeginFrom(early_cdda_left0);
+        if (cdda_pend_spec) {
+          cdda_virtual_left = cdda_after_mix + cdda_pend_n * 2352;
+          cdda_pend_spec = 0;
+        }
+      } else
 #endif
 #ifdef VITA_SCSP_DEFER_MAIN_WRITES
       ScspMixBegin();
@@ -6318,7 +6366,13 @@ ScspReceiveCDDA (const u8 *sector)
 {
 #ifdef VITA_SCSP_EARLY_MIX
   atomic_store(&cdda_delivering, 1);
-  if (atomic_load(&early_spec)) ScspEarlyCancel();
+  if (atomic_load(&early_spec)) {
+    if (!atomic_load_explicit(&scsp_mix_busy, memory_order_acquire) && ScspCddaPendSpec(sector)) {
+      atomic_store_explicit(&cdda_delivering, 0, memory_order_release);
+      return;
+    }
+    ScspEarlyCancel();
+  }
   ScspReceiveCDDAOne(sector);
   atomic_store_explicit(&cdda_delivering, 0, memory_order_release);
 }
@@ -6537,15 +6591,11 @@ static int ScspEarlyRun(void) {
   early_in_frame = 0;
   if (early_self_abort) goto rollback;
 #ifdef VITA_SCSP_EARLY_MIX
-  if (!Cs2Area->isaudio) {
-    atomic_store(&early_spec, 1);
-    if (atomic_load(&cdda_delivering)) atomic_store(&early_spec, 0);
-    else {
-      early_cdda_left0 = cdda_out_left;
-      early_genpos0 = scspsoundgenpos;
-      early_outleft0 = scspsoundoutleft;
-    }
-  }
+  early_cdda_left0 = cdda_out_left;
+  early_genpos0 = scspsoundgenpos;
+  early_outleft0 = scspsoundoutleft;
+  atomic_store(&early_spec, 1);
+  if (atomic_load(&cdda_delivering)) atomic_store(&early_spec, 0);
 #endif
   s = EARLY_RUNNING;
   if (!atomic_compare_exchange_strong(&early_state, &s, EARLY_DONE)) goto rollback;

@@ -834,7 +834,7 @@ int YabauseEmulate(void) {
 
 #if defined(ASYNC_SCSP)
 #ifdef VITA_SCSP_DEFER_MAIN_WRITES
-            ScspDeferFlush();   /* the 68000's frame reads sound RAM */
+            ScspDeferFlushVBlank();   /* the 68000's frame reads sound RAM */
 #endif
             setM68kCounter((u64)(44100 * 256 / 60) << SCSP_FRACTIONAL_BITS);
 #endif
