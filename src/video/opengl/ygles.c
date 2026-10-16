@@ -1981,11 +1981,13 @@ static void YglMemoryReport(const char *why) {
  * hardware between 32769 and 65535 (a 98850-vertex VDP1 batch drew only its
  * start); every slot stays at or under this many vertices. */
 #define YGL_DRAW_MAX_VERTICES 32768u
+extern float vdp1wratio, vdp1hratio;
 YglProgram * YglGetProgram( YglSprite * input, int prg, unsigned needed )
 {
    YglLevel   *level;
    YglProgram *program;
    float checkval;
+   int uclipmode = input->uclipmode;
 
    if (input->priority > 8) {
       VDP1LOG("sprite with priority %d\n", input->priority);
@@ -1995,17 +1997,24 @@ YglProgram * YglGetProgram( YglSprite * input, int prg, unsigned needed )
    level = &_Ygl->levels[input->priority];
 
    level->blendmode |= (input->blendmode&0x03);
-   if( input->uclipmode != level->uclipcurrent ||
-     (input->uclipmode !=0 && 
+   /* Drawing inside a user clip window that covers the whole framebuffer
+    * (exactly as its stencil rectangle below would) is drawing unclipped:
+    * no stencil pass, and the batch continues. */
+   if (uclipmode == 0x02 && Vdp1Regs->userclipX1 == 0 && Vdp1Regs->userclipY1 == 0 &&
+       (int)((float)(Vdp1Regs->userclipX2 + 1) * vdp1wratio) >= _Ygl->width &&
+       (int)((float)(Vdp1Regs->userclipY2 + 1) * vdp1hratio) >= _Ygl->height)
+     uclipmode = 0;
+   if( uclipmode != level->uclipcurrent ||
+     (uclipmode !=0 && 
     (level->ux1 != Vdp1Regs->userclipX1 || level->uy1 != Vdp1Regs->userclipY1 ||
     level->ux2 != Vdp1Regs->userclipX2 || level->uy2 != Vdp1Regs->userclipY2) )
      )
    {
-      if( input->uclipmode == 0x02 || input->uclipmode == 0x03 )
+      if( uclipmode == 0x02 || uclipmode == 0x03 )
       {
          if (YglProgramChange(level,PG_VFP1_STARTUSERCLIP) != 0) abort();
          program = &level->prg[level->prgcurrent];
-         program->uClipMode = input->uclipmode;
+         program->uClipMode = uclipmode;
          program->ux1=Vdp1Regs->userclipX1;
          program->uy1=Vdp1Regs->userclipY1;
          program->ux2=Vdp1Regs->userclipX2;
@@ -2017,9 +2026,9 @@ YglProgram * YglGetProgram( YglSprite * input, int prg, unsigned needed )
       }else{
          if (YglProgramChange(level,PG_VFP1_ENDUSERCLIP) != 0) abort();
          program = &level->prg[level->prgcurrent];
-         program->uClipMode = input->uclipmode;
+         program->uClipMode = uclipmode;
       }
-      level->uclipcurrent = input->uclipmode;
+      level->uclipcurrent = uclipmode;
 
    }
 
