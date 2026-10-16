@@ -207,8 +207,15 @@ void SH2DynDebugReset(SH2_struct *context) {
 
 void FASTCALL SH2DynExec(SH2_struct *context, u32 cycles){
   DynarecSh2* pctx = ((DynarecSh2*)context->ext);
+  // A nested run (the other CPU's input capture write runs this one for 32
+  // cycles) hands the context back, so the interrupted CPU's later helper
+  // memory cycles stay its own.
+  static int depth;
+  DynarecSh2 *const outer = DynarecSh2::CurrentContext;
   pctx->SetCurrentContext();
+  ++depth;
   pctx->ExecuteCount(cycles);
+  if (--depth) DynarecSh2::CurrentContext = outer;
 }
 
 void SH2DynSendInterrupt(SH2_struct *context, u8 vector, u8 level){
