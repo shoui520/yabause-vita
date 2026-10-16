@@ -3000,6 +3000,31 @@ int DynarecSh2::SpinAffineDetect(unsigned spin_n) {
 #endif
   return -1;
 }
+/* The recording's next block is a delay loop DT Rn; BF self with Rn = k > 1:
+ * the next k - 1 states are this one with Rn = k-1..1 (DT changes only Rn
+ * and T, and T stays 0 until Rn reaches 0), then the loop exits. Such a state
+ * repeats recorded state i only if i is this state with Rn = t < k (that
+ * match comes k - t blocks from now), and no affine proof can hold over it
+ * (DT is not ADD #imm,Rn). So when every match and the loop exit fall past
+ * kSpinRecMax blocks, the recording overflows: true. */
+bool DynarecSh2::SpinDelayOverflows(unsigned spin_n) const {
+  const u32 *now = spin_regs_[spin_n];
+  const u32 pc = now[22];
+  if (!HighWram || (pc & 0xDFF00000u) != 0x06000000u || (pc & 0xFFFFFu) > 0xFFFFCu) return false;
+  const u16 op = T2ReadWord(HighWram, pc & 0xFFFFFu);
+  if ((op & 0xF0FF) != 0x4010 || T2ReadWord(HighWram, (pc + 2) & 0xFFFFFu) != 0x8BFD) return false;
+  const unsigned n = (op >> 8) & 15;
+  const u32 k = now[n];
+  if (k < 2 || k > 0x10000u || (now[16] & 1u) || spin_n + k - 1 < kSpinRecMax) return false;
+  for (unsigned i = 0; i < spin_n; ++i) {
+    const u32 *r = spin_regs_[i];
+    if (r[22] != pc || r[n] == 0 || r[n] >= k) continue;
+    bool same = true;
+    for (int w = 0; w < 23 && same; ++w) if (w != int(n)) same = r[w] == now[w];
+    if (same && spin_n + k - r[n] <= kSpinRecMax) return false;
+  }
+  return true;
+}
 #ifdef VITA_SH2_IDLE_AFFINE
 /* True when every instruction in [b, e] references a register with a nonzero
  * delta only as ADD #imm,Rn to itself (register fields per format; branch
@@ -3780,6 +3805,8 @@ void DynarecSh2::ExecuteCountLeanFull(u32 Count) {
 #ifdef VITA_SH2_SPIN_AFFINE
         if (j < 0 && spin_n >= 2) { j = SpinAffineDetect(spin_n); affine = j >= 0; }
 #endif
+        if (j < 0 && spin_n < kSpinRecMax && SpinDelayOverflows(spin_n))
+          spin_n = kSpinRecMax;                    // the recording cannot succeed: end it as an overflow
         if (j >= 0) {
           // Blocks j+1..spin_n repeat forever; state after block q is
           // spin_regs_[q]; spin_n is equivalent to j. Step exactly as the
