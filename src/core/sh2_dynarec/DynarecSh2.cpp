@@ -3540,7 +3540,11 @@ void DynarecSh2::ExecuteCountLeanFull(u32 Count) {
 #endif
 #ifdef VITA_STACK_PROFILE
       VitaStackPush(is_slave_ ? VT_SH2_DISPATCH : VT_SH2_NATIVE);  // profile: slave native code shows as sh2_dispatch
+#ifdef VITA_STACK_PC_SLAVE
+      if (is_slave_) { vt_pc_off = offsetof(Block, b_addr); vt_pc_src = &st->chain_cur; }
+#else
       if (!is_slave_) { vt_pc_off = offsetof(Block, b_addr); vt_pc_src = &st->chain_cur; }
+#endif
       ((dynaFunc)((void*)(block->code)))(st);
       VitaStackPop();
 #elif defined(A9_PMU_REGIONS)

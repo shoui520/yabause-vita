@@ -222,7 +222,11 @@ static int vt_stack_sampler(SceSize args, void *argp) {
     unsigned d = vt_stack_depth;
     unsigned p = d ? vt_stack[(d > 64 ? 64 : d) - 1] : VT_PHASE_COUNT;
     ++vt_stack_hist[p < VT_PHASE_COUNT ? p : VT_PHASE_COUNT];
+#ifdef VITA_STACK_PC_SLAVE
+    if (p == VT_SH2_DISPATCH) vt_pc_sample();
+#else
     if (p == VT_SH2_NATIVE) vt_pc_sample();
+#endif
     if (p == VT_SH2_MEMORY) vt_mem_sample();
     d = vt_stack2_depth;
     p = d ? vt_stack2[(d > 64 ? 64 : d) - 1] : VT_PHASE_COUNT;
