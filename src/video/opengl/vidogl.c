@@ -6067,7 +6067,7 @@ found:;
  * leaving the copies as the per-dot calls would. */
 static INLINE int Vdp2RotationSpanLength(const RotationSplitJob *job, const RotationSplitRow *row, int ii) {
   const int hres = job->hres;
-  if ((fixVdp2Regs->WCTLD & 0xA) == 0) return hres - ii;
+  if (job->per_dot != 3 || (fixVdp2Regs->WCTLD & 0xA) == 0) return hres - ii;
   const vdp2draw_struct *info = &job->info;
   const int v = (int)row->j << info->hres_shift;
   if (info->pWinInfo[v].WinShowLine == 0) return hres - ii;
@@ -6497,7 +6497,9 @@ static int Vdp2RotationSplit(RBGDrawInfo *rbg, vdp2draw_struct *info, YglTexture
       }
     }
   }
-  const int spans = per_dot == 3 && paraA.deltaKAx == 0.0f && paraB.deltaKAx == 0.0f &&
+  /* Without a horizontal coefficient step, mode 3 keeps its parameter over
+   * window runs and mode 2 over whole rows. */
+  const int spans = (per_dot == 3 || per_dot == 2) && paraA.deltaKAx == 0.0f && paraB.deltaKAx == 0.0f &&
                     hstep == 1.0f && rbg->rotate_mval_h == 1.0f;
   u32 *out = texture->textdata;
   size_t out_stride = (size_t)rbg->hres + texture->w;
@@ -9745,21 +9747,7 @@ static void Vdp2DrawNBG1(void)
       infotmp.cellh = vdp2height;
       infotmp.flipfunction = 0;
       YglQuad(&infotmp, &texture, &tmpc);
-#ifdef VITA_STACK_PROFILE
-      { static uint64_t pl_fast, pl_gen; static unsigned pl_n;
-      vdp2draw_struct si = info; YglTexture st = texture;
-      vt_pl_mode = 4;
-      uint64_t t0 = sceKernelGetProcessTimeWide();
       Vdp2DrawMapPerLine(&info, &texture);
-      pl_gen += sceKernelGetProcessTimeWide() - t0;
-      info = si; texture = st; vt_pl_mode = 0;
-      t0 = sceKernelGetProcessTimeWide();
-      Vdp2DrawMapPerLine(&info, &texture);
-      pl_fast += sceKernelGetProcessTimeWide() - t0;
-      if ((++pl_n & 63) == 0) { YuiMsg("diag_perline1_ab calls=64 fast=%llu general=%llu\n", pl_fast, pl_gen); pl_fast = pl_gen = 0; } }
-#else
-      Vdp2DrawMapPerLine(&info, &texture);
-#endif
     }
     else {
       //Vdp2DrawMap(&info, &texture);
