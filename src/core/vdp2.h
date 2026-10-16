@@ -420,6 +420,15 @@ extern Vdp2Internal_struct Vdp2Internal;
 extern u64 lastticks;
 extern int vdp2_is_odd_frame;
 extern Vdp2 Vdp2Lines[270];
+#ifdef VITA_VDP2_LINE_VERSION
+/* Bumped by every change to Vdp2Regs except the HBlank bit of TVSTAT, which
+ * HBlank-in sets and HBlank-out clears before the line copy: a line whose
+ * Vdp2Lines row was made equal to Vdp2Regs at this version needs no compare. */
+extern u32 vdp2_regs_ver;
+#define VDP2_REGS_TOUCH() ((void)++vdp2_regs_ver)
+#else
+#define VDP2_REGS_TOUCH() ((void)0)
+#endif
 
 struct CellScrollData
 {

@@ -1123,6 +1123,10 @@ int main(int argc, char **argv) {
         YuiMsg("scsp_mix_gate waits=%u spins=%u us=%llu", g_scsp_mix_waits, g_scsp_mix_spins,
                (unsigned long long)(g_scsp_mix_wait_ticks * 1000000 / yabsys.tickfreq));
         g_scsp_mix_waits = g_scsp_mix_spins = 0; g_scsp_mix_wait_ticks = 0; }
+#ifdef VITA_VDP2_LINE_VERSION_VERIFY
+      { extern u32 vdp2_line_verify[2];
+        YuiMsg("vdp2_line_verify match=%u mismatch=%u", vdp2_line_verify[0], vdp2_line_verify[1]); }
+#endif
 #ifdef VITA_SCSP_DEFER_MAIN_WRITES
       { extern u32 g_scsp_defer_writes, g_scsp_defer_waits, g_scsp_defer_sectors;
         YuiMsg("scsp_defer writes=%u sectors=%u waits=%u", g_scsp_defer_writes, g_scsp_defer_sectors, g_scsp_defer_waits);

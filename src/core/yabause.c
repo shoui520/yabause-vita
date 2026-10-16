@@ -1163,6 +1163,7 @@ void YabauseSetVideoFormat(int type) {
    yabsys.OneFrameTime =
       type ? (yabsys.tickfreq / 50) : (yabsys.tickfreq * 1001 / 60000);
    Vdp2Regs->TVSTAT = Vdp2Regs->TVSTAT | (type & 0x1);
+   VDP2_REGS_TOUCH();
    ScspChangeVideoFormat(type);
    YabauseChangeTiming(yabsys.CurSH2FreqType);
    lastticks = YabauseGetTicks();
@@ -1270,6 +1271,7 @@ void YabauseSpeedySetup(void)
    Vdp1Regs->systemclipY2 = 223;
 
    // Set VDP2 registers to sane states
+   VDP2_REGS_TOUCH();   /* the assignments below follow at once, before any line */
    memset(Vdp2Regs, 0, sizeof(Vdp2));
    Vdp2Regs->TVMD = 0x8000;
    Vdp2Regs->TVSTAT = 0x020A;

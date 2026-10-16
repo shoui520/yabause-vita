@@ -112,6 +112,13 @@ u8 B1_Updated = 0;
 
 struct CellScrollData cell_scroll_data[270];
 Vdp2 Vdp2Lines[270];
+#ifdef VITA_VDP2_LINE_VERSION
+u32 vdp2_regs_ver = 1;
+static u32 vdp2_line_regs_ver[270];   /* 0: unknown */
+#ifdef VITA_VDP2_LINE_VERSION_VERIFY
+u32 vdp2_line_verify[2];              /* skipped lines that matched, mismatched */
+#endif
+#endif
 
 
 u32 skipped_frame = 0;
@@ -493,6 +500,9 @@ int Vdp2Init(void) {
       return -1;
 
    memset(Vdp2Lines, 0, sizeof(Vdp2) * 270);
+#ifdef VITA_VDP2_LINE_VERSION
+   memset(vdp2_line_regs_ver, 0, sizeof(vdp2_line_regs_ver));
+#endif
 
    Vdp2Reset();
 
@@ -545,6 +555,7 @@ void Vdp2DeInit(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 void Vdp2Reset(void) {
+   VDP2_REGS_TOUCH();
    VDP_TOUCH_ALL(vdp2_page_ver, 128, vdp2_touched);
    VDP_TOUCH_ALL(vdp2_line_ver, 270, lines_touched);
 #ifdef VITA_RENDER_THREAD
@@ -871,6 +882,7 @@ void vdp2VBlankIN(void) {
 
    VIDCore->Vdp2DrawEnd();
    VIDCore->Sync();
+   /* No version bump: VBlank-out clears the bit before any line is copied. */
    Vdp2Regs->TVSTAT |= 0x0008;
 
    ScuSendVBlankIN();
@@ -920,6 +932,7 @@ void Vdp2VBlankIN(void) {
 
    VIDCore->Vdp2DrawEnd();
    VIDCore->Sync();
+   /* No version bump: VBlank-out clears the bit before any line is copied. */
    Vdp2Regs->TVSTAT |= 0x0008;
 
    ScuSendVBlankIN();
@@ -969,11 +982,27 @@ void Vdp2HBlankOUT(void) {
     const u32 *row = reinterpret_cast<const u32 *>(Vdp2Lines + yabsys.LineCount);
     const u32 *regs = reinterpret_cast<const u32 *>(Vdp2Regs);
     u32 diff = 0;
+#ifdef VITA_VDP2_LINE_VERSION
+    if (vdp2_line_regs_ver[yabsys.LineCount] == vdp2_regs_ver) {
+#ifdef VITA_VDP2_LINE_VERSION_VERIFY
+      for (unsigned w = 0; w < sizeof(Vdp2) / 4; ++w) diff |= row[w] ^ regs[w];
+      ++vdp2_line_verify[diff != 0];
+      if (diff) {
+        memcpy(Vdp2Lines + yabsys.LineCount, Vdp2Regs, sizeof(Vdp2));
+        vdp2_line_ver[yabsys.LineCount] = lines_touched = vdp_snap_epoch;
+      }
+#endif
+    } else {
+      vdp2_line_regs_ver[yabsys.LineCount] = vdp2_regs_ver;
+#endif
     for (unsigned w = 0; w < sizeof(Vdp2) / 4; ++w) diff |= row[w] ^ regs[w];
     if (diff) {
       memcpy(Vdp2Lines + yabsys.LineCount, Vdp2Regs, sizeof(Vdp2));
       vdp2_line_ver[yabsys.LineCount] = lines_touched = vdp_snap_epoch;
     }
+#ifdef VITA_VDP2_LINE_VERSION
+    }
+#endif
 #else
     memcpy(Vdp2Lines + yabsys.LineCount, Vdp2Regs, sizeof(Vdp2));
 #endif
@@ -1251,6 +1280,7 @@ void dumpvram() {
 void restorevram() {
   FILE * fp = fopen("vdp2vram.bin", "rb");
   fread(Vdp2Regs, sizeof(Vdp2), 1, fp);
+  VDP2_REGS_TOUCH();
   fread(Vdp2Ram, 0x80000, 1, fp);
 #if defined(VITA_ROTATION_VRAM_REUSE) || defined(VITA_ROTATION_MAP_CACHE) || defined(VITA_ROTATION_PATTERN_CACHE)
   Vdp2AdvanceRamGeneration();
@@ -1570,6 +1600,9 @@ void Vdp2VBlankOUT(void) {
        vdp2_is_odd_frame = 1;
    }
 
+#ifdef VITA_VDP2_LINE_VERSION
+   if ((Vdp2Regs->TVSTAT & 0x0002) != (vdp2_is_odd_frame << 1)) VDP2_REGS_TOUCH();   /* ODD changes */
+#endif
    Vdp2Regs->TVSTAT = ((Vdp2Regs->TVSTAT & ~0x0008) & ~0x0002) | (vdp2_is_odd_frame << 1);
 
    ScuSendVBlankOUT();
@@ -1589,6 +1622,7 @@ void Vdp2SendExternalLatch(int hcnt, int vcnt)
    Vdp2Regs->HCNT = hcnt << 1;
    Vdp2Regs->VCNT = vcnt;
    Vdp2Regs->TVSTAT |= 0x200;
+   VDP2_REGS_TOUCH();
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1613,6 +1647,9 @@ u16 FASTCALL Vdp2ReadWord(u32 addr) {
      {
        // Latch HV counter on read
        // Vdp2Regs->HCNT = ?;
+#ifdef VITA_VDP2_LINE_VERSION
+       if (Vdp2Regs->VCNT != yabsys.LineCount || !(Vdp2Regs->TVSTAT & 0x200)) VDP2_REGS_TOUCH();
+#endif
        Vdp2Regs->VCNT = yabsys.LineCount;
        Vdp2Regs->TVSTAT |= 0x200;
      }
@@ -1623,6 +1660,9 @@ u16 FASTCALL Vdp2ReadWord(u32 addr) {
      u16 tvstat = Vdp2Regs->TVSTAT;
 
      // Clear External latch and sync flags
+#ifdef VITA_VDP2_LINE_VERSION
+     if (Vdp2Regs->TVSTAT & 0x0300) VDP2_REGS_TOUCH();
+#endif
      Vdp2Regs->TVSTAT &= 0xFCFF;
 
      // if TVMD's DISP bit is cleared, TVSTAT's VBLANK bit is always set
@@ -2080,6 +2120,7 @@ void FASTCALL Vdp2WriteByte(u32 addr, UNUSED u8 val) {
 
 void FASTCALL Vdp2WriteWord(u32 addr, u16 val) {
    addr &= 0x1FF;
+   VDP2_REGS_TOUCH();
 
    switch (addr)
    {
@@ -2577,6 +2618,7 @@ int Vdp2LoadState(FILE *fp, UNUSED int version, int size)
 
    // Read registers
    yread(&check, (void *)Vdp2Regs, sizeof(Vdp2), 1, fp);
+   VDP2_REGS_TOUCH();
 
    // Read VDP2 ram
    yread(&check, (void *)Vdp2Ram, 0x80000, 1, fp);

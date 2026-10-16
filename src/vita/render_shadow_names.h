@@ -179,6 +179,8 @@
 #define vdp1_page_ver rs_vdp1_page_ver
 #define vdp2_page_ver rs_vdp2_page_ver
 #define vdp2_line_ver rs_vdp2_line_ver
+#define vdp2_regs_ver rs_vdp2_regs_ver
+#define vdp2_line_verify rs_vdp2_line_verify
 #define vdp1_touched rs_vdp1_touched
 #define vdp2_touched rs_vdp2_touched
 #define cram_touched rs_cram_touched
