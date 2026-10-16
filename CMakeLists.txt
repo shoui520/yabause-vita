@@ -141,7 +141,9 @@ if(VITA_PGO STREQUAL "generate")
   add_compile_definitions(VITA_PGO_GENERATE)
 elseif(VITA_PGO STREQUAL "use")
   # main.c differs from the generate build (the dump call): its profile is dropped.
-  add_compile_options(-fprofile-use=${VITA_PGO_DIR} -fprofile-partial-training -Wno-missing-profile
+  # Worker threads update shared counters without atomics: -fprofile-correction
+  # repairs the resulting flow inconsistencies.
+  add_compile_options(-fprofile-use=${VITA_PGO_DIR} -fprofile-partial-training -fprofile-correction -Wno-missing-profile
     -Wno-error=coverage-mismatch)
 elseif(NOT VITA_PGO STREQUAL "")
   message(FATAL_ERROR "VITA_PGO must be empty, generate or use")
