@@ -52,6 +52,7 @@
         "VITA_TRIPLE_BUFFER": "ON",
         "VITA_VDP2_CELL_REUSE": "ON",
         "VITA_VDP2_LAYER_REPLAY": "ON",
+        "VITA_VDP1_SPRITE_CACHE": "ON",
         "VITA_VDP1_SPRITE_REUSE": "ON",
         "VITA_VDP2_FAST_CELL_MSB": "ON",
         "VITA_ROTATION_REUSE_PROBE": "OFF",

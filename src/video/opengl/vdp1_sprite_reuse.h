@@ -54,6 +54,64 @@ static inline Vdp1SpriteReuseRecord *Vdp1SpriteReuseSlot(Vdp1SpriteReuseRecord *
   return &records[victim];
 }
 
+/* Decoded sprites kept in cached RAM by their decode inputs (the reuse
+ * record's, with CCCTL). Moving 3D scenes allocate a sprite somewhere else
+ * every frame, so the rectangle match above fails; a hit here copies the
+ * texels into the new rectangle, which in video memory is a cheap write. */
+enum { SPRITE_CACHE_WAYS = 4, SPRITE_CACHE_SETS = 512, SPRITE_CACHE_BUDGET = 8 << 20,
+       SPRITE_CACHE_MAX_TEXELS = 256 * 256 };
+
+typedef struct {
+  uint32_t size, srca, pmod, colr, spctl, ccctl, ver;
+  unsigned used;             /* atlas frame of the last hit or store */
+  uint32_t *texels;          /* w * h, rows packed; NULL: empty */
+  uint32_t cap;              /* texels allocated */
+} Vdp1SpriteCacheEntry;
+
+typedef struct {
+  Vdp1SpriteCacheEntry e[SPRITE_CACHE_SETS * SPRITE_CACHE_WAYS];
+  size_t bytes;              /* allocated texels, bounded by the budget */
+} Vdp1SpriteCache;
+
+static inline int Vdp1SpriteCacheKeyEqual(const Vdp1SpriteCacheEntry *e, const Vdp1SpriteReuseRecord *q,
+                                          uint32_t ccctl) {
+  return e->texels && e->size == q->size && e->srca == q->srca && e->pmod == q->pmod && e->colr == q->colr &&
+    e->spctl == q->spctl && e->ccctl == ccctl && e->ver == q->ver;
+}
+
+/* The entry holding q's decode (*hit), else the one to store it in, with
+ * room for its texels; NULL when the budget has none. */
+static inline Vdp1SpriteCacheEntry *Vdp1SpriteCacheSlot(Vdp1SpriteCache *c, const Vdp1SpriteReuseRecord *q,
+                                                        uint32_t ccctl, unsigned now, int *hit) {
+  uint32_t a = q->srca * 0x9E3779B1u ^ q->size * 0x85EBCA77u ^ q->colr * 0xC2B2AE3Du ^ q->pmod;
+  a ^= a >> 15; a *= 0x2C1B3C6Du; a ^= a >> 12;
+  Vdp1SpriteCacheEntry *set = &c->e[(a & (SPRITE_CACHE_SETS - 1)) * SPRITE_CACHE_WAYS], *victim = set;
+  *hit = 0;
+  for (unsigned w = 0; w < SPRITE_CACHE_WAYS; ++w) {
+    Vdp1SpriteCacheEntry *e = &set[w];
+    if (Vdp1SpriteCacheKeyEqual(e, q, ccctl)) { *hit = 1; e->used = now; return e; }
+    if (!e->texels) { if (victim->texels) victim = e; }
+    else if (victim->texels && now - e->used > now - victim->used) victim = e;
+  }
+  const uint32_t need = (q->size & 0xFFFF) * (q->size >> 16);
+  if (!need || need > SPRITE_CACHE_MAX_TEXELS) return NULL;
+  if (victim->cap < need) {
+    if (c->bytes - (size_t)victim->cap * 4 + (size_t)need * 4 > SPRITE_CACHE_BUDGET) return NULL;
+    uint32_t *t = (uint32_t *)realloc(victim->texels, (size_t)need * 4);
+    if (!t) return NULL;
+    c->bytes += (size_t)(need - victim->cap) * 4;
+    victim->texels = t; victim->cap = need;
+  }
+  victim->size = 0;          /* empty until stored */
+  return victim;
+}
+
+static inline void Vdp1SpriteCacheStore(Vdp1SpriteCacheEntry *e, const Vdp1SpriteReuseRecord *q, uint32_t ccctl,
+                                        unsigned now) {
+  e->size = q->size; e->srca = q->srca; e->pmod = q->pmod; e->colr = q->colr;
+  e->spctl = q->spctl; e->ccctl = ccctl; e->ver = q->ver; e->used = now;
+}
+
 static inline int Vdp1SpriteReuseMatch(const Vdp1SpriteReuseRecord *r, const Vdp1SpriteReuseRecord *q,
                                        unsigned prev_frame) {
   return r->dst == q->dst && r->frame == prev_frame && r->gen == q->gen && r->size == q->size &&

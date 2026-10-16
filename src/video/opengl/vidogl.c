@@ -674,6 +674,20 @@ static void FASTCALL Vdp1ReadTextureInner(vdp1cmd_struct *cmd, YglSprite *sprite
 static unsigned vt_rt_hit, vt_rt_miss, vt_rt_why[5]; static uint64_t vt_rt_us, vt_rt_texels;
 extern unsigned vita_atlas_frame, vita_atlas_prev_frame;
 #endif
+#ifdef VITA_VDP1_SPRITE_REUSE
+/* The decode's side effects outside the texels, for a sprite not decoded. */
+static void Vdp1ReuseSideEffects(const vdp1cmd_struct *cmd) {
+  const int mode = (cmd->CMDPMOD >> 3) & 7;
+  const int msb = (cmd->CMDPMOD & 0x8000) != 0;
+  if (msb) _Ygl->msb_shadow_count_[_Ygl->drawframe]++;
+#ifdef VITA_VDP1_FAST_SPRITE
+  const int fast_rgb16 = (cmd->CMDPMOD & 0x80) && !msb && !(cmd->CMDPMOD & 0x40) && (fixVdp2Regs->SPCTL & 0x20);
+#else
+  const int fast_rgb16 = 0;
+#endif
+  if (mode == 5 && !fast_rgb16) ((u8 *)&fixVdp2Regs->CCRSA)[0] &= 0x1F;
+}
+#endif
 static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, YglTexture *texture)
 {
 #ifdef VITA_STACK_PROFILE
@@ -705,16 +719,7 @@ static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, Ygl
   }
 #ifndef VITA_VDP1_SPRITE_REUSE_VERIFY
   if (sprite_reused) {
-    /* The decode's side effects outside the texels. */
-    const int mode = (cmd->CMDPMOD >> 3) & 7;
-    const int msb = (cmd->CMDPMOD & 0x8000) != 0;
-    if (msb) _Ygl->msb_shadow_count_[_Ygl->drawframe]++;
-#ifdef VITA_VDP1_FAST_SPRITE
-    const int fast_rgb16 = (cmd->CMDPMOD & 0x80) && !msb && !(cmd->CMDPMOD & 0x40) && (fixVdp2Regs->SPCTL & 0x20);
-#else
-    const int fast_rgb16 = 0;
-#endif
-    if (mode == 5 && !fast_rgb16) ((u8 *)&fixVdp2Regs->CCRSA)[0] &= 0x1F;
+    Vdp1ReuseSideEffects(cmd);
     reuse_record->frame = reuse_query.frame;
 #ifdef VITA_STACK_PROFILE
     ++vt_rt_hit;
@@ -729,7 +734,45 @@ static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, Ygl
     for (u32 r = 0; r < verify_h; ++r) memcpy(kept + r * verify_w, verify_dst + r * verify_pitch, verify_w * 4);
 #endif
 #endif
+#ifdef VITA_VDP1_SPRITE_CACHE
+  static Vdp1SpriteCache *sprite_cache;
+  Vdp1SpriteCacheEntry *cache_entry = NULL;
+  int cache_hit = 0;
+  const uint32_t cache_ccctl = fixVdp2Regs->CCCTL;
+  if (reuse_record && !sprite_reused) {
+    if (!sprite_cache) sprite_cache = calloc(1, sizeof(*sprite_cache));
+    if (sprite_cache)
+      cache_entry = Vdp1SpriteCacheSlot(sprite_cache, &reuse_query, cache_ccctl, vita_atlas_frame, &cache_hit);
+  }
+  const u32 cache_w = sprite->w, cache_h = sprite->h, cache_pitch = texture->w + sprite->w;
+#ifndef VITA_VDP1_SPRITE_REUSE_VERIFY
+  if (cache_hit) {
+    for (u32 r = 0; r < cache_h; ++r)
+      memcpy(texture->textdata + r * cache_pitch, cache_entry->texels + r * cache_w, cache_w * 4);
+    Vdp1ReuseSideEffects(cmd);
+    *reuse_record = reuse_query;
+#ifdef VITA_STACK_PROFILE
+    ++vt_rt_hit;
+#endif
+    return;
+  }
+#else
+  if (cache_hit && !kept && (kept = malloc((size_t)verify_w * verify_h * 4)))
+    memcpy(kept, cache_entry->texels, (size_t)verify_w * verify_h * 4);
+  if (cache_hit) cache_entry = NULL;   /* decode into the atlas and compare */
+#endif
+#endif
   DIAG_T0(t);
+#ifdef VITA_VDP1_SPRITE_CACHE
+  if (cache_entry) {
+    /* Decode into the entry (cached RAM), then copy into the rectangle. */
+    YglTexture staged = { cache_entry->texels, 0 };
+    Vdp1ReadTextureInner(cmd, sprite, &staged);
+    for (u32 r = 0; r < cache_h; ++r)
+      memcpy(texture->textdata + r * cache_pitch, cache_entry->texels + r * cache_w, cache_w * 4);
+    Vdp1SpriteCacheStore(cache_entry, &reuse_query, cache_ccctl, vita_atlas_frame);
+  } else
+#endif
   Vdp1ReadTextureInner(cmd, sprite, texture);
 #ifdef VITA_STACK_PROFILE
   ++vt_rt_miss; vt_rt_texels += sprite->w * sprite->h;
