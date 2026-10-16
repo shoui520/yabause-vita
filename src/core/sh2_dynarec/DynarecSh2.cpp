@@ -2977,17 +2977,22 @@ int DynarecSh2::SpinAffineDetect(unsigned spin_n) {
   for (unsigned L = 1; 2 * L <= spin_n && L <= 16; ++L) {     // short periods only, as before recordings grew
     const unsigned k = spin_n - L, i = k - L;
     if (spin_hash_[k][1] != spin_hash_[spin_n][1] || spin_hash_[i][1] != spin_hash_[k][1]) continue; // R0, SR..PC: delta 0
+    // r1..r14 first: the lowest varying one must move by +-1, which most
+    // candidates fail; R0 and SR..PC must not vary at all.
+    const u32 *rk = spin_regs_[k], *ri = spin_regs_[i];
     u32 delta[23];
-    bool ok = true, any = false;
-    for (int w = 0; w < 23 && ok; ++w) {
-      delta[w] = spin_regs_[k][w] - spin_regs_[i][w];
-      if (delta[w] && (w == 0 || w >= 15)) ok = false;
-      if (delta[w]) any = true;
-    }
-    if (!ok || !any) continue;
     int d0 = -1;
-    for (int w = 1; w < 15; ++w) if (delta[w]) { d0 = w; break; }
-    if (delta[d0] != 1u && delta[d0] != 0xFFFFFFFFu) continue;
+    bool ok = true;
+    for (int w = 1; w < 15 && ok; ++w) {
+      delta[w] = rk[w] - ri[w];
+      if (delta[w] && d0 < 0) { d0 = w; ok = delta[w] == 1u || delta[w] == 0xFFFFFFFFu; }
+    }
+    if (!ok || d0 < 0) continue;
+    delta[0] = 0;
+    for (int w = 15; w < 23; ++w) delta[w] = 0;
+    if (rk[0] != ri[0]) continue;
+    for (int w = 15; w < 23 && ok; ++w) ok = rk[w] == ri[w];
+    if (!ok) continue;
     for (unsigned t = 0; t < L && ok; ++t) {
       for (int w = 0; w < 23; ++w)
         if (spin_regs_[k + t + 1][w] - spin_regs_[i + t + 1][w] != delta[w]) { ok = false; break; }
