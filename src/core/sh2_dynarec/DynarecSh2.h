@@ -134,7 +134,14 @@ typedef map<u32, CompileStaticsNode> MapCompileStatics;
 //****************************************************
 
 #include "../../vita/code_arena_layout.h"
+#ifdef VITA_SH2_PACKED_CODE
+// Packed code is placed at a cursor, not at slot * Stride: the slot count
+// only bounds the block metadata, so it is not limited to Sh2 / Stride.
+const int NUMOFBLOCKS = 16384;
+#else
 const int NUMOFBLOCKS = vitacode::Layout::Sh2Blocks;
+#endif
+static inline int NextBlockSlot(int slot) { return slot + 1 == NUMOFBLOCKS ? 0 : slot + 1; }
 //const int MAXBLOCKSIZE = 3072-(4*4);
 const int MAXBLOCKSIZE = vitacode::Layout::Block;
 #define MAINMEMORY_SIZE (0x100000);

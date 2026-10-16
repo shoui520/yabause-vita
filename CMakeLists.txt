@@ -1179,10 +1179,10 @@ if(VITA_SH2_ARENA_DISPATCH)
   endif()
   set_property(SOURCE src/core/sh2_dynarec/DynarecSh2.cpp APPEND PROPERTY COMPILE_DEFINITIONS VITA_SH2_ARENA_DISPATCH)
 endif()
-option(VITA_SH2_PACKED_CODE "Place SH-2 block code back to back in the arena instead of one 4 KiB slot per block" OFF)
+option(VITA_SH2_PACKED_CODE "Place SH-2 block code back to back in the arena instead of one 4 KiB slot per block" ON)
 if(VITA_SH2_PACKED_CODE)
-  set_property(SOURCE src/core/sh2_dynarec/DynarecSh2.cpp src/vita/sh2_compiler_test.cpp APPEND PROPERTY
-    COMPILE_DEFINITIONS VITA_SH2_PACKED_CODE)
+  set_property(SOURCE src/core/sh2_dynarec/DynarecSh2.cpp src/core/sh2_dynarec/DynarecSh2CInterface.cpp
+    src/vita/sh2_compiler_test.cpp APPEND PROPERTY COMPILE_DEFINITIONS VITA_SH2_PACKED_CODE)
 endif()
 option(VITA_SH2_LINK "Static SH-2 block exits branch directly into the next block under sh2_dispatch's conditions" OFF)
 if(VITA_SH2_LINK)

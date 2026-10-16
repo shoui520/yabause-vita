@@ -104,7 +104,7 @@ static u64 mem_ops_total, mem_ops_r15; // sampled guest memory accesses; base R1
 #endif
 #ifdef VITA_STACK_PROFILE
 // Profile only: compiles by PC range, and blocks dropped by high-RAM writes.
-u32 g_prof_compiles[4], g_prof_self_modify_reuse;
+u32 g_prof_compiles[4], g_prof_self_modify_reuse, g_prof_recompile, g_prof_evict;
 u32 g_prof_smc_pc[64], g_prof_smc_n[64], g_prof_smc_hit, g_prof_smc_miss;
 // Per CPU (0 master, 1 slave): slices, blocks, slices whose first block
 // idle-skipped, and blocks before an idle skip.
@@ -122,9 +122,9 @@ extern "C" void VitaSh2ReportExecution() {
   YuiMsg("jit_spin_verify match=%u mismatch=%u", g_spin_verify[0], g_spin_verify[1]);
 #endif
 #ifdef VITA_STACK_PROFILE
-  YuiMsg("jit_compiles high=%u low=%u cache=%u other=%u self_modify_reuse=%u removed=%u",
+  YuiMsg("jit_compiles high=%u low=%u cache=%u other=%u self_modify_reuse=%u removed=%u recompile=%u evict=%u",
     g_prof_compiles[0], g_prof_compiles[1], g_prof_compiles[2], g_prof_compiles[3],
-    g_prof_self_modify_reuse, CompileBlocks::getInstance()->remove_count_);
+    g_prof_self_modify_reuse, CompileBlocks::getInstance()->remove_count_, g_prof_recompile, g_prof_evict); g_prof_recompile = g_prof_evict = 0;
   memset(g_prof_compiles, 0, sizeof(g_prof_compiles)); g_prof_self_modify_reuse = 0;
   { unsigned best[6] = {0}; for (unsigned r = 0; r < 6; ++r) { unsigned bi = 0; for (unsigned k = 0; k < 64; ++k) { bool used = false; for (unsigned q = 0; q < r; ++q) used |= best[q] == k; if (!used && g_prof_smc_n[k] > g_prof_smc_n[bi]) bi = k; } best[r] = bi; }
     YuiMsg("jit_smc hit=%u miss=%u top %08x:%u %08x:%u %08x:%u %08x:%u %08x:%u %08x:%u", g_prof_smc_hit, g_prof_smc_miss,
@@ -595,7 +595,8 @@ void DumpInstX( int i, u32 pc, u16 op  )
 
 #define SAFEPAGESIZE	MAXBLOCKSIZE - MAXINSTRSIZE - SEPERATORSIZE_DELAY_SLOT - SEPERATORSIZE_DELAY_AFTER - SEPERATORSIZE_NORMAL - EPILOGSIZE
 #define MAXINSTRCNT		MAXBLOCKSIZE/(MININSTRSIZE+SEPERATORSIZE_NORMAL)
-int instrSize[NUMOFBLOCKS][MAXINSTRCNT];
+// Host code size of each instruction of the block being compiled.
+int instrSize[MAXINSTRCNT];
 
 #define opinit(x)	extern const unsigned short x##_size; \
                     extern const unsigned char x##_src, x##_dest, x##_off1, x##_imm, x##_off3; \
@@ -943,7 +944,11 @@ void CompileBlocks::Init()
   memset((void*)dCode, 0, sizeof(Block)*NUMOFBLOCKS);
   unsigned char *code_base = VitaSh2CodeArena();
   for (unsigned i = 0; i < NUMOFBLOCKS; ++i)
+#ifdef VITA_SH2_PACKED_CODE
+    dCode[i].code = code_base;   // PlaceCode assigns the code room
+#else
     dCode[i].code = code_base + i * vitacode::Layout::Stride;
+#endif
   code_off_.assign(NUMOFBLOCKS, 0);
   code_bytes_.assign(NUMOFBLOCKS, 0);
   code_page_slots_.assign(vitacode::Layout::Sh2 >> 12, {});
@@ -1165,6 +1170,9 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
   ++g_prof_compiles[(pc & 0x0ff00000) == 0x06000000 ? 0 : (pc & 0x0ff00000) == 0x00200000 ? 1
                     : (pc & 0xff000000) == 0xc0000000 ? 2 : 3];
   if (self_modify_block.count(pc)) ++g_prof_self_modify_reuse;
+  { static u8 seen[0x80000 / 8]; extern u32 g_prof_recompile;
+    if ((pc & 0x0ff00000) == 0x06000000) { const u32 i = (pc & 0xfffff) >> 1;
+      if (seen[i >> 3] & (1 << (i & 7))) ++g_prof_recompile; else seen[i >> 3] |= 1 << (i & 7); } }
 #endif
 
   auto block_index = self_modify_block.find(pc);
@@ -1198,12 +1206,15 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
       LOG( "hit! last_modified_block = %d, last_modified_pc = %08X",blockCount, pc );
   }else{
     blockCount = LastMakeBlock;
-    LastMakeBlock = vitacode::Layout::NextSh2Block(LastMakeBlock);
+    LastMakeBlock = NextBlockSlot(LastMakeBlock);
   }
 #ifdef VITA_SH2_SMC_VARIANTS
   smc_slot_[blockCount].pc = 0;  // overwritten below: no longer a variant
 #endif
   
+#ifdef VITA_STACK_PROFILE
+  { extern u32 g_prof_evict; if (g_CompleBlock[blockCount].b_addr) ++g_prof_evict; }
+#endif
   EvictSlot(blockCount);
   g_CompleBlock[blockCount].b_addr = pc;
 #ifdef VITA_SH2_PACKED_CODE
@@ -1334,7 +1345,7 @@ int CompileBlocks::SmcSlot(u32 pc) {
               slots.end());
   if (slots.size() < kSmcVariants) {
     const int slot = LastMakeBlock;
-    LastMakeBlock = vitacode::Layout::NextSh2Block(LastMakeBlock);
+    LastMakeBlock = NextBlockSlot(LastMakeBlock);
     slots.push_back(slot);
     return slot;
   }
@@ -1752,7 +1763,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #endif
           const u16 source = owner < body.size() ? body[owner] : candidate;
           ++asm_list[dsh2_instructions[source]].build_count;
-          instrSize[blockCount][count++] = owner ? 0 : code.size() * 4;
+          instrSize[count++] = owner ? 0 : code.size() * 4;
         }
         instruction_counter += index + 1;
         write_memory_counter = progress;
@@ -1956,7 +1967,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
         // This is also the legacy loop detector's progress marker (ADD/DT
         // count, not just memory writes). Omitting it can skip real loops.
         write_memory_counter += asm_list[decoded].write_count;
-        instrSize[blockCount][count++] = 0;
+        instrSize[count++] = 0;
         addr += 2;
       }
       if (region.instructions) {
@@ -1976,7 +1987,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
         memcpy(ptr, region.code.data(), bytes);
         ptr += bytes;
         scheduling_cursor = ptr;
-        instrSize[blockCount][first] = bytes;
+        instrSize[first] = bytes;
         continue;
       }
     }
@@ -2087,7 +2098,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #ifdef VITA_SH2_DEFER_SEPARATORS
     if (defer_enabled && asm_list[i].delay == 0 && !lowered_load && !Sh2TemplateReadsPcOrCount(op)) {
       memcpy(ptr, regular_code, regular_size);
-      instrSize[blockCount][count++] = regular_size;
+      instrSize[count++] = regular_size;
       opcodePass(&asm_list[i], op, ptr);
       ptr += regular_size;
       defer_pc += 2;
@@ -2102,7 +2113,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
     if (asm_list[i].delay == 0) { 
       memcpy(ptr, regular_code, regular_size);
       memcpy(ptr + regular_size, nomal_seperator, nomal_seperator_size);
-      instrSize[blockCount][count++] = regular_size + nomal_seperator_size;
+      instrSize[count++] = regular_size + nomal_seperator_size;
       if (!lowered_load) opcodePass(&asm_list[i], op, ptr);
 #if defined(AARCH64)
       u32 * counterpos = (u32*)(ptr + regular_size + nomal_seperator_counter_offset);
@@ -2119,7 +2130,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
     else if (asm_list[i].delay == 0xFF ) { 
       memcpy((void*)ptr, (void*)(asm_list[i].func), *(asm_list[i].size));
       memcpy((void*)(ptr + *(asm_list[i].size)), (void*)nomal_seperator, nomal_seperator_size);
-      instrSize[blockCount][count++] = *(asm_list[i].size) + nomal_seperator_size;
+      instrSize[count++] = *(asm_list[i].size) + nomal_seperator_size;
       opcodePass(&asm_list[i], op, ptr);
       ptr += *(asm_list[i].size) + nomal_seperator_size;
     }
@@ -2176,13 +2187,13 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
         t[3] = 0xe587905cu;                                   // str r9,[r7,#92]  count
         link_stub(reinterpret_cast<u8 *>(t + 4), 0, at + off);
         const size_t bytes = 11 * 4 + 2 * kLinkStubBytes;
-        instrSize[blockCount][count++] = bytes;
+        instrSize[count++] = bytes;
         ptr += bytes;
       } else
 #endif
       {
       memcpy(ptr, words, sizeof(words));
-      instrSize[blockCount][count++] = sizeof(words);
+      instrSize[count++] = sizeof(words);
       ptr += sizeof(words);
       }
     }
@@ -2194,7 +2205,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       if (jumpptr != 0xFFFFFFFF ) {
         intptr_t offset = *(asm_list[i].size) + nomal_seperator_size;
         memcpy((void*)(ptr + offset), (void*)internal_jmp, internal_jmp_size);
-        instrSize[blockCount][count++] = offset + internal_jmp_size;
+        instrSize[count++] = offset + internal_jmp_size;
         opcodePass(&asm_list[i], op, ptr);
         intptr_t jump_offset = jumpptr - (intptr_t)(ptr + offset + internal_jmp_to_offset);
 
@@ -2217,7 +2228,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       }
       else {
         memcpy((void*)(ptr + *(asm_list[i].size) + nomal_seperator_size), (void*)PageFlip, DELAYJUMPSIZE);
-        instrSize[blockCount][count++] = *(asm_list[i].size) + nomal_seperator_size + DELAYJUMPSIZE;
+        instrSize[count++] = *(asm_list[i].size) + nomal_seperator_size + DELAYJUMPSIZE;
         opcodePass(&asm_list[i], op, ptr);
 #if defined(AARCH64)
         u32 * counterpos = (u32*)(ptr + *(asm_list[i].size) + nomal_seperator_counter_offset);
@@ -2260,7 +2271,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
             + 2 * kLinkStubBytes + 4
 #endif
             < MAXBLOCKSIZE) {
-        instrSize[blockCount][count++] = 0;
+        instrSize[count++] = 0;
         if (call) {
           slot_region.LoadConstant(12, branch_pc + 4);
           slot_region.code.push_back(0xe587c054u);              // str ip,[r7,#84]  PR
@@ -2327,8 +2338,8 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
           link_stub(stub, 0, target);
           stub += kLinkStubBytes;
           if (bt_bf) { link_stub(stub, 0, fall); stub += kLinkStubBytes; }
-          instrSize[blockCount][count - 1] = u32(stub - ptr);
-          instrSize[blockCount][count++] = 0;
+          instrSize[count - 1] = u32(stub - ptr);
+          instrSize[count++] = 0;
           ptr = stub;
         } else {
 #endif
@@ -2340,8 +2351,8 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
         w.push_back(0xe8bd87f0u);                                 // pop {r4-r10,pc}  BLOCK_RETURN
 #endif
         memcpy(ptr, w.data(), w.size() * sizeof(u32));
-        instrSize[blockCount][count - 1] = w.size() * sizeof(u32);
-        instrSize[blockCount][count++] = 0;
+        instrSize[count - 1] = w.size() * sizeof(u32);
+        instrSize[count++] = 0;
         ptr += w.size() * sizeof(u32);
 #ifdef VITA_SH2_LINK
         }
@@ -2353,7 +2364,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       u32 cycle = asm_list[i].cycle;
       memcpy((void*)ptr, (void*)(asm_list[i].func), *(asm_list[i].size));
       memcpy((void*)(ptr + *(asm_list[i].size)), (void*)delay_seperator, delay_seperator_size);
-      instrSize[blockCount][count++] = *(asm_list[i].size) + delay_seperator_size;
+      instrSize[count++] = *(asm_list[i].size) + delay_seperator_size;
       opcodePass(&asm_list[i], op, ptr);
 #ifdef VITA_SH2_LINK
       u8 *const slot_separator = ptr + *(asm_list[i].size);  // its not-taken exit is word 6
@@ -2398,7 +2409,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 
         u32 cpsize = internal_delay_jmp_size;
         memcpy((void*)(ptr + offset), (void*)internal_delay_jmp, internal_delay_jmp_size);
-        instrSize[blockCount][count++] = offset + internal_delay_jmp_size;
+        instrSize[count++] = offset + internal_delay_jmp_size;
         opcodePass(&asm_list[j], temp, ptr);
 
         intptr_t jump_offset = jumpptr - (intptr_t)(ptr + offset + internal_delay_jmp_to_offset);
@@ -2422,7 +2433,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       }
       else {
         memcpy((void*)(ptr + offset), (void*)seperator_delay_after, SEPERATORSIZE_DELAY_AFTER);
-        instrSize[blockCount][count++] = offset + SEPERATORSIZE_DELAY_AFTER;
+        instrSize[count++] = offset + SEPERATORSIZE_DELAY_AFTER;
         opcodePass(&asm_list[j], temp, ptr);
 #if defined(AARCH64)
         u32 * counterpos = (u32*)(ptr + *(asm_list[j].size) + delayslot_seperator_counter_offset);
@@ -2519,7 +2530,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
         ptr = startptr + PROLOGSIZE;
         memcpy(ptr, fused.data(), fused_bytes);
         ptr += fused_bytes;
-        for (int k = 0; k < count; ++k) instrSize[blockCount][k] = k ? 0 : fused_bytes;
+        for (int k = 0; k < count; ++k) instrSize[k] = k ? 0 : fused_bytes;
         page->flags |= BLOCK_POLL_FUSED;
         ++poll_fused_blocks;
         poll_fused_saved_bytes += original_bytes - fused_bytes;
