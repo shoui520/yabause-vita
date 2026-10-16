@@ -10,6 +10,9 @@
  * which staging storage (bumped at every allocation/realloc) texels were
  * last written in. */
 unsigned vita_atlas_frame, vita_atlas_gen;
+#ifdef VITA_VDP1_ATLAS_STORE
+void Vdp1AtlasStoreFrame(YglTextureManager *tm);   /* vidogl.c: the store's rows */
+#endif
 /* The atlas frame whose texels the current storage still holds, if any
  * (UINT_MAX: none). Without the zero-copy ring it is the previous frame. */
 unsigned vita_atlas_prev_frame = ~0u;
@@ -246,10 +249,16 @@ void YglTMReset(YglTextureManager *tm) {
     vita_atlas_prev_frame = z->buf[i].atlas_frame;
     z->buf[i].atlas_frame = vita_atlas_frame;
     ZcUse(tm, i, 0);
+#ifdef VITA_VDP1_ATLAS_STORE
+    Vdp1AtlasStoreFrame(tm);
+#endif
     return;
   }
 #endif
   vita_atlas_prev_frame = vita_atlas_frame - 1;
+#ifdef VITA_VDP1_ATLAS_STORE
+  Vdp1AtlasStoreFrame(tm);
+#endif
 }
 
 static void YglTmPushInner(YglTextureManager *tm);

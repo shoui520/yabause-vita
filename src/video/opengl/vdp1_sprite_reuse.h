@@ -57,7 +57,8 @@ static inline Vdp1SpriteReuseRecord *Vdp1SpriteReuseSlot(Vdp1SpriteReuseRecord *
 /* Decoded sprites kept in cached RAM by their decode inputs (the reuse
  * record's, with CCCTL). Moving 3D scenes allocate a sprite somewhere else
  * every frame, so the rectangle match above fails; a hit here copies the
- * texels into the new rectangle, which in video memory is a cheap write. */
+ * texels into the new rectangle (or draws them from the atlas store,
+ * vdp1_atlas_store.h). */
 enum { SPRITE_CACHE_WAYS = 4, SPRITE_CACHE_SETS = 512, SPRITE_CACHE_BUDGET = 8 << 20,
        SPRITE_CACHE_MAX_TEXELS = 256 * 256 };
 
@@ -66,6 +67,12 @@ typedef struct {
   unsigned used;             /* atlas frame of the last hit or store */
   uint32_t *texels;          /* w * h, rows packed; NULL: empty */
   uint32_t cap;              /* texels allocated */
+  /* Atlas store rectangle (vdp1_atlas_store.h), valid while store_epoch is
+   * the store's; store_gen: atlas storages already holding the texels. */
+  int store_shelf;
+  uint16_t store_x, store_y;
+  unsigned store_epoch, store_next;
+  uint32_t store_gen[4];
 } Vdp1SpriteCacheEntry;
 
 typedef struct {
@@ -79,13 +86,26 @@ static inline int Vdp1SpriteCacheKeyEqual(const Vdp1SpriteCacheEntry *e, const V
     e->spctl == q->spctl && e->ccctl == ccctl && e->ver == q->ver;
 }
 
+static inline uint32_t Vdp1SpriteCacheHash(const Vdp1SpriteReuseRecord *q) {
+  uint32_t a = q->srca * 0x9E3779B1u ^ q->size * 0x85EBCA77u ^ q->colr * 0xC2B2AE3Du ^ q->pmod;
+  a ^= a >> 15; a *= 0x2C1B3C6Du; a ^= a >> 12;
+  return a & (SPRITE_CACHE_SETS - 1);
+}
+
+/* The entry holding q's decode, else NULL; nothing is replaced. */
+static inline Vdp1SpriteCacheEntry *Vdp1SpriteCacheFind(Vdp1SpriteCache *c, const Vdp1SpriteReuseRecord *q,
+                                                        uint32_t ccctl) {
+  Vdp1SpriteCacheEntry *set = &c->e[Vdp1SpriteCacheHash(q) * SPRITE_CACHE_WAYS];
+  for (unsigned w = 0; w < SPRITE_CACHE_WAYS; ++w)
+    if (Vdp1SpriteCacheKeyEqual(&set[w], q, ccctl)) return &set[w];
+  return NULL;
+}
+
 /* The entry holding q's decode (*hit), else the one to store it in, with
  * room for its texels; NULL when the budget has none. */
 static inline Vdp1SpriteCacheEntry *Vdp1SpriteCacheSlot(Vdp1SpriteCache *c, const Vdp1SpriteReuseRecord *q,
                                                         uint32_t ccctl, unsigned now, int *hit) {
-  uint32_t a = q->srca * 0x9E3779B1u ^ q->size * 0x85EBCA77u ^ q->colr * 0xC2B2AE3Du ^ q->pmod;
-  a ^= a >> 15; a *= 0x2C1B3C6Du; a ^= a >> 12;
-  Vdp1SpriteCacheEntry *set = &c->e[(a & (SPRITE_CACHE_SETS - 1)) * SPRITE_CACHE_WAYS], *victim = set;
+  Vdp1SpriteCacheEntry *set = &c->e[Vdp1SpriteCacheHash(q) * SPRITE_CACHE_WAYS], *victim = set;
   *hit = 0;
   for (unsigned w = 0; w < SPRITE_CACHE_WAYS; ++w) {
     Vdp1SpriteCacheEntry *e = &set[w];

@@ -688,6 +688,111 @@ static void Vdp1ReuseSideEffects(const vdp1cmd_struct *cmd) {
   if (mode == 5 && !fast_rgb16) ((u8 *)&fixVdp2Regs->CCRSA)[0] &= 0x1F;
 }
 #endif
+#ifdef VITA_VDP1_SPRITE_CACHE
+static Vdp1SpriteCache *vdp1_sprite_cache;
+#endif
+#ifdef VITA_VDP1_ATLAS_STORE
+/* Cached sprites drawn again are sampled from a rectangle of the atlas store
+ * (vdp1_atlas_store.h), at the top of every atlas frame, instead of being
+ * copied into a new rectangle: each atlas storage receives an entry's texels
+ * once, the first time it is drawn from that storage. */
+#include "vdp1_atlas_store.h"
+enum { ATLAS_STORE_STEP = 128, ATLAS_STORE_MAX_ROWS = 2048 };
+static AtlasStore vdp1_store;
+extern unsigned vita_atlas_frame, vita_atlas_gen;
+static unsigned vdp1_store_epoch = 1;   /* rectangles of other epochs are gone */
+static unsigned vdp1_store_short;       /* an atlas frame found the store full */
+/* Owns rectangles freed after being drawn in the current atlas frame (an
+ * earlier quad may sample them) until the next one. */
+static Vdp1SpriteCacheEntry vdp1_store_held;
+static int Vdp1StorePlaced(const Vdp1SpriteCacheEntry *e) { return e->store_epoch == vdp1_store_epoch; }
+static void Vdp1StoreRelease(Vdp1SpriteCacheEntry *e) {
+  if (!Vdp1StorePlaced(e)) return;
+  e->store_epoch = 0;
+  if (e->used != vita_atlas_frame) { AtlasStoreFree(&vdp1_store, e->store_shelf, e->store_x); return; }
+  AtlasStoreShelf *sh = &vdp1_store.shelf[e->store_shelf];
+  for (unsigned i = 0; i < sh->n; ++i)
+    if (sh->s[i].x == e->store_x) sh->s[i].owner = &vdp1_store_held;
+}
+/* Frees the rectangles of entries not drawn for at least age atlas frames. */
+static void Vdp1StoreEvict(unsigned age) {
+  for (unsigned i = 0; i < vdp1_store.shelves; ++i) {
+    AtlasStoreShelf *sh = &vdp1_store.shelf[i];
+    for (unsigned j = sh->n; j-- > 0;) {
+      Vdp1SpriteCacheEntry *e = sh->s[j].owner;
+      if (e == &vdp1_store_held || vita_atlas_frame - e->used < age) continue;
+      e->store_epoch = 0;
+      memmove(&sh->s[j], &sh->s[j + 1], (sh->n - j - 1) * sizeof(sh->s[0]));
+      --sh->n;
+    }
+  }
+}
+/* Atlas reset (YglTMReset): the store's rows go first in the new frame. */
+void Vdp1AtlasStoreFrame(YglTextureManager *tm) {
+  for (unsigned i = 0; i < vdp1_store.shelves; ++i) {
+    AtlasStoreShelf *sh = &vdp1_store.shelf[i];
+    for (unsigned j = sh->n; j-- > 0;)
+      if (sh->s[j].owner == &vdp1_store_held) {
+        memmove(&sh->s[j], &sh->s[j + 1], (sh->n - j - 1) * sizeof(sh->s[0]));
+        --sh->n;
+      }
+  }
+  unsigned limit = vdp1_store.limit;
+  if (vdp1_store_short && limit < ATLAS_STORE_MAX_ROWS) limit += ATLAS_STORE_STEP;
+  vdp1_store_short = 0;
+  if (vdp1_store.width != tm->width) {
+    ++vdp1_store_epoch;
+    AtlasStoreReset(&vdp1_store, tm->width, limit);
+  }
+  vdp1_store.limit = limit;
+  if (!limit) return;
+  if (tm->height < limit + ATLAS_STORE_STEP) YglTMRealloc(tm, tm->width, limit + 2 * ATLAS_STORE_STEP);
+  tm->currentY = tm->yMax = limit;
+  YglAtlasExtentAdd(&tm->vita_cpu_extent, 0, 0, tm->width, limit);
+}
+/* Draws a cached sprite from its store rectangle and records it in the atlas
+ * frame's cache under key, as a decoded sprite would be; 0 when it is not
+ * cached or the store has no room (the caller then decodes or copies). */
+static int Vdp1StoreQuad(vdp1cmd_struct *cmd, YglSprite *sprite, float *colors, YglCache *cash, u64 key) {
+  extern u32 vdp1_page_ver[128];
+  YglTextureManager *tm = _Ygl->texture_manager;
+  if (!vdp1_sprite_cache || !tm->texture) return 0;
+  const int mode = (cmd->CMDPMOD >> 3) & 7;
+  const u32 w = sprite->w, h = sprite->h, start = cmd->CMDSRCA * 8;
+  const u32 bytes = mode <= 1 ? (w + 1) / 2 * h : mode == 5 ? 2 * w * h : w * h;
+  u32 ver = Vdp1SpriteReusePages(vdp1_page_ver, start, bytes, 0);
+  if (mode == 1) ver = Vdp1SpriteReusePages(vdp1_page_ver, cmd->CMDCOLR * 8, 32, ver);
+  const Vdp1SpriteReuseRecord q = { NULL, 0, 0, w | h << 16, 0, cmd->CMDSRCA, cmd->CMDPMOD, cmd->CMDCOLR,
+                                    fixVdp2Regs->SPCTL, ver };
+  Vdp1SpriteCacheEntry *e = Vdp1SpriteCacheFind(vdp1_sprite_cache, &q, fixVdp2Regs->CCCTL);
+  if (!e) return 0;
+  e->used = vita_atlas_frame;
+  if (!Vdp1StorePlaced(e)) {
+    unsigned x, y;
+    int shelf = AtlasStoreAlloc(&vdp1_store, w, h, e, &x, &y);
+    if (shelf < 0) { Vdp1StoreEvict(8); shelf = AtlasStoreAlloc(&vdp1_store, w, h, e, &x, &y); }
+    if (shelf < 0) { Vdp1StoreEvict(1); shelf = AtlasStoreAlloc(&vdp1_store, w, h, e, &x, &y); }
+    if (shelf < 0) { vdp1_store_short = 1; return 0; }
+    e->store_shelf = shelf; e->store_x = (uint16_t)x; e->store_y = (uint16_t)y;
+    e->store_epoch = vdp1_store_epoch;
+    memset(e->store_gen, 0, sizeof(e->store_gen));
+  }
+  unsigned k = 0;
+  while (k < 4 && e->store_gen[k] != vita_atlas_gen) ++k;
+  if (k == 4) {
+    u32 *dst = tm->texture + (size_t)e->store_y * tm->width + e->store_x;
+    for (u32 r = 0; r < h; ++r) memcpy(dst + (size_t)r * tm->width, e->texels + r * w, w * 4);
+    e->store_gen[e->store_next++ & 3] = vita_atlas_gen;
+  }
+  Vdp1ReuseSideEffects(cmd);
+  cash->x = e->store_x; cash->y = e->store_y;
+  YglCacheQuadGrowShading(sprite, colors, cash);
+  /* As the decoded sprite's quad records it (ygles.c, ATLAS_BIAS). */
+  cash->x = e->store_x + 0.025f; cash->y = e->store_y + 0.025f;
+  YglCacheAdd(tm, key, cash);
+  return 1;
+}
+#endif
 static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, YglTexture *texture)
 {
 #ifdef VITA_STACK_PROFILE
@@ -735,18 +840,25 @@ static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, Ygl
 #endif
 #endif
 #ifdef VITA_VDP1_SPRITE_CACHE
-  static Vdp1SpriteCache *sprite_cache;
+  Vdp1SpriteCache *const sprite_cache = vdp1_sprite_cache;
   Vdp1SpriteCacheEntry *cache_entry = NULL;
   int cache_hit = 0;
   const uint32_t cache_ccctl = fixVdp2Regs->CCCTL;
   if (reuse_record && !sprite_reused) {
-    if (!sprite_cache) sprite_cache = calloc(1, sizeof(*sprite_cache));
-    if (sprite_cache)
-      cache_entry = Vdp1SpriteCacheSlot(sprite_cache, &reuse_query, cache_ccctl, vita_atlas_frame, &cache_hit);
+    if (!vdp1_sprite_cache) vdp1_sprite_cache = calloc(1, sizeof(*vdp1_sprite_cache));
+    if (vdp1_sprite_cache)
+      cache_entry = Vdp1SpriteCacheSlot(vdp1_sprite_cache, &reuse_query, cache_ccctl, vita_atlas_frame, &cache_hit);
+#ifdef VITA_VDP1_ATLAS_STORE
+    if (cache_entry && !cache_hit) Vdp1StoreRelease(cache_entry);   /* replaced */
+#endif
   }
   const u32 cache_w = sprite->w, cache_h = sprite->h, cache_pitch = texture->w + sprite->w;
 #ifndef VITA_VDP1_SPRITE_REUSE_VERIFY
   if (cache_hit) {
+    { static unsigned hist[64][32], n_; unsigned wi = cache_w / 8 < 63 ? cache_w / 8 : 63, hi = cache_h / 8 < 31 ? cache_h / 8 : 31; ++hist[wi][hi];
+      if (++n_ % 8192 == 0) { char b_[1024]; int o = 0;
+        for (unsigned i = 0; i < 64; ++i) for (unsigned j = 0; j < 32; ++j) if (hist[i][j] > 40 && o < 960) o += snprintf(b_ + o, 1024 - o, " %ux%u:%u", i * 8, j * 8, hist[i][j]);
+        YuiMsg("sprite_hist%s", b_); memset(hist, 0, sizeof hist); } }
     for (u32 r = 0; r < cache_h; ++r)
       memcpy(texture->textdata + r * cache_pitch, cache_entry->texels + r * cache_w, cache_w * 4);
     Vdp1ReuseSideEffects(cmd);
@@ -7413,6 +7525,9 @@ void VIDOGLVdp1NormalSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
         return;
       }
 
+#ifdef VITA_VDP1_ATLAS_STORE
+      if (Vdp1StoreQuad(&cmd, &sprite, col, &cash, tmp)) return;
+#endif
       YglQuadGrowShading(&sprite, &texture, col, &cash);
       YglCacheAdd(_Ygl->texture_manager, tmp, &cash);
       Vdp1ReadTexture(&cmd, &sprite, &texture);
@@ -7430,6 +7545,9 @@ void VIDOGLVdp1NormalSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
         return;
       }
 
+#ifdef VITA_VDP1_ATLAS_STORE
+      if (Vdp1StoreQuad(&cmd, &sprite, NULL, &cash, tmp)) return;
+#endif
       YglQuadGrowShading(&sprite, &texture, NULL, &cash);
       YglCacheAdd(_Ygl->texture_manager, tmp, &cash);
 
@@ -7629,6 +7747,9 @@ void VIDOGLVdp1ScaledSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
         return;
       }
 
+#ifdef VITA_VDP1_ATLAS_STORE
+      if (Vdp1StoreQuad(&cmd, &sprite, col, &cash, tmp)) return;
+#endif
       YglQuadGrowShading(&sprite, &texture, col, &cash);
       YglCacheAdd(_Ygl->texture_manager, tmp, &cash);
       Vdp1ReadTexture(&cmd, &sprite, &texture);
@@ -7649,6 +7770,9 @@ void VIDOGLVdp1ScaledSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
         return;
       }
 
+#ifdef VITA_VDP1_ATLAS_STORE
+      if (Vdp1StoreQuad(&cmd, &sprite, NULL, &cash, tmp)) return;
+#endif
       YglQuadGrowShading(&sprite, &texture, NULL, &cash);
       YglCacheAdd(_Ygl->texture_manager, tmp, &cash);
       Vdp1ReadTexture(&cmd, &sprite, &texture);
@@ -7904,6 +8028,9 @@ void VIDOGLVdp1DistortedSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
     }
 #endif
 
+#ifdef VITA_VDP1_ATLAS_STORE
+    if (Vdp1StoreQuad(&cmd, &sprite, col, &cash, tmp)) { DPROF_END(1); return; }
+#endif
     YglQuadGrowShading(&sprite, &texture, col, &cash);
     YglCacheAdd(_Ygl->texture_manager, tmp, &cash);
     Vdp1ReadTexture(&cmd, &sprite, &texture);
@@ -7928,6 +8055,9 @@ void VIDOGLVdp1DistortedSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       YglCacheQuadGrowShading(&sprite, NULL, &cash);
       return;
     }
+#endif
+#ifdef VITA_VDP1_ATLAS_STORE
+    if (Vdp1StoreQuad(&cmd, &sprite, NULL, &cash, tmp)) { DPROF_END(1); return; }
 #endif
     YglQuadGrowShading(&sprite, &texture, NULL, &cash);
     YglCacheAdd(_Ygl->texture_manager, tmp, &cash);
