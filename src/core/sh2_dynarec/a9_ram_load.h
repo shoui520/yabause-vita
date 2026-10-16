@@ -15,6 +15,7 @@ inline std::vector<uint32_t> RamLoad(unsigned n, unsigned m, unsigned width,
                                     uint32_t low, uint32_t high, bool postincrement = false) {
   assert(n < 16 && m < 16 && (width == 1 || width == 2 || width == 4));
   std::vector<uint32_t> c;
+  c.reserve(32);
   auto constant = [&](unsigned r, uint32_t value) {
     c.push_back(0xe3000000u | (r << 12) | ((value & 0xf000) << 4) | (value & 0xfff));
     c.push_back(0xe3400000u | (r << 12) | ((value >> 12) & 0xf0000) | ((value >> 16) & 0xfff));

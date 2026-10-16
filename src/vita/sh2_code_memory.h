@@ -13,6 +13,8 @@ protected:
   VitaCodeWrite(void *address, std::size_t length, vitacode::Region region);
 public:
   ~VitaCodeWrite();
+  // Only the first n bytes were written: publish just those.
+  void Written(std::size_t n) { if (n < length) length = n; }
   VitaCodeWrite(const VitaCodeWrite &) = delete;
   VitaCodeWrite &operator=(const VitaCodeWrite &) = delete;
 };

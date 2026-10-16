@@ -20,7 +20,9 @@ class RegisterRegion {
 public:
   explicit RegisterRegion(uint32_t low = 0, uint32_t high = 0,
                           bool guarded_loads = false)
-      : low_ram(low), high_ram(high), guarded_loads(guarded_loads) {}
+      : low_ram(low), high_ram(high), guarded_loads(guarded_loads) {
+    code.reserve(256);  // one allocation for a typical region, not a doubling series
+  }
   std::vector<uint32_t> code;
   struct Fixup { unsigned at, target; uint32_t cond; };
   std::vector<uint32_t> cold;              // slow edges, appended by Finish
@@ -952,6 +954,9 @@ private:
   // Slow-edge stubs are emitted with the ordinary helpers by swapping the
   // cold buffer into `code`; branch indices are resolved by Finish.
   void BeginCold(const std::vector<unsigned> &sources, const std::vector<uint32_t> &conds) {
+    if (cold.capacity() < 64) cold.reserve(64);
+    if (to_cold.capacity() < 16) to_cold.reserve(16);
+    if (to_hot.capacity() < 16) to_hot.reserve(16);
     for (size_t i = 0; i < sources.size(); ++i)
       to_cold.push_back({sources[i], unsigned(cold.size()), conds[i]});
     code.swap(cold);

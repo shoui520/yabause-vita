@@ -1557,7 +1557,9 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
   u32 instruction_counter = 0;
   u32 write_memory_counter = 0;
   u32 calsize;
-  std::unordered_map<u32, uintptr_t> addr_map;
+#if defined(AARCH64)
+  std::unordered_map<u32, uintptr_t> addr_map;  // read only by the AArch64 jump lowering
+#endif
 
   startptr = ptr = page->code;
 #ifdef VITA_SH2_LINK
@@ -1597,6 +1599,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
       if (acc.store) { ++stores; slo = std::min(slo, o & ~3); shi = std::max(shi, (e + 3) & ~3); }
       else ++loads;
     };
+    stack_plan.valid.reserve(256); stack_plan.off.reserve(256);
     for (u32 a = start_addr, k = 0; k < 256; ++k, a += 2) {
       const u16 o = MappedMemoryReadWord(a, NULL);
       stack_plan.valid.push_back(valid); stack_plan.off.push_back(off);
@@ -1625,6 +1628,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
     if (stack_plan.active) {
       std::vector<u32> w;
       std::vector<size_t> bail;
+      w.reserve(32); bail.reserve(4);
       // ADD/SUB rd,rn,#v for a multiple of 4 below 1024 (imm8 ROR 30).
       auto add = [&](unsigned rd, unsigned rn, int v) {
         if (!v && rd == rn) return;
@@ -1862,7 +1866,9 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
     }
 #endif
 
+#if defined(AARCH64)
     addr_map[addr] = (uintptr_t)ptr;
+#endif
 
     i = dsh2_instructions[op];
     if (asm_list[i].func == 0) {
@@ -2621,7 +2627,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
     if (*w == 0xe597f090u)                         // ldr pc,[r7,#144]
       *w = 0xea000000u | ((u32(arena_dispatch - reinterpret_cast<u8 *>(w) - 8) >> 2) & 0xffffffu);
 #endif
-  last_code_bytes_ = u32(ptr - startptr);
+  last_code_bytes_ = u32(ptr - startptr); code_write.Written(last_code_bytes_);
   if (write_memory_counter > 0) {
     page->flags |= BLOCK_WRITE;
   }
