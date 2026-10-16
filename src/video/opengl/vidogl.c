@@ -3546,6 +3546,13 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
     ((info->patternpixelwh >> 4) << 1) | (((u64)(info->coloroffset >> 8) & 0x07) << 32);
 
   YglCache c;
+  VT_STACK_BEGIN(VT_VDP2_CELL_LOOKUP);
+  const int cell_cached = YglIsCached(_Ygl->texture_manager, cacheaddr, &c);
+  VT_STACK_END();
+#ifdef VITA_SKIP_TRANSPARENT_CELLS
+  /* All texels alpha 0: nothing to draw, whatever the window. */
+  if (cell_cached == 1 && c.x < 0.0f) { ++vita_transparent_cells_skipped; return; }
+#endif
   vdp2draw_struct tile;
   int winmode = 0;
   tile.dst = 0;
@@ -3603,17 +3610,11 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
   tile.cob = info->cob;
 
 
-  VT_STACK_BEGIN(VT_VDP2_CELL_LOOKUP);
-  const int cell_cached = YglIsCached(_Ygl->texture_manager, cacheaddr, &c);
-  VT_STACK_END();
 #ifdef VITA_DIAG_ABLATE
   if (info->id == 0) { extern unsigned vt_pat[2]; ++vt_pat[cell_cached == 1]; }
 #endif
   if (1 == cell_cached)
   {
-#ifdef VITA_SKIP_TRANSPARENT_CELLS
-    if (c.x < 0.0f) { ++vita_transparent_cells_skipped; return; } /* all texels alpha 0 */
-#endif
     //printf("x=%d,y=%d %lx cached\n",x,y,cacheaddr);
     VT_STACK_BEGIN(VT_VDP2_CELL_QUAD);
     YglCachedQuadOffset(&tile, &c, cx, cy, info->coordincx, info->coordincy);
