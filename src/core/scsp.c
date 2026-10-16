@@ -1848,14 +1848,76 @@ static _Atomic int thread_running = 0;
  * thread test. Release/acquire on the flag publishes the mix's results. */
 static _Atomic int scsp_mix_busy;
 u32 g_scsp_mix_waits, g_scsp_mix_spins;
+u64 g_scsp_mix_wait_ticks;
 static void ScspWaitMix(void) {
   if (!atomic_load_explicit(&scsp_mix_busy, memory_order_acquire)) return;
   ++g_scsp_mix_waits;
+  const u64 t0 = YabauseGetTicks();
   while (atomic_load_explicit(&scsp_mix_busy, memory_order_acquire)) { ++g_scsp_mix_spins; __asm__ volatile("yield"); }
+  g_scsp_mix_wait_ticks += YabauseGetTicks() - t0;
 }
 #define SCSP_MIX_GATE() ScspWaitMix()
+#ifdef VITA_SCSP_DEFER_MAIN_WRITES
+/* Main-side sound RAM writes made during a mix. The mix ran before them in
+ * the reference order (the SH-2s waited at VBlank-in), so instead of waiting
+ * for it they are kept here, in order, and made once it is done, before
+ * anything else can see sound RAM: a main-side read or SCSP access, the next
+ * 68000 budget, an early frame request, reset, start/stop or a state save. */
+enum { DEFER_MAX = 4096 };
+static struct { u32 addr, val, size; } defer_log[DEFER_MAX];
+static unsigned defer_n;   /* main thread only */
+u32 g_scsp_defer_writes, g_scsp_defer_waits, g_scsp_defer_sectors;
+/* CD audio sectors delivered during a mix, likewise. The mix is the only
+ * reader of the CDDA ring and consumes 4 * min(frame samples, bytes / 4)
+ * bytes of it; cdda_after_mix, set before scsp_mix_busy, is what it leaves,
+ * so the CD timing decision of each kept sector is made as after the mix. */
+enum { CDDA_PEND_MAX = 8 };
+static u8 cdda_pend[CDDA_PEND_MAX][2352];
+static unsigned cdda_pend_n;          /* main thread only */
+static u32 cdda_after_mix, cdda_virtual_left;
+static void ScspCddaAppend(const u8 *sector);
+static u32 scspsoundlen;
+static void ScspMixBegin(void) {
+  const u32 take = cdda_out_left / 4 < scspsoundlen ? cdda_out_left / 4 : scspsoundlen;
+  cdda_after_mix = cdda_out_left - take * 4;
+  atomic_store_explicit(&scsp_mix_busy, 1, memory_order_release);
+}
+static void ScspDeferApply(void) {
+  for (unsigned i = 0; i < cdda_pend_n; ++i) ScspCddaAppend(cdda_pend[i]);
+  cdda_pend_n = 0;
+  const unsigned n = defer_n;
+  defer_n = 0;
+  for (unsigned i = 0; i < n; ++i)
+    switch (defer_log[i].size) {
+      case 1: SoundRamWriteByte(defer_log[i].addr, (u8)defer_log[i].val); break;
+      case 2: SoundRamWriteWord(defer_log[i].addr, (u16)defer_log[i].val); break;
+      default: SoundRamWriteLong(defer_log[i].addr, defer_log[i].val); break;
+    }
+}
+void ScspDeferFlush(void) {
+  if (!defer_n && !cdda_pend_n) return;
+  if (atomic_load_explicit(&scsp_mix_busy, memory_order_acquire)) ++g_scsp_defer_waits;
+  ScspWaitMix();
+  ScspDeferApply();
+}
+/* 1 when the write was kept for after the mix. */
+static int ScspDeferWrite(u32 addr, u32 val, u32 size) {
+  if (atomic_load_explicit(&scsp_mix_busy, memory_order_acquire) && defer_n < DEFER_MAX &&
+      g_scsp_main_mode == 0 && !use_new_scsp && !VitaSoundBudgetBlocking()) {
+    defer_log[defer_n].addr = addr; defer_log[defer_n].val = val; defer_log[defer_n].size = size;
+    ++defer_n; ++g_scsp_defer_writes;
+    return 1;
+  }
+  ScspDeferFlush();
+  return 0;
+}
+#define SCSP_DEFER_FLUSH() ScspDeferFlush()
+#endif
 #else
 #define SCSP_MIX_GATE() ((void)0)
+#endif
+#ifndef SCSP_DEFER_FLUSH
+#define SCSP_DEFER_FLUSH() ((void)0)
 #endif
 int ScspHasAsyncWorker(void) {
   return atomic_load_explicit(&thread_running, memory_order_acquire) != 0;
@@ -1952,6 +2014,13 @@ void ScspEarlyLine(void) {
   ++early_line; ++early_quiet;
   if (early_line < EARLY_START_LINE || early_line > EARLY_LAST_LINE || early_quiet < EARLY_QUIET_LINES)
     return;
+#ifdef VITA_SCSP_DEFER_MAIN_WRITES
+  /* The frame reads sound RAM: deferred writes go first, without waiting. */
+  if (defer_n || cdda_pend_n) {
+    if (atomic_load_explicit(&scsp_mix_busy, memory_order_acquire)) return;
+    ScspDeferApply();
+  }
+#endif
   int s = EARLY_IDLE;
   if (atomic_load_explicit(&early_state, memory_order_relaxed) == EARLY_IDLE && ScspEarlyUsable())
     atomic_compare_exchange_strong(&early_state, &s, EARLY_REQUESTED);
@@ -1973,7 +2042,11 @@ int ScspEarlyCommit(void) {
         __asm__ volatile("yield");
       break;
     case EARLY_DONE:
+#ifdef VITA_SCSP_DEFER_MAIN_WRITES
+      ScspMixBegin();
+#else
       atomic_store_explicit(&scsp_mix_busy, 1, memory_order_release);
+#endif
       atomic_store_explicit(&early_state, EARLY_COMMIT, memory_order_release);
       YabAddEventQueue(early_decision, 0);
       ++g_early_stats[0];
@@ -2016,30 +2089,38 @@ static u8 *ScspMainRamReadMap(u32 *a) {
   return NULL;
 }
 u8 FASTCALL ScspMainRamReadByte(u32 a) {
+  SCSP_DEFER_FLUSH();
   u8 *ram = ScspMainRamReadMap(&a);
   return ram ? T2ReadByte(ram, a) : SoundRamReadByte(a);
 }
 u16 FASTCALL ScspMainRamReadWord(u32 a) {
+  SCSP_DEFER_FLUSH();
   u8 *ram = ScspMainRamReadMap(&a);
   if (!ram) return SoundRamReadWord(a);
   SyncSh2And68k();
   return T2ReadWord(ram, a);
 }
 u32 FASTCALL ScspMainRamReadLong(u32 a) {
+  SCSP_DEFER_FLUSH();
   u8 *ram = ScspMainRamReadMap(&a);
   if (!ram) return SoundRamReadLong(a);
   SyncSh2And68k();
   return T2ReadLong(ram, a);
 }
-void FASTCALL ScspMainRamWriteByte(u32 a, u8 v) { ScspMainMapAccess(); SoundRamWriteByte(a, v); }
-void FASTCALL ScspMainRamWriteWord(u32 a, u16 v) { ScspMainMapAccess(); SoundRamWriteWord(a, v); }
-void FASTCALL ScspMainRamWriteLong(u32 a, u32 v) { ScspMainMapAccess(); SoundRamWriteLong(a, v); }
-u8 FASTCALL ScspMainRegReadByte(u32 a) { ScspMainMapAccess(); return scsp_r_b(a); }
-u16 FASTCALL ScspMainRegReadWord(u32 a) { ScspMainMapAccess(); return scsp_r_w(a); }
-u32 FASTCALL ScspMainRegReadLong(u32 a) { ScspMainMapAccess(); return scsp_r_d(a); }
-void FASTCALL ScspMainRegWriteByte(u32 a, u8 v) { ScspMainMapAccess(); scsp_w_b(a, v); }
-void FASTCALL ScspMainRegWriteWord(u32 a, u16 v) { ScspMainMapAccess(); scsp_w_w(a, v); }
-void FASTCALL ScspMainRegWriteLong(u32 a, u32 v) { ScspMainMapAccess(); scsp_w_d(a, v); }
+#ifdef VITA_SCSP_DEFER_MAIN_WRITES
+#define SCSP_DEFER_WRITE(a, v, n) if (ScspDeferWrite(a, v, n)) return
+#else
+#define SCSP_DEFER_WRITE(a, v, n) ((void)0)
+#endif
+void FASTCALL ScspMainRamWriteByte(u32 a, u8 v) { ScspMainMapAccess(); SCSP_DEFER_WRITE(a, v, 1); SoundRamWriteByte(a, v); }
+void FASTCALL ScspMainRamWriteWord(u32 a, u16 v) { ScspMainMapAccess(); SCSP_DEFER_WRITE(a, v, 2); SoundRamWriteWord(a, v); }
+void FASTCALL ScspMainRamWriteLong(u32 a, u32 v) { ScspMainMapAccess(); SCSP_DEFER_WRITE(a, v, 4); SoundRamWriteLong(a, v); }
+u8 FASTCALL ScspMainRegReadByte(u32 a) { ScspMainMapAccess(); SCSP_DEFER_FLUSH(); return scsp_r_b(a); }
+u16 FASTCALL ScspMainRegReadWord(u32 a) { ScspMainMapAccess(); SCSP_DEFER_FLUSH(); return scsp_r_w(a); }
+u32 FASTCALL ScspMainRegReadLong(u32 a) { ScspMainMapAccess(); SCSP_DEFER_FLUSH(); return scsp_r_d(a); }
+void FASTCALL ScspMainRegWriteByte(u32 a, u8 v) { ScspMainMapAccess(); SCSP_DEFER_FLUSH(); scsp_w_b(a, v); }
+void FASTCALL ScspMainRegWriteWord(u32 a, u16 v) { ScspMainMapAccess(); SCSP_DEFER_FLUSH(); scsp_w_w(a, v); }
+void FASTCALL ScspMainRegWriteLong(u32 a, u32 v) { ScspMainMapAccess(); SCSP_DEFER_FLUSH(); scsp_w_d(a, v); }
 #endif
 static int scsp_sample_count = 0;
 static int scsp_checktime = 0;
@@ -5875,6 +5956,7 @@ void
 M68KStart (void)
 {
   SCSP_MIX_GATE();
+  SCSP_DEFER_FLUSH();
   SCSP_MAIN_GATE();
   M68K->Reset ();
   //ScspReset();
@@ -5888,6 +5970,7 @@ void
 M68KStop (void)
 {
   SCSP_MIX_GATE();
+  SCSP_DEFER_FLUSH();
   SCSP_MAIN_GATE();
   M68K->Reset();
   //ScspReset();
@@ -5900,6 +5983,7 @@ void
 ScspReset (void)
 {
   SCSP_MIX_GATE();
+  SCSP_DEFER_FLUSH();
   SCSP_MAIN_GATE();
   g_scsp_lock = 1;
   YabThreadUSleep(100000);
@@ -6203,26 +6287,49 @@ ScspConvert32uto16s (s32 *srcL, s32 *srcR, s16 *dst, u32 len)
 
 //////////////////////////////////////////////////////////////////////////////
 
+static void ScspCddaTiming(u32 left);
+static void ScspCddaAppend(const u8 *sector);
 void
 ScspReceiveCDDA (const u8 *sector)
 {
+#ifdef VITA_SCSP_DEFER_MAIN_WRITES
+  if (atomic_load_explicit(&scsp_mix_busy, memory_order_acquire) && cdda_pend_n < CDDA_PEND_MAX &&
+      g_scsp_main_mode == 0 && !use_new_scsp && !VitaSoundBudgetBlocking()) {
+    u32 left = cdda_pend_n ? cdda_virtual_left : cdda_after_mix;
+    ScspCddaTiming(left);
+    memcpy(cdda_pend[cdda_pend_n++], sector, 2352);
+    left += 2352;
+    if (left > sizeof(cddabuf.data)) left = sizeof(cddabuf.data);
+    cdda_virtual_left = left;
+    ++g_scsp_defer_sectors;
+    return;
+  }
+  ScspDeferFlush();
+#endif
   SCSP_MIX_GATE();
+  ScspCddaTiming(cdda_out_left);
+  ScspCddaAppend(sector);
+}
+static void ScspCddaTiming(u32 left)
+{
    VT_SCOPE(VT_CDDA);
    // If buffer is half empty or less, boost timing for a bit until we've buffered a few sectors
-   if (cdda_out_left < (sizeof(cddabuf.data) / 2))
+   if (left < (sizeof(cddabuf.data) / 2))
    {
       Cs2Area->isaudio = 0;
       Cs2SetTiming(1);
 		Cs2Area->isaudio = 1;
    }
-	else if (cdda_out_left > (sizeof(cddabuf.data) * 3 / 4 ))
+	else if (left > (sizeof(cddabuf.data) * 3 / 4 ))
 		Cs2SetTiming(0);
    else
    {
       Cs2Area->isaudio = 1;
       Cs2SetTiming(1);
    }
-
+}
+static void ScspCddaAppend(const u8 *sector)
+{
   memcpy(cddabuf.data+cdda_next_in, sector, 2352);
   if (sizeof(cddabuf.data)-cdda_next_in <= 2352)
      cdda_next_in = 0;
@@ -6504,7 +6611,11 @@ void ScspAsynMainCpuTime( void * p ){
         ScspCpuFrameEnd();
 #ifdef VITA_SCSP_MIX_AFTER_SYNC
         VitaM68kNativePark();
+#ifdef VITA_SCSP_DEFER_MAIN_WRITES
+        ScspMixBegin();
+#else
         atomic_store_explicit(&scsp_mix_busy, 1, memory_order_release);
+#endif
         YabAddEventQueue( q_scsp_finish , 0);
         scsp_defer_output = 1;
         ScspExecAsync();
@@ -7043,6 +7154,7 @@ int
 SoundSaveState (FILE *fp)
 {
   SCSP_MIX_GATE();
+  SCSP_DEFER_FLUSH();
   SCSP_MAIN_GATE();
   int i;
   u32 temp;
@@ -7338,6 +7450,7 @@ int
 SoundLoadState (FILE *fp, int version, int size)
 {
   SCSP_MIX_GATE();
+  SCSP_DEFER_FLUSH();
   SCSP_MAIN_GATE();
   C68K_NATIVE_GUARD;
   int i, i2;

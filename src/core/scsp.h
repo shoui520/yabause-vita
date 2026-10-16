@@ -161,6 +161,7 @@ u32 FASTCALL ScspMainRamReadLong(u32);
 void FASTCALL ScspMainRamWriteByte(u32, u8);
 void FASTCALL ScspMainRamWriteWord(u32, u16);
 void FASTCALL ScspMainRamWriteLong(u32, u32);
+void ScspDeferFlush(void);
 u8 FASTCALL ScspMainRegReadByte(u32);
 u16 FASTCALL ScspMainRegReadWord(u32);
 u32 FASTCALL ScspMainRegReadLong(u32);

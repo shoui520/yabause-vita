@@ -1119,9 +1119,15 @@ int main(int argc, char **argv) {
       { extern void VitaSh2MemReport(void); VitaSh2MemReport(); }
 #endif
 #ifdef VITA_SCSP_MIX_AFTER_SYNC
-      { extern u32 g_scsp_mix_waits, g_scsp_mix_spins;
-        YuiMsg("scsp_mix_gate waits=%u spins=%u", g_scsp_mix_waits, g_scsp_mix_spins);
-        g_scsp_mix_waits = g_scsp_mix_spins = 0; }
+      { extern u32 g_scsp_mix_waits, g_scsp_mix_spins; extern u64 g_scsp_mix_wait_ticks;
+        YuiMsg("scsp_mix_gate waits=%u spins=%u us=%llu", g_scsp_mix_waits, g_scsp_mix_spins,
+               (unsigned long long)(g_scsp_mix_wait_ticks * 1000000 / yabsys.tickfreq));
+        g_scsp_mix_waits = g_scsp_mix_spins = 0; g_scsp_mix_wait_ticks = 0; }
+#ifdef VITA_SCSP_DEFER_MAIN_WRITES
+      { extern u32 g_scsp_defer_writes, g_scsp_defer_waits, g_scsp_defer_sectors;
+        YuiMsg("scsp_defer writes=%u sectors=%u waits=%u", g_scsp_defer_writes, g_scsp_defer_sectors, g_scsp_defer_waits);
+        g_scsp_defer_writes = g_scsp_defer_waits = g_scsp_defer_sectors = 0; }
+#endif
 #endif
 #ifdef VITA_M68K_IDLE_ORBIT
       {

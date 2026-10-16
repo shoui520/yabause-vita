@@ -833,6 +833,9 @@ int YabauseEmulate(void) {
          if (yabsys.LineCount == yabsys.VBlankLineCount) {
 
 #if defined(ASYNC_SCSP)
+#ifdef VITA_SCSP_DEFER_MAIN_WRITES
+            ScspDeferFlush();   /* the 68000's frame reads sound RAM */
+#endif
             setM68kCounter((u64)(44100 * 256 / 60) << SCSP_FRACTIONAL_BITS);
 #endif
             PROFILE_START("vblankin");
@@ -960,8 +963,12 @@ int YabauseEmulate(void) {
         // the reset before waking the next sound frame. Re-publishing that
         // unchanged budget here only bounces a 64-bit atomic between cores.
         // Keep incremental budgets and the alternate pacing mode unchanged.
-        if (m68k_cycles_per_deciline != 0 || g_scsp_main_mode != 0)
+        if (m68k_cycles_per_deciline != 0 || g_scsp_main_mode != 0) {
+#ifdef VITA_SCSP_DEFER_MAIN_WRITES
+          ScspDeferFlush();
+#endif
           setM68kCounter(saved_m68k_cycles);
+        }
 #endif
       }
       PROFILE_STOP("Total Emulation");
