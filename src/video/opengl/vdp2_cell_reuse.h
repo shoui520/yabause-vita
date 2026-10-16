@@ -2,6 +2,7 @@
 #ifndef VDP2_CELL_REUSE_H
 #define VDP2_CELL_REUSE_H
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 /* Cross-frame reuse of decoded VDP2 cell patterns (fast 4/8bpp path).
  *
@@ -62,6 +63,39 @@ static inline unsigned Vdp2CellReuseSlot(const Vdp2CellReuseRecord *records, con
     if (age > oldest || w == set) { oldest = age; victim = w; }
   }
   return victim;
+}
+
+/* Records in allocation order. A frame allocates its patterns in the same
+ * order as the last frame its storage held when nothing changed, so the k-th
+ * reusable pattern looks only at the k-th record of that frame's list, and
+ * the lookups walk memory in order. A list is retagged with the frame that
+ * rewrites it; a frame with no list of its prev_frame takes the oldest. */
+enum { CELL_REUSE_LISTS = 5, CELL_REUSE_LIST_LEN = 12288 };
+typedef struct {
+  Vdp2CellReuseRecord *records[CELL_REUSE_LISTS];
+  unsigned tag[CELL_REUSE_LISTS], valid[CELL_REUSE_LISTS];
+  unsigned frame, started, list, pos;
+} Vdp2CellReuseSeq;
+
+/* The next record of this frame, or NULL past the end or without memory. */
+static inline Vdp2CellReuseRecord *Vdp2CellReuseNext(Vdp2CellReuseSeq *s, unsigned frame,
+                                                    unsigned prev_frame) {
+  if (!s->started || s->frame != frame) {
+    unsigned pick = CELL_REUSE_LISTS, oldest = 0;
+    for (unsigned i = 0; i < CELL_REUSE_LISTS; ++i)
+      if (s->valid[i] && s->tag[i] == prev_frame) { pick = i; break; }
+    if (pick == CELL_REUSE_LISTS) {
+      for (unsigned i = 0; i < CELL_REUSE_LISTS; ++i) {
+        const unsigned age = s->valid[i] ? frame - s->tag[i] : ~0u;
+        if (pick == CELL_REUSE_LISTS || age > oldest) { pick = i; oldest = age; }
+      }
+    }
+    if (!s->records[pick]) s->records[pick] = calloc(CELL_REUSE_LIST_LEN, sizeof(Vdp2CellReuseRecord));
+    s->tag[pick] = frame; s->valid[pick] = 1;
+    s->frame = frame; s->started = 1; s->list = pick; s->pos = 0;
+  }
+  if (!s->records[s->list] || s->pos >= CELL_REUSE_LIST_LEN) return NULL;
+  return &s->records[s->list][s->pos++];
 }
 
 /* Source bytes of one pattern: patternwh^2 cells of 32 (4bpp) or 64 (8bpp). */

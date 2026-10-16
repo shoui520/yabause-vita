@@ -573,7 +573,78 @@ static u32 FASTCALL Vdp1ReadPolygonColor(vdp1cmd_struct *cmd)
 }
 
 #include "vdp2_cell_decode.h"
+
+/* Bumped per VIDOGLVdp2DrawScreens: color RAM is fixed while one draws. */
+static unsigned vdp2_cell_msb_draw = 1;
+
+/* Special color mode 3 takes each dot's alpha from its color RAM word's MSB
+ * (Vdp2CellMsbTexel). Per draw and 4/8bpp palette base: whether the reachable
+ * words agree (1 all set, 0 all clear, -1 mixed), and a version that changes
+ * whenever their MSB pattern does, which keys reuse of mixed palettes. */
+typedef struct { unsigned tag, version; signed char value; uint32_t bits[8]; } Vdp2CellMsbSlot;
+static Vdp2CellMsbSlot *Vdp2CellPaletteMsbSlot(uint32_t base, unsigned n) {
+  static Vdp2CellMsbSlot slots[512];
+  static unsigned versions;
+  Vdp2CellMsbSlot *slot = &slots[((base >> 4) & 255) | (n == 256 ? 256 : 0)];
+  if (slot->tag == vdp2_cell_msb_draw) return slot;
+  const int cram_shift = Vdp2Internal.ColorMode <= 1 ? 1 : Vdp2Internal.ColorMode == 2 ? 2 : -1;
+  uint32_t bits[8] = {0};
+  if (cram_shift >= 0) {
+    for (unsigned i = 0; i < n; ++i) {
+      uint16_t word;
+      memcpy(&word, Vdp2ColorRam + (((base + i) << cram_shift) & 0xFFF), 2);
+      bits[i >> 5] |= (uint32_t)(word >> 15) << (i & 31);
+    }
+  }
+  unsigned set = 0;
+  for (unsigned i = 0; i < n; ++i) set += (bits[i >> 5] >> (i & 31)) & 1;
+  if (!slot->version || memcmp(slot->bits, bits, sizeof(bits))) {
+    memcpy(slot->bits, bits, sizeof(bits));
+    if (!(++versions & 0x3FFFFF)) ++versions; // keys need nonzero low bits
+    slot->version = versions & 0x3FFFFF;
+  }
+  slot->value = set == 0 ? 0 : set == n ? 1 : -1;
+  slot->tag = vdp2_cell_msb_draw;
+  return slot;
+}
+
+/* Vdp2CellConstantAlpha, plus mode 3 palettes whose MSBs agree. */
+static int Vdp2CellAlpha(const vdp2draw_struct *info, uint32_t *out) {
+  const int ccmd = (fixVdp2Regs->CCCTL >> 8) & 1;
+  if (Vdp2CellConstantAlpha(ccmd, info->specialcolormode, info->specialcolorfunction,
+                            (uint32_t)info->alpha, out)) return 1;
+  if (info->specialcolormode != 3 || (info->colornumber != 0 && info->colornumber != 1)) return 0;
+  const int msb = Vdp2CellPaletteMsbSlot((uint32_t)info->coloroffset + (uint32_t)(info->paladdr << 4),
+                                         info->colornumber == 0 ? 16 : 256)->value;
+  if (msb < 0) return 0;
+  *out = msb ? (ccmd ? 0xFFu : (uint32_t)info->alpha) : (ccmd ? 0x40u : 0xFFu);
+  return 1;
+}
+/* An alpha that is nonzero exactly when every non-transparent dot's is, for
+ * deciding from the source whether a decoded cell is all alpha 0. Mixed mode
+ * 3 palettes give each dot one of two alphas, both nonzero unless CCMD is
+ * clear and the MSB alpha is 0. */
+static int Vdp2CellClearAlpha(const vdp2draw_struct *info, uint32_t *out) {
+  if (Vdp2CellAlpha(info, out)) return 1;
+  if (info->specialcolormode != 3 || (info->colornumber != 0 && info->colornumber != 1)) return 0;
+  if (!((fixVdp2Regs->CCCTL >> 8) & 1) && info->alpha == 0) return 0;
+  *out = 0xFF;
+  return 1;
+}
+
 #ifdef VITA_VDP2_CELL_REUSE
+/* The alpha bits a decoded 4/8bpp cell carries, as a reuse key: the constant
+ * alpha, or for mixed mode 3 palettes the alpha, CCMD and MSB pattern version
+ * (nonzero low bits, so never equal to a constant). */
+static int Vdp2CellReuseAlphaKey(const vdp2draw_struct *info, uint32_t *key) {
+  uint32_t alpha;
+  if (Vdp2CellAlpha(info, &alpha)) { *key = alpha << 24; return 1; }
+  if (info->specialcolormode != 3 || (info->colornumber != 0 && info->colornumber != 1)) return 0;
+  const Vdp2CellMsbSlot *slot = Vdp2CellPaletteMsbSlot(
+      (uint32_t)info->coloroffset + (uint32_t)(info->paladdr << 4), info->colornumber == 0 ? 16 : 256);
+  *key = ((uint32_t)info->alpha << 24) | ((uint32_t)((fixVdp2Regs->CCCTL >> 8) & 1) << 22) | slot->version;
+  return 1;
+}
 #ifdef VITA_RENDER_SHADOW
 #define VDP2_CELL_REUSE_PAGE_VERSIONS   /* snapshot page stamps (render_proxy.c) */
 extern u32 vdp2_page_ver[128];
@@ -2553,8 +2624,7 @@ static void FASTCALL Vdp2DrawBitmapInner(vdp2draw_struct *info, YglTexture *text
    * same 512 KiB address mask). Access-denied lines stay transparent. */
   if ((info->colornumber == 0 || info->colornumber == 1) && info->specialprimode != 2) {
     uint32_t alpha;
-    if (Vdp2CellConstantAlpha((fixVdp2Regs->CCCTL >> 8) & 1, info->specialcolormode,
-                              info->specialcolorfunction, (uint32_t)info->alpha, &alpha)) {
+    if (Vdp2CellAlpha(info, &alpha)) {
       const uint32_t co = (uint32_t)info->coloroffset, pal = (uint32_t)(info->paladdr << 4);
       const uint32_t abits = alpha << 24;
       const int transparent = info->transparencyenable != 0;
@@ -2837,8 +2907,7 @@ static void FASTCALL Vdp2DrawCell(vdp2draw_struct *info, YglTexture *texture)
    * (vdp2_cell_decode.h); results are bit-identical to Vdp2GetPixel4/8bpp. */
   if ((info->colornumber == 0 || info->colornumber == 1) && info->specialprimode != 2) {
     uint32_t alpha;
-    if (Vdp2CellConstantAlpha((fixVdp2Regs->CCCTL >> 8) & 1, info->specialcolormode,
-                              info->specialcolorfunction, (uint32_t)info->alpha, &alpha)) {
+    if (Vdp2CellAlpha(info, &alpha)) {
       const uint32_t co = (uint32_t)info->coloroffset, pal = (uint32_t)(info->paladdr << 4);
       const uint32_t abits = alpha << 24;
       const int transparent = info->transparencyenable != 0;
@@ -3411,8 +3480,7 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
     if ((info->patternwh == 1 || info->patternwh == 2) && (info->colornumber == 0 || info->colornumber == 1) &&
         info->specialprimode != 2 && info->cellw == 8 && info->cellh == 8 &&
         (uint32_t)info->charaddr + clear_cells * clear_cell_bytes <= 0x80000 &&
-        Vdp2CellConstantAlpha((fixVdp2Regs->CCCTL >> 8) & 1, info->specialcolormode,
-                              info->specialcolorfunction, (uint32_t)info->alpha, &clear_alpha))
+        Vdp2CellClearAlpha(info, &clear_alpha))
       cell_clear = Vdp2CellsTransparent(Vdp2Ram, (uint32_t)info->charaddr, clear_cells, clear_cell_bytes,
                                         info->char_bank, clear_alpha << 24, info->transparencyenable != 0);
   }
@@ -3440,21 +3508,19 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
     if (!cell_skip && (info->patternwh == 1 || info->patternwh == 2) && (info->colornumber == 0 || info->colornumber == 1) &&
         info->specialprimode != 2 && info->cellw == 8 && info->cellh == 8 &&
         (uint32_t)info->charaddr + reuse_bytes <= 0x80000 &&
-        Vdp2CellConstantAlpha((fixVdp2Regs->CCCTL >> 8) & 1, info->specialcolormode,
-                              info->specialcolorfunction, (uint32_t)info->alpha, &reuse_alpha)) {
+        Vdp2CellReuseAlphaKey(info, &reuse_alpha)) {
       extern unsigned vita_atlas_frame, vita_atlas_gen, vita_atlas_prev_frame;
-      static Vdp2CellReuseRecord *records;
-      if (!records) records = calloc(CELL_REUSE_SLOTS, sizeof(*records));
-      if (records) {
+      static Vdp2CellReuseSeq reuse_seq;
+      reuse_record = Vdp2CellReuseNext(&reuse_seq, vita_atlas_frame, vita_atlas_prev_frame);
+      if (reuse_record) {
         reuse_query = (Vdp2CellReuseQuery){ texture->textdata, vita_atlas_prev_frame, vita_atlas_frame,
           vita_atlas_gen, texture->w, info->patternwh, info->colornumber, info->transparencyenable != 0,
           (uint32_t)info->charaddr, (uint32_t)info->coloroffset, (uint32_t)(info->paladdr << 4),
-          reuse_alpha << 24, info->char_bank, reuse_bytes, Vdp2Ram + info->charaddr
+          reuse_alpha, info->char_bank, reuse_bytes, Vdp2Ram + info->charaddr
 #ifdef VDP2_CELL_REUSE_PAGE_VERSIONS
           , vdp2_page_ver
 #endif
           };
-        reuse_record = &records[Vdp2CellReuseSlot(records, texture->textdata, vita_atlas_frame)];
         cell_reused = Vdp2CellReuseMatch(reuse_record, &reuse_query);
 #ifdef VITA_STACK_PROFILE
         { static unsigned rd[8]; const Vdp2CellReuseRecord *r = reuse_record; const Vdp2CellReuseQuery *q = &reuse_query;
@@ -10454,6 +10520,7 @@ void VIDOGLVdp2DrawScreens(void)
   fixVdp2Regs = &baseVdp2Regs;
 
   YglUpdateColorRam();
+  if (!++vdp2_cell_msb_draw) ++vdp2_cell_msb_draw; // 0 tags an empty slot
 
   Vdp2GenerateWindowInfo();
 

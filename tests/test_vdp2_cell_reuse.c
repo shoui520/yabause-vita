@@ -100,6 +100,17 @@ int main(void) {
   table[Vdp2CellReuseSlot(table, same[0], 20)].frame = 19; /* refreshed by a reuse */
   victim = &table[Vdp2CellReuseSlot(table, same[CELL_REUSE_WAYS], 20)];
   assert(victim->dst == same[1]);
+  /* Allocation-order lists: a frame reads the list of its storage's previous
+   * frame in order and rewrites it; an unknown previous frame takes the oldest. */
+  static Vdp2CellReuseSeq seq;
+  Vdp2CellReuseRecord *a0 = Vdp2CellReuseNext(&seq, 1, ~0u), *a1 = Vdp2CellReuseNext(&seq, 1, ~0u);
+  assert(a0 && a1 == a0 + 1);
+  Vdp2CellReuseRecord *b0 = Vdp2CellReuseNext(&seq, 2, ~0u);
+  assert(b0 && b0 != a0);
+  assert(Vdp2CellReuseNext(&seq, 5, 1) == a0);   /* frame 5's storage last held frame 1 */
+  assert(Vdp2CellReuseNext(&seq, 5, 1) == a1);
+  assert(Vdp2CellReuseNext(&seq, 6, 2) == b0);
+  assert(Vdp2CellReuseNext(&seq, 9, 5) == a0);
   puts("vdp2_cell_reuse: ok");
   return 0;
 }
