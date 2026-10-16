@@ -1877,11 +1877,12 @@ static unsigned cdda_pend_n;          /* main thread only */
 static u32 cdda_after_mix, cdda_virtual_left;
 static void ScspCddaAppend(const u8 *sector);
 static u32 scspsoundlen;
-static void ScspMixBegin(void) {
-  const u32 take = cdda_out_left / 4 < scspsoundlen ? cdda_out_left / 4 : scspsoundlen;
-  cdda_after_mix = cdda_out_left - take * 4;
+static void ScspMixBeginFrom(u32 left) {
+  const u32 take = left / 4 < scspsoundlen ? left / 4 : scspsoundlen;
+  cdda_after_mix = left - take * 4;
   atomic_store_explicit(&scsp_mix_busy, 1, memory_order_release);
 }
+static void ScspMixBegin(void) { ScspMixBeginFrom(cdda_out_left); }
 static void ScspDeferApply(void) {
   for (unsigned i = 0; i < cdda_pend_n; ++i) ScspCddaAppend(cdda_pend[i]);
   cdda_pend_n = 0;
@@ -1951,6 +1952,18 @@ static _Atomic int early_snap_ok;
 static u8 *ScspEarlySnapRam(u32 *mem4b);
 void SyncSh2And68k();
 static int early_in_frame, early_self_abort;   /* worker only */
+#if defined(VITA_SCSP_DEFER_MAIN_WRITES) && !defined(VITA_M68K_NATIVE_EXECUTION)
+/* The worker mixes a finished early frame while it waits for VBlank-in
+ * instead of after the commit, so a short next frame need not wait for that
+ * mix. The mix reads the CDDA ring as it is at VBlank-in, so it is only
+ * tried while no CD audio plays, and a sector delivered from then until the
+ * frame commits cancels the frame first (cdda_delivering and early_spec form
+ * a Dekker pair). A rollback also restores what the mix moved. */
+#define VITA_SCSP_EARLY_MIX
+static _Atomic int early_spec, cdda_delivering;
+static int early_mixed;                         /* worker only */
+static u32 early_cdda_left0, early_genpos0, early_outleft0;
+#endif
 /* 4 KB sound RAM pages written since the early frame's snapshot; every
  * writer reports through M68KWriteNotify. A rollback restores only these. */
 static u32 early_dirty[0x80000 >> 12 >> 5];
@@ -1977,10 +1990,11 @@ static unsigned early_line, early_quiet;       /* main side only (policy) */
 /* The worker blocks here once its frame is done, until the main side
  * decides (commit or abort) and posts exactly once. */
 static YabEventQueue *early_decision;
-u32 g_early_stats[5];
+u32 g_early_stats[8];
 #ifdef A9_DIAG_EARLY_VERIFY
 u32 g_early_verify[2];
-#endif   /* commits, main rollbacks, self rollbacks, commit waits, frames */
+#endif   /* commits, main rollbacks, self rollbacks, commit waits, frames,
+            requested but unstarted, unrequested, blocked */
 static int ScspEarlyUsable(void) {
   return !use_new_scsp && g_scsp_main_mode == 0 && ScspHasAsyncWorker() &&
          !VitaSoundBudgetBlocking() && M68K && M68K->id == M68KCORE_C68K;
@@ -2026,15 +2040,15 @@ void ScspEarlyLine(void) {
     atomic_compare_exchange_strong(&early_state, &s, EARLY_REQUESTED);
 }
 /* Main side at VBlank-in, with the frame's budget published: 1 when an early
- * frame stood and has been committed (the worker mixes it next), else 0 (the
- * worker runs the frame now, as before). */
+ * frame stood and has been committed (the worker mixes it next, unless it
+ * already has), else 0 (the worker runs the frame now, as before). */
 int ScspEarlyCommit(void) {
   early_line = 0;
   for (;;) {
     int s = atomic_load_explicit(&early_state, memory_order_acquire);
     switch (s) {
     case EARLY_REQUESTED:
-      if (atomic_compare_exchange_weak(&early_state, &s, EARLY_IDLE)) return 0;
+      if (atomic_compare_exchange_weak(&early_state, &s, EARLY_IDLE)) { ++g_early_stats[5]; return 0; }
       break;
     case EARLY_RUNNING:
       ++g_early_stats[3];
@@ -2042,6 +2056,11 @@ int ScspEarlyCommit(void) {
         __asm__ volatile("yield");
       break;
     case EARLY_DONE:
+#ifdef VITA_SCSP_EARLY_MIX
+      /* The worker may be mixing: its CDDA ring is read only as it was. */
+      if (atomic_load(&early_spec)) ScspMixBeginFrom(early_cdda_left0);
+      else
+#endif
 #ifdef VITA_SCSP_DEFER_MAIN_WRITES
       ScspMixBegin();
 #else
@@ -2053,8 +2072,10 @@ int ScspEarlyCommit(void) {
       return 1;
     case EARLY_BLOCKED:
       atomic_store_explicit(&early_state, EARLY_IDLE, memory_order_release);
+      ++g_early_stats[7];
       return 0;
     default:
+      ++g_early_stats[6];
       return 0;
     }
   }
@@ -6289,9 +6310,21 @@ ScspConvert32uto16s (s32 *srcL, s32 *srcR, s16 *dst, u32 len)
 
 static void ScspCddaTiming(u32 left);
 static void ScspCddaAppend(const u8 *sector);
+#ifdef VITA_SCSP_EARLY_MIX
+static void ScspReceiveCDDAOne(const u8 *sector);
+#endif
 void
 ScspReceiveCDDA (const u8 *sector)
 {
+#ifdef VITA_SCSP_EARLY_MIX
+  atomic_store(&cdda_delivering, 1);
+  if (atomic_load(&early_spec)) ScspEarlyCancel();
+  ScspReceiveCDDAOne(sector);
+  atomic_store_explicit(&cdda_delivering, 0, memory_order_release);
+}
+static void ScspReceiveCDDAOne(const u8 *sector)
+{
+#endif
 #ifdef VITA_SCSP_DEFER_MAIN_WRITES
   if (atomic_load_explicit(&scsp_mix_busy, memory_order_acquire) && cdda_pend_n < CDDA_PEND_MAX &&
       g_scsp_main_mode == 0 && !use_new_scsp && !VitaSoundBudgetBlocking()) {
@@ -6498,9 +6531,28 @@ static int ScspEarlyRun(void) {
   ScspCpuFrameEnd();
   early_in_frame = 0;
   if (early_self_abort) goto rollback;
+#ifdef VITA_SCSP_EARLY_MIX
+  if (!Cs2Area->isaudio) {
+    atomic_store(&early_spec, 1);
+    if (atomic_load(&cdda_delivering)) atomic_store(&early_spec, 0);
+    else {
+      early_cdda_left0 = cdda_out_left;
+      early_genpos0 = scspsoundgenpos;
+      early_outleft0 = scspsoundoutleft;
+    }
+  }
+#endif
   s = EARLY_RUNNING;
   if (!atomic_compare_exchange_strong(&early_state, &s, EARLY_DONE)) goto rollback;
   ++g_early_stats[4];
+#ifdef VITA_SCSP_EARLY_MIX
+  if (atomic_load_explicit(&early_spec, memory_order_relaxed)) {
+    scsp_defer_output = 1;
+    ScspExecAsync();
+    scsp_defer_output = 0;
+    early_mixed = 1;
+  }
+#endif
   YabWaitEventQueue(early_decision);
   s = atomic_load_explicit(&early_state, memory_order_acquire);
   atomic_store_explicit(&early_snap_ok, 0, memory_order_release);
@@ -6509,6 +6561,15 @@ rollback:
   atomic_store_explicit(&early_snap_ok, 0, memory_order_release);
   early_in_frame = 0;
   ScspEarlyRestore();
+#ifdef VITA_SCSP_EARLY_MIX
+  if (early_mixed) {
+    cdda_out_left = early_cdda_left0;
+    scspsoundgenpos = early_genpos0;
+    scspsoundoutleft = early_outleft0;
+    early_mixed = 0;
+  }
+  atomic_store(&early_spec, 0);
+#endif
   if (early_self_abort) ++g_early_stats[2];
   atomic_store_explicit(&early_state, early_self_abort ? EARLY_BLOCKED : EARLY_IDLE, memory_order_release);
   early_self_abort = 0;
@@ -6576,13 +6637,25 @@ void ScspAsynMainCpuTime( void * p ){
     if (early) {
       /* Committed at VBlank-in: the main side set scsp_mix_busy and resumed. */
       VitaM68kNativePark();
-      scsp_defer_output = 1;
-      ScspExecAsync();
-      scsp_defer_output = 0;
+#ifdef VITA_SCSP_EARLY_MIX
+      if (early_mixed) early_mixed = 0;
+      else
+#endif
+      {
+        scsp_defer_output = 1;
+        ScspExecAsync();
+        scsp_defer_output = 0;
+      }
+#ifdef VITA_SCSP_EARLY_MIX
+      atomic_store(&early_spec, 0);
+#endif
       atomic_store_explicit(&scsp_mix_busy, 0, memory_order_release);
+      /* The next frame may be requested now: this worker takes the request
+       * only after its output and the frame start, and output can wait for
+       * audio pacing well into the next frame. */
+      atomic_store_explicit(&early_state, EARLY_IDLE, memory_order_release);
       ScspFlushOutput();
       YabWaitEventQueue(q_scsp_frame_start);
-      atomic_store_explicit(&early_state, EARLY_IDLE, memory_order_release);
       VitaM68kNativeResume();
       pre_m68k_cycle = 0;
       setM68kDoneCounter(pre_m68k_cycle);
