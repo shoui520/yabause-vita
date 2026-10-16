@@ -3871,9 +3871,9 @@ static INLINE u32 Vdp2RotationFetchPixel(vdp2draw_struct *info, int x, int y, in
 
 /* One 8-dot cell row of a 4bpp (colornumber 0) or 8bpp (1) cell at rowaddr
  * in VDP2 RAM, read forwards (fx 0) or mirrored (fx 7): the dot's CRAM
- * index base + dot with alpha a24 in the top byte, or 0 for a transparent
- * dot 0. */
-static INLINE void Vdp2PerLineDecodeCellRow(u32 rowaddr, int colornumber, int fx, u32 base, u32 a24, int transp,
+ * index base + dot with alpha at[(dot & 15) >> 1] in the top byte, or 0 for
+ * a transparent dot 0. */
+static INLINE void Vdp2PerLineDecodeCellRow(u32 rowaddr, int colornumber, int fx, u32 base, const u8 at[8], int transp,
                                             u32 *row) {
   if (rowaddr + 8 <= 0x80000 && (fx == 0 || fx == 7)) {
     uint8x8_t dots;
@@ -3888,8 +3888,12 @@ static INLINE void Vdp2PerLineDecodeCellRow(u32 rowaddr, int colornumber, int fx
     if (fx) dots = vrev64_u8(dots);
     const uint16x8_t d16 = vmovl_u8(dots);
     const uint32x4_t lo = vmovl_u16(vget_low_u16(d16)), hi = vmovl_u16(vget_high_u16(d16));
-    const uint32x4_t b4 = vdupq_n_u32(base), a4 = vdupq_n_u32(a24);
-    uint32x4_t tlo = vorrq_u32(vaddq_u32(b4, lo), a4), thi = vorrq_u32(vaddq_u32(b4, hi), a4);
+    const uint8x8_t a8 = vtbl1_u8(vld1_u8(at), vshr_n_u8(vand_u8(dots, vdup_n_u8(0xF)), 1));
+    const uint16x8_t a16 = vmovl_u8(a8);
+    const uint32x4_t alo = vshlq_n_u32(vmovl_u16(vget_low_u16(a16)), 24);
+    const uint32x4_t ahi = vshlq_n_u32(vmovl_u16(vget_high_u16(a16)), 24);
+    const uint32x4_t b4 = vdupq_n_u32(base);
+    uint32x4_t tlo = vorrq_u32(vaddq_u32(b4, lo), alo), thi = vorrq_u32(vaddq_u32(b4, hi), ahi);
     if (transp) {
       tlo = vbicq_u32(tlo, vceqq_u32(lo, vdupq_n_u32(0)));
       thi = vbicq_u32(thi, vceqq_u32(hi, vdupq_n_u32(0)));
@@ -3903,28 +3907,48 @@ static INLINE void Vdp2PerLineDecodeCellRow(u32 rowaddr, int colornumber, int fx
       const int x = k ^ fx;
       u32 dot = T1ReadByte(Vdp2Ram, (rowaddr + (x >> 1)) & 0x7FFFF);
       dot = (x & 1) ? (dot & 0xF) : (dot >> 4);
-      row[k] = (dot == 0 && transp) ? 0 : ((base + dot) | a24);
+      row[k] = (dot == 0 && transp) ? 0 : ((base + dot) | (u32)at[(dot & 0xF) >> 1] << 24);
     }
   } else {
     for (int k = 0; k < 8; ++k) {
       const u32 dot = T1ReadByte(Vdp2Ram, (rowaddr + (k ^ fx)) & 0x7FFFF);
-      row[k] = (dot == 0 && transp) ? 0 : ((base + dot) | a24);
+      row[k] = (dot == 0 && transp) ? 0 : ((base + dot) | (u32)at[(dot & 0xF) >> 1] << 24);
     }
   }
 }
 
 /* Whether Vdp2PerLineDecodeCellRow decodes the layer's cells. */
 static INLINE int Vdp2PerLineCellRowFast(const vdp2draw_struct *info) {
-  return info->colornumber <= 1 && info->specialprimode != 2 && info->specialcolormode <= 1 && info->cellw == 8;
+  return info->colornumber <= 1 && info->specialprimode != 2 && info->specialcolormode <= 2 && info->cellw == 8;
 }
 
+/* The alpha of each (dot & 15) >> 1 for the current pattern, as
+ * Vdp2RotationFetchPixel picks it for special color modes 0 to 2. */
+static INLINE void Vdp2PerLineAlphaTable(const vdp2draw_struct *info, u8 at[8]) {
+  for (int i = 0; i < 8; ++i) {
+    u8 a = info->alpha;
+    if (info->specialcolormode == 1 && info->specialcolorfunction == 0) a = 0xFF;
+    if (info->specialcolormode == 2 &&
+        (info->specialcolorfunction == 0 || (info->specialcode & (1 << i)) == 0)) a = 0xFF;
+    at[i] = a;
+  }
+}
+
+#ifdef VITA_VDP2_PERLINE_VERIFY
+static int vt_perline_reference; /* the reference draw decodes dot by dot */
+#endif
 /* rowcache[k] == Vdp2RotationFetchPixel(info, k ^ fx, y, info->cellw) for k in 0..7. */
 static INLINE void Vdp2PerLineDecodeRow(vdp2draw_struct *info, int y, int fx, u32 *row) {
   const int cellw = info->cellw;
+#ifdef VITA_VDP2_PERLINE_VERIFY
+  if (!vt_perline_reference && Vdp2PerLineCellRowFast(info)) {
+#else
   if (Vdp2PerLineCellRowFast(info)) {
-    const u32 alpha = (info->specialcolormode == 1 && info->specialcolorfunction == 0) ? 0xFF : info->alpha;
+#endif
+    u8 at[8];
+    Vdp2PerLineAlphaTable(info, at);
     const u32 rowaddr = (info->charaddr + y * (info->colornumber == 0 ? 4 : 8)) & 0x7FFFF;
-    Vdp2PerLineDecodeCellRow(rowaddr, info->colornumber, fx, info->coloroffset + (info->paladdr << 4), alpha << 24,
+    Vdp2PerLineDecodeCellRow(rowaddr, info->colornumber, fx, info->coloroffset + (info->paladdr << 4), at,
                              info->transparencyenable, row);
     return;
   }
@@ -4123,7 +4147,7 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
       for (int j = 0; j < draww; ++j) hmap[j] = (j * inch0) >> 8;
       const int pitch = draww + texture->w;
       u32 *const out0 = texture->textdata;
-      typedef struct { u32 a0; int dy, fx; u32 base, a24; } PlCell;
+      typedef struct { u32 a0; int dy, fx; u32 base; u8 at[8]; } PlCell;
       typedef struct { u32 charaddr; int paladdr, flip, sf, scf, charx; } PlPattern;
       static PlCell cells[PL_BAND_CELLS];
       static PlPattern pats[PL_BAND_CELLS];
@@ -4187,7 +4211,7 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
                 e->dy = (y1 - y0) * row_bytes;
                 e->fx = x0 & 7;
                 e->base = info->coloroffset + (info->paladdr << 4);
-                e->a24 = (u32)((info->specialcolormode == 1 && info->specialcolorfunction == 0) ? 0xFF : info->alpha) << 24;
+                Vdp2PerLineAlphaTable(info, e->at);
               }
             }
           }
@@ -4200,7 +4224,7 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
           const PlCell *e = &cells[c0 - band_cmin];
           u32 *dst = srcrow;
           for (int c = c0; c <= c1; ++c, ++e, dst += 8)
-            Vdp2PerLineDecodeCellRow((e->a0 + r * e->dy) & 0x7FFFF, colornumber, e->fx, e->base, e->a24, transp, dst);
+            Vdp2PerLineDecodeCellRow((e->a0 + r * e->dy) & 0x7FFFF, colornumber, e->fx, e->base, e->at, transp, dst);
         } else {
           u32 *dst = srcrow;
           for (int c = c0; c <= c1; ++c, dst += 8) {
@@ -4264,9 +4288,9 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
         ref.textdata = scratch;
         ref.w = 0;
         vdp2draw_struct saved = *info;
-        verify_ref = 1;
+        verify_ref = vt_perline_reference = 1;
         Vdp2DrawMapPerLine(info, &ref);
-        verify_ref = 0;
+        verify_ref = vt_perline_reference = 0;
         *info = saved;
         int bad = 0;
         for (int vl = 0; vl < vdp2height && !bad; ++vl)
