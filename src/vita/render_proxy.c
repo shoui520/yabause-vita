@@ -29,6 +29,7 @@
  * Calls that return renderer state or touch the VDP1 framebuffer wait for
  * the render thread to reach them. */
 #ifdef VITA_RENDER_THREAD
+#include "gpuprof.h"
 #include <pthread.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
@@ -232,6 +233,10 @@ static void Execute(Cmd *c) {
     rs_Vdp1FrameBuffer[1] = Vdp1FrameBuffer[1];
     rs_VIDCore = &VIDOGL;
   }
+  static const char *const gp_names[] = {"init","deinit","resize","isfull","v1reset","v1start","v1end",
+    "fbread","fbwrite","erase","fchange","v2reset","v2start","v2end","v2screens","glsize","setting","sync",
+    "native","dispoff","cram","fbwrites","call","quit"};
+  const int gp_scope = VitaGpuProfScope(c->fn >= 0 && c->fn <= FN_QUIT ? gp_names[c->fn] : "?");
   switch (c->fn) {
     case FN_INIT: c->ret = VIDOGL.Init(); break;
     case FN_DEINIT: VIDOGL.DeInit(); break;
@@ -246,7 +251,7 @@ static void Execute(Cmd *c) {
     case FN_FCHANGE: VIDOGL.Vdp1FrameChange(); break;
     case FN_V2RESET: c->ret = VIDOGL.Vdp2Reset(); break;
     case FN_V2START: VIDOGL.Vdp2DrawStart(); break;
-    case FN_V2END: VIDOGL.Vdp2DrawEnd(); break;
+    case FN_V2END: VIDOGL.Vdp2DrawEnd(); { static uint64_t presented; VitaGpuProfFrame(++presented); } break;
     case FN_V2SCREENS: VIDOGL.Vdp2DrawScreens(); break;
     case FN_GLSIZE: VIDOGL.GetGlSize((int *)c->p[0], (int *)c->p[1]); break;
     case FN_SETTING: VIDOGL.SetSettingValue((int)c->a[0], (int)c->a[1]); break;
@@ -276,6 +281,7 @@ static void Execute(Cmd *c) {
     }
     default: break;
   }
+  VitaGpuProfScopeEnd(gp_scope);
 }
 
 /* Wall time spent executing queued calls (excludes waiting for work). */
@@ -308,6 +314,7 @@ static void *RenderMain(void *arg) {
   (void)arg;
   YabThreadSetCurrentThreadAffinityMask(4);
   VitaGraphicsAdoptOwner();
+  VitaGpuProfThreadBegin();
 #if defined(VITA_STACK_PROFILE) && defined(VITA_STACK_PROFILE_RENDER)
   { extern void VitaStackAdoptSecondThread(void); VitaStackAdoptSecondThread(); }  /* stack2_sample = render thread */
 #endif

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
+#include "gpuprof.h"
 #include <psp2/kernel/processmgr.h>
 #include "diag_timers.h"
 #include <malloc.h>
@@ -856,9 +857,11 @@ int main(int argc, char **argv) {
   YuiMsg("shader_cache=" DATA "shader_cache/cg-o3-strict");
 #endif
   /* Pinned vitaGL returns resolution-fallback, NOT success/failure. */
+  VitaGpuProfInit(DATA "gpuprof.txt", DATA "gpuprof.csv", run_id);
   GLboolean resolution_fallback = vglInitWithCustomSizes(0, 960, 544,
     32*1024*1024, 48*1024*1024, 0, 0, SCE_GXM_MULTISAMPLE_NONE);
   graphics_ready = 1;
+  VitaGpuProfStartSampler();
 #ifdef VITA_DIAG_NO_VSYNC
   /* Diagnostic only: vitaGL defaults to vsync_interval=1 (vgl.c), waiting a
    * vblank in the display callback (gxm.c). Frame contents are unchanged. */

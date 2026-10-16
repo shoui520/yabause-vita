@@ -1525,6 +1525,36 @@ if(VITA_RENDER_THREAD AND VITA_FB_DIRECT_READ)
   set_property(SOURCE src/core/sh2_dynarec/DynarecSh2CInterface.cpp src/core/scu.c src/vita/render_proxy.c
     src/video/opengl/ygles.c APPEND PROPERTY COMPILE_DEFINITIONS VITA_FB_DIRECT_READ)
 endif()
+option(VITA_GPUPROF "GPU capture with psp2-cex-gpues4-prof on request (development builds)" OFF)
+set(VITA_GPUPROF_PREFIX "" CACHE PATH "psp2-cex-gpues4-prof install prefix, built with its vitaGL adapter")
+if(VITA_GPUPROF)
+  if(NOT VITA_RENDER_THREAD OR NOT EXISTS "${VITA_GPUPROF_PREFIX}/lib/libpsp2_gpuprof_vitagl.a")
+    message(FATAL_ERROR "VITA_GPUPROF needs VITA_RENDER_THREAD and VITA_GPUPROF_PREFIX with the vitaGL adapter")
+  endif()
+  target_sources(yabause-vita PRIVATE src/vita/gpuprof.c)
+  set_source_files_properties(src/vita/gpuprof.c PROPERTIES INCLUDE_DIRECTORIES "${VITA_GPUPROF_PREFIX}/include")
+  set_property(SOURCE src/vita/main.c src/vita/render_proxy.c src/vita/gpuprof.c
+    APPEND PROPERTY COMPILE_DEFINITIONS VITA_GPUPROF)
+  target_link_libraries(yabause-vita PRIVATE
+    "${VITA_GPUPROF_PREFIX}/lib/libpsp2_gpuprof_vitagl.a" "${VITA_GPUPROF_PREFIX}/lib/libpsp2_gpuprof_client.a"
+    "${VITA_GPUPROF_PREFIX}/lib/libpsp2_gpuprof_gxm_observer.a" "${VITA_GPUPROF_PREFIX}/lib/libpsp2_gpuprof_stub.a"
+    ScePower_stub)
+  foreach(call BeginScene EndScene MidSceneFlush Draw DrawInstanced DrawPrecomputed
+      SetVertexProgram SetFragmentProgram CreateContext DestroyContext
+      ShaderPatcherCreateVertexProgram ShaderPatcherCreateFragmentProgram
+      ShaderPatcherAddRefVertexProgram ShaderPatcherAddRefFragmentProgram
+      ShaderPatcherReleaseVertexProgram ShaderPatcherReleaseFragmentProgram ShaderPatcherDestroy
+      DisplayQueueAddEntry TransferCopy TransferFill TransferDownscale TransferFinish
+      SetFrontFragmentProgramEnable SetBackFragmentProgramEnable
+      ShaderPatcherCreateMaskUpdateFragmentProgram)
+    target_link_options(yabause-vita PRIVATE "-Wl,--wrap=sceGxm${call}")
+  endforeach()
+  foreach(call glCreateProgram glDeleteProgram glUseProgram glDrawArrays glDrawElements
+      glDrawRangeElements glDrawArraysInstanced glDrawElementsInstanced
+      glDrawElementsBaseVertex glDrawRangeElementsBaseVertex vglSwapBuffers)
+    target_link_options(yabause-vita PRIVATE "-Wl,--wrap=${call}")
+  endforeach()
+endif()
 if(VITA_RENDER_THREAD)
   if(NOT YABAUSE_VITAGL)
     message(FATAL_ERROR "The render proxy wraps the vitaGL renderer")
