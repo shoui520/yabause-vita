@@ -4096,7 +4096,7 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
 #ifdef VITA_STACK_PROFILE
   if (vt_pl_mode != 4)
 #endif
-  if (!VDPLINE_SY(info->islinescroll) && !VDPLINE_SZ(info->islinescroll) && incv > 0 &&
+  if (!VDPLINE_SZ(info->islinescroll) && (incv > 0 || VDPLINE_SY(info->islinescroll)) &&
       vdp2height <= 512 && info->draww <= 1024) {
     float cx = info->coordincx;
     if (cx < info->maxzoom) cx = info->maxzoom;
@@ -4104,11 +4104,17 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
     const int draww = info->draww;
     const int span = inch0 > 0 ? (((draww - 1) * inch0) >> 8) + 1 : 0;
     if (inch0 > 0 && span + 16 <= PL_SRC_MAX) {
-      int sxl[512];
+      int sxl[512], tvl[512];
+      int sv = info->sv;
+      if (info->isverticalscroll) sv += T1ReadLong(Vdp2Ram, info->verticalscrolltbl) >> 16;
       {
         int li = 0;
         for (int vv = 0; vv < vdp2height; ++vv) {
           sxl[vv] = VDPLINE_SX(info->islinescroll) ? info->sh + info->lineinfo[li << res_shift].LineScrollValH : info->sh;
+          /* Vertical line scroll replaces the zoomed row step, as below. */
+          tvl[vv] = VDPLINE_SY(info->islinescroll) ?
+              sv + (vv & linemask) + info->lineinfo[li << res_shift].LineScrollValV :
+              sv + ((vv * incv) >> 8);
           if ((vv & linemask) == linemask) li++;
         }
       }
@@ -4126,12 +4132,10 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
       const int colornumber = info->colornumber, patternwh = info->patternwh, transp = info->transparencyenable;
       const int row_bytes = colornumber == 0 ? 4 : 8;
       int premap = -1;
-      int sv = info->sv;
-      if (info->isverticalscroll) sv += T1ReadLong(Vdp2Ram, info->verticalscrolltbl) >> 16;
       int prev_tv = 0, prev_sx = 0, have_prev = 0;
       int band_row = 0, band_cmin = 0, band_ok = 0;
       for (int vl = 0; vl < vdp2height; ++vl) {
-        const int tv = sv + ((vl * incv) >> 8);
+        const int tv = tvl[vl];
         const int sx0 = sxl[vl];
         int my = tv >> planeh_shift;
         const int dpy = tv - (my << planeh_shift);
@@ -4142,7 +4146,7 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
            * sample. */
           band_row = tv >> 3;
           int cmin = sx0 >> 3, cmax = (sx0 + span - 1) >> 3;
-          for (int vv = vl + 1; vv < vdp2height && ((sv + ((vv * incv) >> 8)) >> 3) == band_row; ++vv) {
+          for (int vv = vl + 1; vv < vdp2height && (tvl[vv] >> 3) == band_row; ++vv) {
             if ((sxl[vv] >> 3) < cmin) cmin = sxl[vv] >> 3;
             if (((sxl[vv] + span - 1) >> 3) > cmax) cmax = (sxl[vv] + span - 1) >> 3;
           }
