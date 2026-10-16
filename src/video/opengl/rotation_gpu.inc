@@ -169,7 +169,7 @@ typedef struct {
 } VitaRotationProgram;
 /* 28 immutable specializations plus generic fallback/control. */
 #ifdef VITA_ROTATION_COEFF_PAIR
-static VitaRotationProgram vita_rotation_programs[86];
+static VitaRotationProgram vita_rotation_programs[114];
 #elif defined(VITA_ROTATION_PATTERN_CACHE)
 static VitaRotationProgram vita_rotation_programs[58];
 #elif defined(VITA_ROTATION_MAP_CACHE)
@@ -289,6 +289,25 @@ static int YglVitaRotationSnapshotMatches(const VitaRotationJob *job,
 }
 #endif
 
+/* Special color mode 3 takes each dot's color calculation enable from the
+ * MSB of its CRAM word. When every word the layer can reach has the same MSB
+ * the mode reduces to a constant alpha, which the shader already handles.
+ * Returns the alpha byte to use for every dot, or -1 when the MSBs differ. */
+static int YglVitaRotationMsbAlpha(const vdp2draw_struct *info) {
+  unsigned lo = info->coloroffset, n = 0x800;
+  if (info->isbitmap) {
+    lo += info->paladdr << 4;
+    n = info->colornumber == 0 ? 16 : 256;
+  }
+  unsigned shift = Vdp2Internal.ColorMode == 2 ? 2 : 1, any = 0, all = 0x8000;
+  for (unsigned i = 0; i < n; ++i) {
+    u16 w = T2ReadWord(Vdp2ColorRam, ((lo + i) << shift) & 0xFFF);
+    any |= w; all &= w;
+  }
+  if ((any ^ all) & 0x8000) return -1;
+  return (all & 0x8000) ? info->alpha : 0xFF;
+}
+
 int YglVitaRotationBegin(RBGDrawInfo *rbg, vdp2rotationparameter_struct *p,
                          const unsigned char *vram) {
   const vdp2draw_struct *info = &rbg->info;
@@ -300,7 +319,6 @@ int YglVitaRotationBegin(RBGDrawInfo *rbg, vdp2rotationparameter_struct *p,
            rbg->rotate_mval_h, rbg->rotate_mval_v, rbg->hres, rbg->vres, vita_rotation_count); }
 #endif
   if (info->colornumber < 0 || info->colornumber > 4 || info->colornumber == 2 || info->LineColorBase ||
-      (info->colornumber < 3 && info->specialcolormode == 3) ||
       (!info->isbitmap && (info->patternwh < 1 || info->patternwh > 2 ||
                           info->patterndatasize < 1 || info->patterndatasize > 2)) ||
       p->screenover == OVERMODE_SELPATNAME || p->coefmode == 3 ||
@@ -308,6 +326,11 @@ int YglVitaRotationBegin(RBGDrawInfo *rbg, vdp2rotationparameter_struct *p,
       rbg->rotate_mval_h != 1.0f || rbg->rotate_mval_v != 1.0f ||
       rbg->hres <= 0 || rbg->vres <= 0 || rbg->vres > VITA_ROTATION_MAX_ROWS ||
       vita_rotation_count == VITA_ROTATION_JOBS) return -1;
+  int alpha = info->alpha, specialcolormode = info->specialcolormode;
+  if (info->colornumber < 3 && specialcolormode == 3) {
+    if (Vdp2Internal.ColorMode > 2 || (alpha = YglVitaRotationMsbAlpha(info)) < 0) return -1;
+    specialcolormode = 0;
+  }
   unsigned slot = vita_rotation_count;
   VitaRotationJob *job = vita_rotation_jobs[slot];
   if (!job) {
@@ -371,14 +394,14 @@ int YglVitaRotationBegin(RBGDrawInfo *rbg, vdp2rotationparameter_struct *p,
   job->step[2] = p->Xp; job->step[3] = p->Yp;
   job->bitmap[0] = p->charaddr; job->bitmap[1] = info->cellw;
   job->bitmap[2] = info->cellh; job->bitmap[3] = p->screenover;
-  job->pixel[0] = info->alpha; job->pixel[1] = info->transparencyenable;
+  job->pixel[0] = alpha; job->pixel[1] = info->transparencyenable;
   job->pixel[2] = info->colornumber;
   job->map[0] = p->ShiftPaneX; job->map[1] = p->ShiftPaneY;
   job->map[2] = info->planew; job->map[3] = info->patternwh;
   job->pattern[0] = info->patterndatasize; job->pattern[1] = info->auxmode;
   job->pattern[2] = info->supplementdata; job->pattern[3] = info->isbitmap != 0;
   job->palette[0] = info->coloroffset; job->palette[1] = info->paladdr;
-  job->palette[2] = info->specialcolormode; job->palette[3] = info->specialcode;
+  job->palette[2] = specialcolormode; job->palette[3] = info->specialcode;
   job->special[0] = info->specialprimode; job->special[1] = info->priority;
   job->special[2] = info->specialfunction; job->special[3] = info->specialcolorfunction;
   if (!info->isbitmap) {
@@ -416,6 +439,15 @@ static int YglVitaRotationConstK(const VitaRotationJob *job) {
     if (memcmp(&job->rows[y][2], &job->rows[0][2], 2 * sizeof(float))) return 0;
   return 1;
 }
+#ifdef VITA_ROTATION_ROW_K_BINARIES
+/* Per-row kx/ky (perspective planes) read from the paired coefficient
+ * texture instead of the generic shader's four byte-decoded fetches. */
+static int YglVitaRotationRowK(const VitaRotationJob *job) {
+  return !YglVitaRotationConstK(job) && YglRotationPairSafe(job->rows, job->height, 4);
+}
+#else
+static int YglVitaRotationRowK(const VitaRotationJob *job) { (void)job; return 0; }
+#endif
 #ifdef VITA_ROTATION_FLOAT_COEFFICIENTS
 /* Do not assume texture sampling preserves NaN payloads, denormals or -0.
  * Ordinary finite normal values and +0 suffice for this specialization. */
@@ -448,7 +480,7 @@ static int YglVitaRotationFloatSafe(const VitaRotationJob *job) {
 static int YglVitaRotationPreparePatterns(const VitaRotationJob *job, unsigned slot) {
   if (vita_rotation_validate_generic || job->pattern[3] != 0 ||
       (job->bitmap[3] != 0 && job->bitmap[3] != 2) ||
-      !YglVitaRotationConstK(job)) return 0;
+      (!YglVitaRotationConstK(job) && !YglVitaRotationRowK(job))) return 0;
   YglRotationPatternKey key={0};
   key.generation=job->map_generation;
   key.width=(unsigned)job->bitmap[1]; key.height=(unsigned)job->bitmap[2];
@@ -569,7 +601,7 @@ static VitaRotationProgram *YglVitaRotationProgram(const VitaRotationJob *job, i
       binary_size=vita_rotation_pattern_binaries[variant].size;
       index=30+variant;
 #ifdef VITA_ROTATION_COEFF_PAIR
-      if (YglRotationPairSafe(job->rows,job->height)) {
+      if (YglRotationPairSafe(job->rows,job->height,2)) {
         binary=vita_rotation_pair_binaries[variant].data;
         binary_size=vita_rotation_pair_binaries[variant].size;
         index=58+variant;
@@ -582,6 +614,15 @@ static VitaRotationProgram *YglVitaRotationProgram(const VitaRotationJob *job, i
     }
 #endif
   }
+#ifdef VITA_ROTATION_ROW_K_BINARIES
+  /* Bitmaps need no name cache; tiled screens need the predecoded names. */
+  if (variant >= 0 && !vita_rotation_validate_generic &&
+      (job->pattern_cached || job->pattern[3] == 1) && YglVitaRotationRowK(job)) {
+    binary=vita_rotation_rowk_binaries[variant].data;
+    binary_size=vita_rotation_rowk_binaries[variant].size;
+    index=86+variant;
+  }
+#endif
 #else
   (void)job;
 #endif
@@ -975,7 +1016,8 @@ void YglVitaRotationFlush(YglTextureManager *tm) {
        * the same deferred retirement but uploads directly into new storage. */
       unsigned upload_rows=261;
 #ifdef VITA_ROTATION_BYTE_VRAM
-      int byte_vram=p>=&vita_rotation_programs[58] && p<&vita_rotation_programs[72];
+      int byte_vram=(p>=&vita_rotation_programs[58] && p<&vita_rotation_programs[72]) ||
+                    (p>=&vita_rotation_programs[86] && p<&vita_rotation_programs[100]);
       if (byte_vram) upload_rows=256;
 #endif
 #ifdef VITA_ROTATION_BYTE_RESIDENT

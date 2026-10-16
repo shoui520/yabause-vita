@@ -161,7 +161,14 @@ float4 main(float2 pixel : TEXCOORD0
   float2 xy = tex2D<float2>(s_coeff_pair,
       (float2(pair & 255, pair >> 8)+0.5)/float2(256.0,4.0));
 #endif
+#ifdef ROTATION_ROW_K
+  // kx/ky vary per row: they are the next F32F32 texel of the same row.
+  float2 k = tex2D<float2>(s_coeff_pair,
+      (float2((pair+1) & 255, (pair+1) >> 8)+0.5)/float2(256.0,4.0));
+  float4 coefficients = float4(xy, k);
+#else
   float4 coefficients = float4(xy, u_k.x, u_k.y);
+#endif
 #else
   float4 coefficients = float4(coefficient(base), coefficient(base+1), u_k.x, u_k.y);
 #endif
