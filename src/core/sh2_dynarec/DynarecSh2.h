@@ -389,7 +389,7 @@ public:
   int SmcSlot(u32 pc);
   // VITA_SH2_PACKED_CODE: slot code is placed at a cursor in the arena, each
   // block right after the previous one, instead of at a fixed 4 KiB slot. A
-  // compile still has MAXBLOCKSIZE bytes of room, so blocks end where they
+  // compile still has kCodeRoom bytes of room, so blocks end where they
   // did; live blocks whose code the room overlaps are evicted as a recycled
   // slot is. (Members unconditional: one class layout.)
   std::vector<u32> code_off_, code_bytes_;             // by slot; bytes 0: none
@@ -465,6 +465,16 @@ public:
   // admit them into register regions, ending exactly after forced_end_.
   bool mac_regions_ = false;
   u32 forced_end_ = 0;
+  // Native code room of a compile: MAXBLOCKSIZE, or kCodeRoom for the MAC
+  // pass, whose regions' cold edges can outgrow the baseline's templates
+  // (its extent is still the baseline's, fixed by forced_end_ and the
+  // template-size schedule).
+#ifdef VITA_SH2_PACKED_CODE
+  static constexpr size_t kCodeRoom = 2 * MAXBLOCKSIZE;
+#else
+  static constexpr size_t kCodeRoom = MAXBLOCKSIZE;
+#endif
+  size_t code_room_ = MAXBLOCKSIZE;
 
   // statics
   u32 compile_count_ ;

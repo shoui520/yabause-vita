@@ -1127,14 +1127,14 @@ void CompileBlocks::CodeRelease(int slot) {
   code_bytes_[slot] = 0;
 }
 
-/* Code room for a compile into slot: MAXBLOCKSIZE bytes at the cursor, after
+/* Code room for a compile into slot: kCodeRoom bytes at the cursor, after
  * evicting every other live block with code there (blocks start at most
- * MAXBLOCKSIZE before the room). */
+ * kCodeRoom before the room). */
 void CompileBlocks::PlaceCode(int slot) {
   CodeRelease(slot);
-  if (code_cursor_ + MAXBLOCKSIZE > vitacode::Layout::StubOffset) code_cursor_ = 0;
-  const size_t lo = code_cursor_, hi = lo + MAXBLOCKSIZE;
-  for (size_t p = lo >= 4096 ? (lo >> 12) - 1 : 0; p <= (hi - 1) >> 12; ++p) {
+  if (code_cursor_ + kCodeRoom > vitacode::Layout::StubOffset) code_cursor_ = 0;
+  const size_t lo = code_cursor_, hi = lo + kCodeRoom;
+  for (size_t p = lo >= kCodeRoom ? (lo - kCodeRoom) >> 12 : 0; p <= (hi - 1) >> 12; ++p) {
     const std::vector<int> page = code_page_slots_[p];
     for (int other : page) {
       if (code_off_[other] >= hi || code_off_[other] + code_bytes_[other] <= lo) continue;
@@ -1147,7 +1147,7 @@ void CompileBlocks::PlaceCode(int slot) {
     }
   }
   code_off_[slot] = u32(lo);
-  code_bytes_[slot] = MAXBLOCKSIZE;
+  code_bytes_[slot] = kCodeRoom;
   code_page_slots_[lo >> 12].push_back(slot);
   g_CompleBlock[slot].code = VitaSh2CodeArena() + lo;
   code_cursor_ = hi;
@@ -1243,7 +1243,9 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL)
       const u32 end = page->e_addr;
       mac_regions_ = true;
       forced_end_ = end;
+      code_room_ = kCodeRoom;
       const int result = EmmitCode(page, ParentT);
+      code_room_ = MAXBLOCKSIZE;
       mac_regions_ = false;
       forced_end_ = 0;
       if ((result != 0 || page->e_addr != end) && EmmitCode(page, ParentT) != 0)
@@ -1552,7 +1554,7 @@ static bool Sh2MayWrite(u16 op) {
 }
 int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 {
-  VitaSh2CodeWrite code_write(page->code, MAXBLOCKSIZE);
+  VitaSh2CodeWrite code_write(page->code, code_room_);
   int i, j, jmp = 0, count = 0;
   u16 op, temp;
   u32 addr = page->b_addr;
@@ -1579,7 +1581,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
   i = 0;
   j = 0;
   count = 0;  
-  memset((void*)ptr,0,sizeof(char)*MAXBLOCKSIZE);
+  memset((void*)ptr,0,sizeof(char)*code_room_);
   memcpy((void*)ptr, (void*)prologue, PROLOGSIZE);
   ptr += PROLOGSIZE;
 #ifdef VITA_SH2_STACK_SPEC
@@ -1924,7 +1926,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #ifdef VITA_SH2_DEFER_SEPARATORS
       if (defer_pc) flush_deferred();
 #endif
-      const size_t remaining = MAXBLOCKSIZE - used();
+      const size_t remaining = code_room_ - used();
       // At most 64 MAC operations: their extra cycles fit in one immediate.
 #ifdef VITA_SH2_MAC_REGIONS
       constexpr size_t reserve = 59 * sizeof(u32) + EPILOGSIZE + 1;
@@ -2036,9 +2038,8 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #endif
     // Keep the baseline's code-size-derived execution boundaries. Smaller
     // native code must not postpone scheduler/interrupt observations.
-    if (scheduling_size > used())
-      calsize += scheduling_size - used();
-    if (calsize >= MAXBLOCKSIZE) {
+    // The MAC pass's native code may use its whole room (see code_room_).
+    if (calsize >= code_room_ || calsize - used() + scheduling_size >= MAXBLOCKSIZE) {
       break; // no space is available
     }
 
@@ -2168,7 +2169,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #endif
       };
 #ifdef VITA_SH2_LINK
-      if (!debug_mode_ && used() + 4 * 11 + 2 * kLinkStubBytes + EPILOGSIZE <= MAXBLOCKSIZE) {
+      if (!debug_mode_ && used() + 4 * 11 + 2 * kLinkStubBytes + EPILOGSIZE <= code_room_) {
         // The same PC and count, with one exit per outcome so both can link.
         const u32 at = addr - 2;  // this BT/BF; r8 holds it
         u32 *w = reinterpret_cast<u32 *>(ptr);
@@ -2270,7 +2271,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #ifdef VITA_SH2_LINK
             + 2 * kLinkStubBytes + 4
 #endif
-            < MAXBLOCKSIZE) {
+            < code_room_) {
         instrSize[count++] = 0;
         if (call) {
           slot_region.LoadConstant(12, branch_pc + 4);
@@ -2453,7 +2454,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
         u32 *const skip_return = reinterpret_cast<u32 *>(slot_separator) + 6;
         if (!debug_mode_ && (relative || conditional) && *taken_return == kBlockReturn &&
             (!conditional || *skip_return == kBlockReturn) &&
-            used() + 2 * kLinkStubBytes + EPILOGSIZE <= MAXBLOCKSIZE) {
+            used() + 2 * kLinkStubBytes + EPILOGSIZE <= code_room_) {
           const u32 target = relative ? branch_pc + 4 + 2 * u32(s32(u32(op) << 20) >> 20)
                                       : branch_pc + 4 + 2 * u32(s32(s8(op & 0xff)));
           ptr -= 4;
@@ -2575,7 +2576,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
   // Falling off the end continues at the next instruction (PC in r8).
   if (!debug_mode_ && !branch_exit && !resident_emitted && !(page->flags & BLOCK_POLL_FUSED) &&
       reinterpret_cast<u32 *>(ptr)[-1] == kBlockReturn &&
-      used() - 4 + kLinkStubBytes <= MAXBLOCKSIZE) {
+      used() - 4 + kLinkStubBytes <= code_room_) {
     ptr -= 4;
     link_stub(ptr, 8, addr);
     ptr += kLinkStubBytes;
