@@ -289,7 +289,7 @@ public:
   std::array<bool, 16> hint_ok{};
   std::array<uint32_t, 16> hint_val{};
   bool EmitOp(uint16_t op, uint32_t pc) {
-    if (!mac_shadow.empty() && !(op == mac_run_op && mac_run.size() < 16 && CanMacWord(op)))
+    if (!mac_shadow.empty() && !(op == mac_run_op && mac_run.size() < 16 && (CanMacWord(op) || CanMacLong(op))))
       CloseMacRun();
     if (div_chain_enabled && !resident_loop) {
       const unsigned n = (op >> 8) & 15, m = (op >> 4) & 15;
@@ -439,7 +439,7 @@ public:
       return true;
     }
     if (CanMacLong(op) || CanMacWord(op)) {
-      if (macw_runs_enabled && IsMacWord(op) && ((op >> 8) & 15) != ((op >> 4) & 15)) MacWordRun(op);
+      if (macw_runs_enabled && ((op >> 8) & 15) != ((op >> 4) & 15)) MacRun(op);
       else MacMemory(op, IsMacWord(op));
       ++instructions;
       extra_cycles += Cycles(op) - 1;
@@ -1268,9 +1268,9 @@ private:
   // their order, saturation) with live PC/cycles, then reloads every
   // resident mapping. All four mappings are marked dirty after that edge, so
   // it stores only what was already dirty.
-  // Runs of the same MAC.W @Rm+,@Rn+ (m != n) with nothing between them, as
-  // in 3x3 matrix rows and dot products (a run may be one MAC.W), emitted
-  // when the run closes. One S test and one range test per pointer cover the
+  // Runs of the same MAC.W/MAC.L @Rm+,@Rn+ (m != n) with nothing between
+  // them, as in 3x3 matrix rows and dot products (a run may be one MAC),
+  // emitted when the run closes. One S test and one range test per pointer cover the
   // whole run: both pointers' first and last reads in work RAM. Cached high
   // work RAM is the straight path; a cold stub per pointer accepts
   // cache-through high RAM and (2-aligned) cached/cache-through low RAM,
@@ -1278,7 +1278,8 @@ private:
   // each, added by the stub (and taken back if the other pointer then fails).
   // Each MAC.W is LDRH/LDRH/SMLABB on MACL and only the last forms MACH (MOV
   // hi,lo,ASR #31 + SMLALBB, as MacMemory; every MAC.W recomputes MACH from
-  // MACL, so the earlier ones' MACH is dead). Anything else leaves state
+  // MACL, so the earlier ones' MACH is dead). Each MAC.L is LDR/LDR/ROR/ROR/
+  // SMLAL on MACH:MACL (low RAM must then be 4-aligned, as MacMemory's). Anything else leaves state
   // untouched and one cold stub runs the template once per MAC.W with that
   // instruction's PC/cycles. mac_shadow is this region with MacMemory's
   // emission of the same instructions: on close the region takes its state
@@ -1291,8 +1292,8 @@ private:
   std::array<Slot, 7> mac_run_slots{};
   unsigned mac_run_first = 0, mac_run_second = 0, mac_run_lo = 0, mac_run_hi = 0, mac_run_hb = 11;
   // Worst-case words still to come for an open run (hot code and stubs).
-  unsigned MacRunOwedWords() const { return 110 + 17 * unsigned(mac_run.size()); }
-  void MacWordRun(uint16_t op) {
+  unsigned MacRunOwedWords() const { return 115 + 19 * unsigned(mac_run.size()); }
+  void MacRun(uint16_t op) {
     const MacRunStep step{instructions - accounted, extra_cycles};
     if (mac_shadow.empty()) {
       mac_shadow.push_back(*this);
@@ -1302,15 +1303,16 @@ private:
       for (unsigned g = 0; g < known.size(); ++g)
         if (known[g]) (void)Get(g, true);
       const unsigned n = (op >> 8) & 15, m = (op >> 4) & 15;
-      const unsigned first = Get(m, true), second = Get(n, true, first);
-      const unsigned lo = Get(20, true, second), hi = Get(19, false, lo);
+      const bool word = IsMacWord(op);
+      const unsigned first = Get(word ? m : n, true), second = Get(word ? n : m, true, first);
+      const unsigned lo = Get(20, true, second), hi = Get(19, !word, lo);
       mac_run_hb = HighBase();
       mac_run_slots = slots;
       mac_run_first = first; mac_run_second = second; mac_run_lo = lo; mac_run_hi = hi;
     }
     mac_run.push_back(step);
     RegisterRegion &sh = mac_shadow[0];
-    sh.MacMemory(op, true);
+    sh.MacMemory(op, IsMacWord(op));
     ++sh.instructions;
     sh.extra_cycles += Cycles(op) - 1;
   }
@@ -1319,7 +1321,9 @@ private:
     RegisterRegion sh = std::move(mac_shadow[0]);
     mac_shadow.clear();
     const auto hints = hint_ok; const auto hint_values = hint_val;
-    const unsigned k = unsigned(mac_run.size()), d = 2 * (k - 1), hb = mac_run_hb;
+    const bool word = IsMacWord(mac_run_op);
+    const unsigned w = word ? 2 : 4;
+    const unsigned k = unsigned(mac_run.size()), d = w * (k - 1), hb = mac_run_hb;
     const unsigned first = mac_run_first, second = mac_run_second, lo = mac_run_lo, hi = mac_run_hi;
     const unsigned guest[2] = {first, second}, host[2] = {10, 14}, scratch[2] = {14, 12};
     // (H | H + d) < 0x100000 proves H and H + d (H = guest ^ area).
@@ -1342,19 +1346,34 @@ private:
     HighBaseIp(hb);
     code.push_back(0xe08aa000u | hb);              // ADD r10,r10,hb
     code.push_back(0xe08ee000u | hb);              // ADD lr,lr,hb
-    for (unsigned i = 0; i + 1 < k; ++i) {
-      const uint32_t imm = (((2 * i) >> 4) << 8) | ((2 * i) & 15);
-      code.push_back(0xe1dac0b0u | imm);                             // LDRH ip,[r10,#2i]
-      code.push_back(0xe1de00b0u | (hi << 12) | imm);                // LDRH hi,[lr,#2i]
-      code.push_back(0xe1000080u | (lo << 16) | (lo << 12) | (hi << 8) | 12u); // SMLABB lo,ip,hi,lo
+    const unsigned first_guest = unsigned(mac_run_slots[first].guest);
+    if (word) {
+      for (unsigned i = 0; i + 1 < k; ++i) {
+        const uint32_t imm = (((2 * i) >> 4) << 8) | ((2 * i) & 15);
+        code.push_back(0xe1dac0b0u | imm);                             // LDRH ip,[r10,#2i]
+        code.push_back(0xe1de00b0u | (hi << 12) | imm);                // LDRH hi,[lr,#2i]
+        code.push_back(0xe1000080u | (lo << 16) | (lo << 12) | (hi << 8) | 12u); // SMLABB lo,ip,hi,lo
+      }
+      const uint32_t imm = ((d >> 4) << 8) | (d & 15);
+      code.push_back(0xe1dac0b0u | imm);           // LDRH ip,[r10,#d]
+      code.push_back(0xe1dea0b0u | imm);           // LDRH r10,[lr,#d]
+      code.push_back(0xe1a00fc0u | (hi << 12) | lo); // MOV hi,lo,ASR #31
+      code.push_back(0xe1400a8cu | (hi << 16) | (lo << 12)); // SMLALBB lo,hi,ip,r10
+    } else {
+      // MACH is live: the first pointer's host register holds the second
+      // operand, its guest value parked in the context and reloaded after.
+      if (slots[first].dirty) code.push_back(0xe5870000u | (first << 12) | (first_guest * 4)); // STR first
+      for (unsigned i = 0; i < k; ++i) {
+        code.push_back(0xe59ac000u | (4 * i));                         // LDR ip,[r10,#4i]
+        code.push_back(0xe59e0000u | (first << 12) | (4 * i));         // LDR A,[lr,#4i]
+        code.push_back(0xe1a0c86cu);                                   // ROR ip,ip,#16
+        code.push_back(0xe1a00860u | (first << 12) | first);           // ROR A,A,#16
+        code.push_back(0xe0e00090u | (hi << 16) | (lo << 12) | (first << 8) | 12u); // SMLAL lo,hi,ip,A
+      }
+      code.push_back(0xe5970000u | (first << 12) | (first_guest * 4)); // LDR first
     }
-    const uint32_t imm = ((d >> 4) << 8) | (d & 15);
-    code.push_back(0xe1dac0b0u | imm);             // LDRH ip,[r10,#d]
-    code.push_back(0xe1dea0b0u | imm);             // LDRH r10,[lr,#d]
-    code.push_back(0xe1a00fc0u | (hi << 12) | lo); // MOV hi,lo,ASR #31
-    code.push_back(0xe1400a8cu | (hi << 16) | (lo << 12)); // SMLALBB lo,hi,ip,r10
-    code.push_back(0xe2800000u | (first << 16) | (first << 12) | (2 * k));    // ADD first,#2k
-    code.push_back(0xe2800000u | (second << 16) | (second << 12) | (2 * k));  // ADD second,#2k
+    code.push_back(0xe2800000u | (first << 16) | (first << 12) | (w * k));    // ADD first,#wk
+    code.push_back(0xe2800000u | (second << 16) | (second << 12) | (w * k));  // ADD second,#wk
     const unsigned done = code.size();
     // Slow stub: the template once per MAC.W of the run. slow_undo first
     // takes back the first pointer's cache-through cycles (its stub passed).
@@ -1365,7 +1384,7 @@ private:
     code.push_back(0xe597c0a0u);                   // LDR ip,[r7,#160] (memcycle)
     code.push_back(0xe3100404u | (first << 16));   // TST first,#0x04000000 (high RAM)
     code.push_back(0x124cc000u | (2 * k));         // SUBNE ip,ip,#2k
-    code.push_back(0x024cc000u | (4 * k));         // SUBEQ ip,ip,#4k
+    code.push_back(0x024cc000u | (4 * k));         // SUBEQ ip,ip,#4k (k <= 16)
     code.push_back(0xe587c0a0u);                   // STR ip,[r7,#160]
     const unsigned slow = code.size();
     to_cold.back().target = slow;                  // the BNE skips the undo
@@ -1377,7 +1396,7 @@ private:
       PendingFor(0xe2800000u, st.insns, st.extra);
       code.push_back(0xe3a00000u | (m * 4));       // MOV r0,#Rm*4
       code.push_back(0xe3a01000u | (n * 4));       // MOV r1,#Rn*4
-      Constant(12, macw_helper);
+      Constant(12, word ? macw_helper : macl_helper);
       code.push_back(0xe12fff3cu);                 // BLX ip
       PendingFor(0xe2400000u, st.insns, st.extra);
     }
@@ -1406,7 +1425,7 @@ private:
       ColdJumpHot(p_back[p]);
       code[low] = 0x2a000000u | ((uint32_t(code.size()) - low - 2) & 0xffffffu);
       code.push_back(0xe2200662u | (H << 16) | (H << 12));   // EOR H,H,#0x06200000
-      code.push_back(0xe3100001u | (g << 16));               // TST g,#1
+      code.push_back(0xe3100000u | (g << 16) | (w - 1));     // TST g,#w-1
       to(0x10000000u, fail);                                 // BNE
       range(H, S);
       to(0x20000000u, fail);                                 // BHS

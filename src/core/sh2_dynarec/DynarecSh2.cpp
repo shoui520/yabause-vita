@@ -2042,6 +2042,9 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
     if (calsize >= code_room_ || calsize - used() + scheduling_size >= MAXBLOCKSIZE) {
       break; // no space is available
     }
+#ifdef A9_LEGACY_LOG
+    if (!debug_mode_) fprintf(stderr, "legacy b=%08x pass=%d op=%04x delay=%d\n", start_addr, int(mac_regions_), op, int(asm_list[i].delay));
+#endif
 
     if (0x1b == op) { // SLEEP
       page->flags |= BLOCK_LOOP;
