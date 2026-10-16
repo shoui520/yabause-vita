@@ -39,6 +39,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 */
 
 
+#include <string.h>
 #include "ygl.h"
 #include "yui.h"
 #include "vidshared.h"
@@ -94,6 +95,12 @@ void YglCacheAdd(YglTextureManager * tm, u64 addr, YglCache * c) {
   u32 hashkey;
   YglCacheHash *add;
   hashkey = YglgetHash(addr);
+  {
+    u32 xy[2];
+    memcpy(&xy[0], &c->x, 4); memcpy(&xy[1], &c->y, 4);
+    tm->vita_cache_sig = (tm->vita_cache_sig ^ addr) * 0x100000001B3ULL;
+    tm->vita_cache_sig = (tm->vita_cache_sig ^ (((u64)xy[0] << 32) | xy[1])) * 0x100000001B3ULL;
+  }
 
   if (tm->HashTable[hashkey] == NULL){
 	add = YglgetNewCash(tm);
@@ -130,6 +137,7 @@ void YglCacheAdd(YglTextureManager * tm, u64 addr, YglCache * c) {
 void YglCacheReset(YglTextureManager * tm) {
 	memset(tm->HashTable, 0, sizeof(tm->HashTable));
 	tm->CashLink_index = 0;
+	tm->vita_cache_sig = 0;
 }
 
 //////////////////////////////////////////////////////////////////////////////

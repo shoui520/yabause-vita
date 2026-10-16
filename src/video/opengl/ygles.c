@@ -3166,18 +3166,11 @@ void YglCachedQuadOffset(vdp2draw_struct * input, YglCache * cache, int cx, int 
 YglProgram *ygl_last_offset_program; /* batch and program id of the last offset quad */
 int ygl_last_offset_prg;
 #endif
-void YglQuadOffset_in(vdp2draw_struct * input, YglTexture * output, YglCache * c, int cx, int cy, float sx, float sy, int cash_flg) {
-  unsigned int x, y;
+/* YglQuadOffset_in's program for input, with room for `needed` more floats
+ * and its fields set; NULL when there is none (the quads are dropped). */
+static YglProgram *YglQuadOffsetProgram(vdp2draw_struct * input, unsigned needed, int *prg_out) {
   YglProgram *program;
-  texturecoordinate_struct *tmp;
   int prg = PG_NORMAL;
-  float * pos;
-  //float * vtxa;
-
-  int vHeight;
-#ifdef VITA_SKIP_TRANSPARENT_CELLS
-  ygl_last_offset_program = NULL;
-#endif
 
   if (input->colornumber >= 3) {
     prg = PG_NORMAL;
@@ -3232,8 +3225,8 @@ void YglQuadOffset_in(vdp2draw_struct * input, YglTexture * output, YglCache * c
     }
   }
   
-  program = YglGetProgram((YglSprite*)input, prg, 12);
-  if (program == NULL) return;
+  program = YglGetProgram((YglSprite*)input, prg, needed);
+  if (program == NULL) return NULL;
 
   program->colornumber = input->colornumber;
   program->bwin0 = input->bEnWin0;
@@ -3252,8 +3245,17 @@ void YglQuadOffset_in(vdp2draw_struct * input, YglTexture * output, YglCache * c
   program->color_offset_val[2] = (float)(input->cob) / 255.0f;
   program->color_offset_val[3] = 0;
   //info->cor
+  *prg_out = prg;
+  return program;
+}
 
-  vHeight = input->vertices[5] - input->vertices[1];
+/* One quad at the program's end: positions and atlas texture coordinates of
+ * the cell at atlas (x, y). */
+static inline void YglQuadOffsetWrite(YglProgram *program, vdp2draw_struct * input, unsigned int x, unsigned int y,
+                                      int cx, int cy, float sx, float sy) {
+  texturecoordinate_struct *tmp;
+  float * pos;
+  const int vHeight = input->vertices[5] - input->vertices[1];
 
   pos = program->quads + program->currentQuad;
   pos[0] = (input->vertices[0] - cx) * sx;
@@ -3269,23 +3271,8 @@ void YglQuadOffset_in(vdp2draw_struct * input, YglTexture * output, YglCache * c
   pos[10] = (input->vertices[6] - cx) * sx;
   pos[11] = input->vertices[7] * sy;
 
-  // vtxa = (program->vertexAttribute + (program->currentQuad * 2));
-  // memset(vtxa,0,sizeof(float)*24);
-
   tmp = (texturecoordinate_struct *)(program->textcoords + (program->currentQuad * 2));
-
   program->currentQuad += 12;
-#ifdef VITA_SKIP_TRANSPARENT_CELLS
-  ygl_last_offset_program = program;
-  ygl_last_offset_prg = prg;
-#endif
-  if (output != NULL){
-    YglTMAllocate(_Ygl->texture_manager, output, input->cellw, input->cellh, &x, &y);
-  }
-  else{
-    x = c->x;
-    y = c->y;
-  }
 
   tmp[0].r = tmp[1].r = tmp[2].r = tmp[3].r = tmp[4].r = tmp[5].r = 0; // these can stay at 0
 
@@ -3315,18 +3302,52 @@ void YglQuadOffset_in(vdp2draw_struct * input, YglTexture * output, YglCache * c
     tmp[2].t = tmp[4].t = tmp[5].t = (float)(y + (cy + vHeight)) - ATLAS_BIAS;
   }
 
-  if (c != NULL && cash_flg == 1)
-  {
-    c->x = x;
-    c->y = y;
-  }
-
   tmp[0].q = 1.0f;
   tmp[1].q = 1.0f;
   tmp[2].q = 1.0f;
   tmp[3].q = 1.0f;
   tmp[4].q = 1.0f;
   tmp[5].q = 1.0f;
+}
+
+void YglQuadOffset_in(vdp2draw_struct * input, YglTexture * output, YglCache * c, int cx, int cy, float sx, float sy, int cash_flg) {
+  unsigned int x, y;
+  YglProgram *program;
+  int prg = PG_NORMAL;
+
+#ifdef VITA_SKIP_TRANSPARENT_CELLS
+  ygl_last_offset_program = NULL;
+#endif
+  program = YglQuadOffsetProgram(input, 12, &prg);
+  if (program == NULL) return;
+
+  if (output != NULL){
+    YglTMAllocate(_Ygl->texture_manager, output, input->cellw, input->cellh, &x, &y);
+  }
+  else{
+    x = c->x;
+    y = c->y;
+  }
+  YglQuadOffsetWrite(program, input, x, y, cx, cy, sx, sy);
+#ifdef VITA_SKIP_TRANSPARENT_CELLS
+  ygl_last_offset_program = program;
+  ygl_last_offset_prg = prg;
+#endif
+
+  if (c != NULL && cash_flg == 1)
+  {
+    c->x = x;
+    c->y = y;
+  }
+}
+
+YglProgram *YglCachedQuadsBegin(vdp2draw_struct * input, unsigned quads) {
+  int prg;
+  return YglQuadOffsetProgram(input, 12 * quads, &prg);
+}
+
+void YglCachedQuadsWrite(YglProgram *program, vdp2draw_struct * input, const YglCache * c) {
+  YglQuadOffsetWrite(program, input, c->x, c->y, 0, 0, 1.0f, 1.0f);
 }
 
 

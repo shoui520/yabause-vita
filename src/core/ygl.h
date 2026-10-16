@@ -287,6 +287,7 @@ typedef struct {
 	YglCacheHash *HashTable[HASHSIZE];
 	YglCacheHash CashLink[HASHSIZE * 2];
 	u32 CashLink_index;
+	u64 vita_cache_sig; /* order-dependent digest of every YglCacheAdd since the reset */
 
 	//GLuint textureID;
 	//GLuint pixelBufferID;
@@ -728,6 +729,10 @@ float * YglQuad(vdp2draw_struct *, YglTexture *, YglCache * c);
 int YglQuadRbg0(vdp2draw_struct * input, YglTexture * output, YglCache * c, YglCache * line, int rbg_type );
 void YglQuadOffset(vdp2draw_struct * input, YglTexture * output, YglCache * c, int cx, int cy, float sx, float sy);
 void YglCachedQuadOffset(vdp2draw_struct * input, YglCache * cache, int cx, int cy, float sx, float sy);
+/* Batched YglCachedQuadOffset(input, cache, 0, 0, 1, 1): a program with room
+ * for `quads` quads of input (NULL drops them), then one write per quad. */
+YglProgram *YglCachedQuadsBegin(vdp2draw_struct * input, unsigned quads);
+void YglCachedQuadsWrite(YglProgram *program, vdp2draw_struct * input, const YglCache * cache);
 void YglCachedQuad(vdp2draw_struct *, YglCache *);
 void YglRender(void);
 void YglReset(void);

@@ -650,6 +650,13 @@ static int Vdp2CellReuseAlphaKey(const vdp2draw_struct *info, uint32_t *key) {
 extern u32 vdp2_page_ver[128];
 #endif
 #include "vdp2_cell_reuse.h"
+static Vdp2CellReuseSeq vdp2_cell_reuse_seq;
+#ifdef VITA_VDP2_LAYER_REPLAY
+#ifndef VDP2_CELL_REUSE_PAGE_VERSIONS
+#error "Layer replay keys VRAM on the snapshot page stamps"
+#endif
+#include "vdp2_layer_replay.inc"
+#endif
 #endif
 #include "vdp2_bitmap_decode.h"
 #include <arm_neon.h>
@@ -3400,6 +3407,9 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
   tile.LogicWin = info->LogicWin;
   tile.lineTexture = info->lineTexture;
   tile.id = info->id;
+  /* YglQuadOffset_in reads both (program choice, blending). */
+  tile.specialprimode = info->specialprimode;
+  tile.specialcolormode = info->specialcolormode;
 
   tile.cellw = tile.cellh = info->patternpixelwh;
   tile.flipfunction = info->flipfunction;
@@ -3453,6 +3463,9 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
     VT_STACK_BEGIN(VT_VDP2_CELL_QUAD);
     YglCachedQuadOffset(&tile, &c, cx, cy, info->coordincx, info->coordincy);
     VT_STACK_END();
+#ifdef VITA_VDP2_LAYER_REPLAY
+    if (vdp2_layer_rec) Vdp2ReplayAddQuad(&tile, &c);
+#endif
 #ifdef VITA_DIAG_CELL_ALPHA
     Vdp2AuditCellAlpha(&tile,&c);
 #endif
@@ -3464,6 +3477,15 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
   YglQuadOffset(&tile, texture, &c, cx, cy, info->coordincx, info->coordincy);
   YglCacheAdd(_Ygl->texture_manager, cacheaddr, &c);
   VT_STACK_END();
+#ifdef VITA_VDP2_LAYER_REPLAY
+  if (vdp2_layer_rec) {
+    /* Bytes per 8x8 cell by color number: 4, 8, 16 (palette), 16, 32 bpp. */
+    static const u16 cell_bytes[5] = { 32, 64, 128, 128, 256 };
+    Vdp2ReplayAddQuad(&tile, &c); Vdp2ReplayAddCache(cacheaddr, &c);
+    const u32 bytes = info->colornumber >= 0 && info->colornumber < 5 ? cell_bytes[info->colornumber] : 256u;
+    Vdp2ReplayRead((u32)info->charaddr, (u32)(info->patternwh * info->patternwh) * bytes);
+  }
+#endif
   VT_STACK_BEGIN(VT_VDP2_CELL_DECODE);
 #ifdef VITA_SKIP_TRANSPARENT_CELLS
   const unsigned int *cell_texels = texture->textdata;
@@ -3510,8 +3532,10 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
         (uint32_t)info->charaddr + reuse_bytes <= 0x80000 &&
         Vdp2CellReuseAlphaKey(info, &reuse_alpha)) {
       extern unsigned vita_atlas_frame, vita_atlas_gen, vita_atlas_prev_frame;
-      static Vdp2CellReuseSeq reuse_seq;
-      reuse_record = Vdp2CellReuseNext(&reuse_seq, vita_atlas_frame, vita_atlas_prev_frame);
+      reuse_record = Vdp2CellReuseNext(&vdp2_cell_reuse_seq, vita_atlas_frame, vita_atlas_prev_frame);
+#ifdef VITA_VDP2_LAYER_REPLAY
+      if (vdp2_layer_rec) ++vdp2_layer_rec->reuse_n;
+#endif
       if (reuse_record) {
         reuse_query = (Vdp2CellReuseQuery){ texture->textdata, vita_atlas_prev_frame, vita_atlas_frame,
           vita_atlas_gen, texture->w, info->patternwh, info->colornumber, info->transparencyenable != 0,
@@ -3618,6 +3642,9 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
       cell_program->currentQuad -= 12;
       c.x = -1.0f;
       YglCacheAdd(_Ygl->texture_manager, cacheaddr, &c);
+#ifdef VITA_VDP2_LAYER_REPLAY
+      if (vdp2_layer_rec) { Vdp2ReplayDropQuad(); Vdp2ReplayAddCache(cacheaddr, &c); }
+#endif
       ++vita_transparent_cells_skipped;
     }
   }
@@ -3773,6 +3800,9 @@ static void Vdp2PatternAddrPos(vdp2draw_struct *info, int planex, int x, int pla
       info->pagewh*info->pagewh*planex +
       info->pagewh*y +
       x)*info->patterndatasize * 2;
+#ifdef VITA_VDP2_LAYER_REPLAY
+  if (vdp2_layer_rec) Vdp2ReplayRead(addr, info->patterndatasize * 2);
+#endif
 
   switch (info->patterndatasize)
   {
@@ -4716,6 +4746,26 @@ static void Vdp2DrawMapTest(vdp2draw_struct *info, YglTexture *texture) {
   info->lineinc = info->patternpixelwh;
 
   //info->coordincx = 1.0f;
+#ifdef VITA_VDP2_LAYER_REPLAY
+  YglTextureManager *const replay_tm = _Ygl->texture_manager;
+  Vdp2LayerRecord *replay_rec = NULL, *replay_hit = NULL;
+  if (Vdp2ReplayEligible(info)) {
+    int key[VDP2_REPLAY_KEY_INTS];
+    Vdp2ReplayKey(info, key);
+    replay_hit = Vdp2ReplayFind(info->id, key, replay_tm);
+#ifdef VITA_STACK_PROFILE
+    { static unsigned n[2]; ++n[replay_hit != NULL];
+      if (!((n[0] + n[1]) & 255)) YuiMsg("vdp2_layer_replay walks=%u replays=%u", n[0], n[1]); }
+#endif
+#ifdef VITA_VDP2_LAYER_REPLAY_VERIFY
+    replay_rec = replay_hit ? &vdp2_replay_check : Vdp2ReplaySlot(info->id);
+#else
+    if (replay_hit) { Vdp2ReplayEmit(replay_hit, info, replay_tm); return; }
+    replay_rec = Vdp2ReplaySlot(info->id);
+#endif
+    Vdp2ReplayBegin(replay_rec, info, key, replay_tm);
+  }
+#endif
 
   for (v = -info->patternpixelwh; v < info->drawh + info->patternpixelwh; v += info->patternpixelwh) {
     int targetv = 0;
@@ -4796,6 +4846,22 @@ static void Vdp2DrawMapTest(vdp2draw_struct *info, YglTexture *texture) {
 
     lineindex++;
   }
+#ifdef VITA_VDP2_LAYER_REPLAY
+  if (replay_rec) {
+    Vdp2ReplayEnd(replay_rec, replay_tm);
+#ifdef VITA_VDP2_LAYER_REPLAY_VERIFY
+    if (replay_hit) {
+      static unsigned verify[2];
+      ++verify[!Vdp2ReplaySame(replay_hit, replay_rec)];
+      if (!((verify[0] + verify[1]) & 63))
+        YuiMsg("vdp2_layer_replay_verify match=%u mismatch=%u", verify[0], verify[1]);
+      const Vdp2LayerRecord fresh = *replay_rec;
+      *replay_rec = *replay_hit;
+      *replay_hit = fresh;
+    }
+#endif
+  }
+#endif
 #ifdef VITA_STACK_PROFILE
   if ((++dm_calls[info->id & 7] & 127) == 0) {
     YuiMsg("diag_drawmap id=%d calls=128 cells=%u pwh=%d col=%d incx=%f incy=%f win=%d/%d vs=%d spm=%d scm=%d",
