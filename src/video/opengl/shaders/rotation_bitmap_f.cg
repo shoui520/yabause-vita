@@ -4,6 +4,8 @@
 #pragma argument (bestprecision)
 #include "packed_texture.h"
 uniform sampler2D s_vram;
+// Composition's color RAM: alpha is 1 where the CRAM word's MSB is set.
+uniform sampler2D s_cram;
 #ifdef ROTATION_BYTE_VRAM
 uniform usampler2D s_byte_vram;
 #endif
@@ -268,6 +270,9 @@ float4 main(float2 pixel : TEXCOORD0
     float alpha = u_pixel.x;
     if ((u_palette.z == 1.0 && colorBit == 0) ||
         (u_palette.z == 2.0 && (colorBit == 0 || special == 0))) alpha = 255.0;
+    // Mode 3: color calculation follows the MSB of the dot's CRAM word.
+    if (u_palette.z == 3.0 &&
+        tex2D(s_cram, float2((float(code & 2047) + 0.5) / 2048.0, 0.5)).a < 0.5) alpha = 255.0;
     return float4(code & 255, (code >> 8) & 255, priority, alpha) / 255.0;
   }
   int stride = format == 4 ? 4 : 2;

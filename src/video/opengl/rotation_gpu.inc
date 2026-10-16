@@ -139,7 +139,8 @@ static int YglVitaRotationSourceEqual(const VitaRotationJob *a,const VitaRotatio
 }
 static int YglVitaRotationOutputEqual(const VitaRotationJob *a,
                                      const VitaRotationJob *b) {
-  if (!a || !b || !a->target || !b->target ||
+  /* Mode 3 output also depends on CRAM, which is not part of the snapshot. */
+  if (!a || !b || !a->target || !b->target || a->palette[2] == 3 ||
       a->width != b->width || a->height != b->height) return 0;
   /* x/y are atlas allocation coordinates, irrelevant to private targets.
    * Compare all shader parameters, active coefficient rows and plane addresses
@@ -208,6 +209,10 @@ typedef struct {
   YglRotationPatternKey key, pending;
   GLuint texture;
   unsigned valid, pending_valid;
+  /* Name table bytes behind key (valid) or pending (pending_valid). Other
+   * VRAM writes bump the generation without changing the decoded names. */
+  uint8_t *names;
+  size_t names_size, names_capacity;
 } VitaRotationPatterns;
 static VitaRotationPatterns vita_rotation_patterns[VITA_ROTATION_JOBS];
 static unsigned vita_rotation_pattern_hits, vita_rotation_pattern_builds;
@@ -328,8 +333,12 @@ int YglVitaRotationBegin(RBGDrawInfo *rbg, vdp2rotationparameter_struct *p,
       vita_rotation_count == VITA_ROTATION_JOBS) return -1;
   int alpha = info->alpha, specialcolormode = info->specialcolormode;
   if (info->colornumber < 3 && specialcolormode == 3) {
-    if (Vdp2Internal.ColorMode > 2 || (alpha = YglVitaRotationMsbAlpha(info)) < 0) return -1;
-    specialcolormode = 0;
+    if (Vdp2Internal.ColorMode > 2) return -1;
+    /* Uniform MSBs need no CRAM read in the shader. Mixed ones are read
+     * from the color RAM texture, laid out by index in modes 0 and 1. */
+    int uniform = YglVitaRotationMsbAlpha(info);
+    if (uniform >= 0) { alpha = uniform; specialcolormode = 0; }
+    else if (Vdp2Internal.ColorMode == 2) return -1;
   }
   unsigned slot = vita_rotation_count;
   VitaRotationJob *job = vita_rotation_jobs[slot];
@@ -477,6 +486,58 @@ static int YglVitaRotationFloatSafe(const VitaRotationJob *job) {
 #endif
 #ifndef YGL_ROTATION_QUEUE_ONLY
 #ifdef VITA_ROTATION_PATTERN_CACHE
+/* The plane regions a key reads, in plane order, without repeats. */
+static size_t YglVitaRotationPatternNames(const YglRotationPatternKey *k,
+                                         unsigned start[16], unsigned *count) {
+  unsigned shift=2+k->cells, page_width=512>>shift;
+  size_t bytes=(size_t)(1u<<(k->shift_x-9))*(1u<<(k->shift_y-9))*page_width*page_width<<k->words;
+  unsigned px=k->width>>k->shift_x, py=k->height>>k->shift_y;
+  *count=0;
+  for (unsigned y=0;y<py;++y) for (unsigned x=0;x<px;++x) {
+    unsigned a=k->planes[x+y*4], seen=0;
+    if (a+bytes > 0x80000) return 0;
+    for (unsigned i=0;i<*count;++i) seen|=start[i]==a;
+    if (!seen) start[(*count)++]=a;
+  }
+  return bytes;
+}
+
+static int YglVitaRotationPatternNamesEqual(const VitaRotationPatterns *cache,
+    const YglRotationPatternKey *k, const unsigned char *vram) {
+  unsigned start[16], count;
+  size_t bytes=YglVitaRotationPatternNames(k,start,&count);
+  if (!bytes || cache->names_size!=bytes*count) return 0;
+  for (unsigned i=0;i<count;++i)
+    if (memcmp(cache->names+i*bytes,vram+start[i],bytes)) return 0;
+  return 1;
+}
+
+static int YglVitaRotationPatternNamesCopy(VitaRotationPatterns *cache,
+    const YglRotationPatternKey *k, const unsigned char *vram) {
+  unsigned start[16], count;
+  size_t bytes=YglVitaRotationPatternNames(k,start,&count);
+  cache->names_size=0;
+  if (!bytes) return 0;
+  if (cache->names_capacity<bytes*count) {
+    uint8_t *names=realloc(cache->names,bytes*count);
+    if (!names) return 0;
+    cache->names=names; cache->names_capacity=bytes*count;
+  }
+  for (unsigned i=0;i<count;++i) memcpy(cache->names+i*bytes,vram+start[i],bytes);
+  cache->names_size=bytes*count;
+  return 1;
+}
+
+/* Equal keys apart from the generation, and the same name bytes. */
+static int YglVitaRotationPatternSame(const VitaRotationPatterns *cache,
+    const YglRotationPatternKey *a, const YglRotationPatternKey *b,
+    const unsigned char *vram) {
+  if (!memcmp(a,b,sizeof(*a))) return 1;
+  YglRotationPatternKey x=*a, y=*b;
+  x.generation=y.generation=0;
+  return !memcmp(&x,&y,sizeof(x)) && YglVitaRotationPatternNamesEqual(cache,a,vram);
+}
+
 static int YglVitaRotationPreparePatterns(const VitaRotationJob *job, unsigned slot) {
   if (vita_rotation_validate_generic || job->pattern[3] != 0 ||
       (job->bitmap[3] != 0 && job->bitmap[3] != 2) ||
@@ -492,12 +553,16 @@ static int YglVitaRotationPreparePatterns(const VitaRotationJob *job, unsigned s
   size_t bytes=YglRotationPatternBytes(&key);
   if (!bytes || bytes > 0x100000) return 0;
   VitaRotationPatterns *cache=&vita_rotation_patterns[slot];
-  int hit=key.generation && cache->valid && !memcmp(&key,&cache->key,sizeof(key));
+  int hit=key.generation && cache->valid &&
+      YglVitaRotationPatternSame(cache,&key,&cache->key,job->vram);
+  if (hit) cache->key=key;
   // A changing map must retain the fast existing shader, not repeatedly decode
   // a whole name table. Require two observations before paying the cold cost.
   if (!hit && key.generation &&
-      (!cache->pending_valid || memcmp(&key,&cache->pending,sizeof(key)))) {
-    cache->pending=key; cache->pending_valid=1;
+      (!cache->pending_valid ||
+       !YglVitaRotationPatternSame(cache,&key,&cache->pending,job->vram))) {
+    cache->valid=0;
+    cache->pending=key; cache->pending_valid=YglVitaRotationPatternNamesCopy(cache,&key,job->vram);
     return 0;
   }
   glActiveTexture(GL_TEXTURE1);
@@ -522,6 +587,7 @@ static int YglVitaRotationPreparePatterns(const VitaRotationJob *job, unsigned s
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
     if (glGetError() != GL_NO_ERROR) { glActiveTexture(GL_TEXTURE0); return 0; }
     cache->key=key; cache->valid=1;
+    if (!key.generation) cache->names_size=0; // names were not captured
     cache->pending_valid=0;
     ++vita_rotation_pattern_builds;
   }
@@ -674,6 +740,7 @@ static VitaRotationProgram *YglVitaRotationProgram(const VitaRotationJob *job, i
 #endif
   glUseProgram(p->program);
   glUniform1i(glGetUniformLocation(p->program, "s_vram"), 0);
+  glUniform1i(glGetUniformLocation(p->program, "s_cram"), 3);
 #ifdef VITA_ROTATION_BYTE_VRAM
   glUniform1i(glGetUniformLocation(p->program,"s_byte_vram"),0);
 #endif
@@ -1117,6 +1184,11 @@ void YglVitaRotationFlush(YglTextureManager *tm) {
     glUniform4fv(p->pattern, 1, job->pattern);
     glUniform4fv(p->palette, 1, job->palette);
     glUniform4fv(p->special, 1, job->special);
+    if (job->palette[2] == 3) {
+      glActiveTexture(GL_TEXTURE3);
+      glBindTexture(GL_TEXTURE_2D, _Ygl->cram_tex);
+      glActiveTexture(GL_TEXTURE0);
+    }
 #ifdef VITA_ROTATION_UNIFORMS
     if (p->k != -1) glUniform2f(p->k, job->rows[0][2], job->rows[0][3]);
 #ifdef VITA_ROTATION_PLANE_UNIFORMS
@@ -1255,6 +1327,7 @@ void YglVitaRotationShutdown(void) {
   for(unsigned i=0;i<VITA_ROTATION_JOBS;++i) {
     if (vita_rotation_patterns[i].texture)
       glDeleteTextures(1,&vita_rotation_patterns[i].texture);
+    free(vita_rotation_patterns[i].names);
   }
   memset(vita_rotation_patterns,0,sizeof(vita_rotation_patterns));
   vita_rotation_pattern_hits=vita_rotation_pattern_builds=0;
