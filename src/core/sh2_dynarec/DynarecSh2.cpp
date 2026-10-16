@@ -3097,6 +3097,51 @@ extern "C" { u32 vita_diag_slice[2][8]; uint64_t sceKernelGetProcessTimeWide(voi
 #if defined(VITA_STACK_PROFILE) || defined(A9_PMU_REGIONS)
 namespace { struct StackPhase { explicit StackPhase(unsigned p) { VitaStackPush(p); } ~StackPhase() { VitaStackPop(); } }; }
 #endif
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+/* The idle-slice skip of ExecuteCountLeanFull (see there), shared with the
+ * fast entry: true when this slice was skipped. */
+inline bool DynarecSh2::IdleSkip(u32 targetcnt) {
+  tagSH2 *const st = m_pDynaSh2;
+#ifdef VITA_SH2_IDLE_ANY_CPU
+  if (idle_.valid && st->SysReg[3] == idle_.pc &&
+#ifdef VITA_SH2_IDLE_AFFINE
+      (idle_.readset ? IdleReadSetSame() : g_wram_epoch == idle_.epoch && g_native_write_epoch == idle_.native_epoch) &&
+#else
+      g_wram_epoch == idle_.epoch && g_native_write_epoch == idle_.native_epoch &&
+#endif
+      (!idle_.io_addr || IdleIoValue(idle_.io_addr) == idle_.io_val) &&
+      !((st->CtrlReg[0] & 0xF0) < st->SysReg[5])) {
+#else
+  if (idle_.valid && st->SysReg[3] == idle_.pc && g_wram_epoch == idle_.epoch &&
+      !yabsys.IsSSH2Running && !((st->CtrlReg[0] & 0xF0) < st->SysReg[5])) {
+#endif
+#ifdef VITA_SH2_IDLE_AFFINE
+    if (idle_.affine)
+      for (int w = 1; w < 15; ++w) { st->GenReg[w] += idle_.delta[w]; idle_.regs[w] += idle_.delta[w]; }
+#endif
+#ifdef VITA_SH2_IDLE_AFFINE
+    // As the run: IN_INFINITY_LOOP sets the count to the target, then the
+    // block's memory cycles are added (carried into the next slice).
+    st->SysReg[4] = targetcnt + idle_.mc;
+    DIAG_SLICE(1);
+    ++loopskip_cnt_; ++g_idle_skips;
+    CurrentSH2->cycles = targetcnt + idle_.mc;
+    counted_slice_active_ = false;
+    pre_exe_count_ = idle_.mc;
+    return true;
+#else
+    st->SysReg[4] = targetcnt;
+    DIAG_SLICE(1);
+    ++loopskip_cnt_; ++g_idle_skips;
+    CurrentSH2->cycles = targetcnt;
+    counted_slice_active_ = false;
+    pre_exe_count_ = 0;
+    return true;
+#endif
+  }
+  return false;
+}
+#endif
 // The lazy forward lives in the fast entry: without it, never lazy.
 #if defined(VITA_SH2_SPIN_LAZY) && !(defined(VITA_SH2_SPIN_FAST_ENTRY) && defined(VITA_SH2_SPIN_FORWARD) && \
     defined(VITA_SH2_SPIN_READSET) && !defined(VITA_SH2_SPIN_VERIFY) && !defined(VITA_SH2_SPIN_REASONS) && \
@@ -3176,6 +3221,16 @@ void DynarecSh2::ExecuteCountLean(u32 Count) {
       return;
     }
     LazySync();
+  }
+#endif
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+  // The full path's prologue up to its idle skip (repeated there if not).
+  if (idle_.valid && Count > pre_exe_count_) {
+    const u32 targetcnt = Count - pre_exe_count_;
+    st->SysReg[4] = 0;
+    st->exitcount = targetcnt;
+    memcycle_ = 0;
+    if (IdleSkip(targetcnt)) return;
   }
 #endif
   if (Count > pre_exe_count_ && spin_proof_.valid && spin_read_self_ && !idle_.valid &&
@@ -3299,42 +3354,8 @@ void DynarecSh2::ExecuteCountLeanFull(u32 Count) {
         (idle_.io_addr && IdleIoValue(idle_.io_addr) != idle_.io_val) ? 3 : ((st->CtrlReg[0] & 0xF0) < st->SysReg[5]) ? 4 : 5];
   }
 #endif
-  if (idle_.valid && st->SysReg[3] == idle_.pc &&
-#ifdef VITA_SH2_IDLE_AFFINE
-      (idle_.readset ? IdleReadSetSame() : g_wram_epoch == idle_.epoch && g_native_write_epoch == idle_.native_epoch) &&
-#else
-      g_wram_epoch == idle_.epoch && g_native_write_epoch == idle_.native_epoch &&
 #endif
-      (!idle_.io_addr || IdleIoValue(idle_.io_addr) == idle_.io_val) &&
-      !((st->CtrlReg[0] & 0xF0) < st->SysReg[5])) {
-#else
-  if (idle_.valid && st->SysReg[3] == idle_.pc && g_wram_epoch == idle_.epoch &&
-      !yabsys.IsSSH2Running && !((st->CtrlReg[0] & 0xF0) < st->SysReg[5])) {
-#endif
-#ifdef VITA_SH2_IDLE_AFFINE
-    if (idle_.affine)
-      for (int w = 1; w < 15; ++w) { st->GenReg[w] += idle_.delta[w]; idle_.regs[w] += idle_.delta[w]; }
-#endif
-#ifdef VITA_SH2_IDLE_AFFINE
-    // As the run: IN_INFINITY_LOOP sets the count to the target, then the
-    // block's memory cycles are added (carried into the next slice).
-    st->SysReg[4] = targetcnt + idle_.mc;
-    DIAG_SLICE(1);
-    ++loopskip_cnt_; ++g_idle_skips;
-    CurrentSH2->cycles = targetcnt + idle_.mc;
-    counted_slice_active_ = false;
-    pre_exe_count_ = idle_.mc;
-    return;
-#else
-    st->SysReg[4] = targetcnt;
-    DIAG_SLICE(1);
-    ++loopskip_cnt_; ++g_idle_skips;
-    CurrentSH2->cycles = targetcnt;
-    counted_slice_active_ = false;
-    pre_exe_count_ = 0;
-    return;
-#endif
-  }
+  if (IdleSkip(targetcnt)) return;
   const u32 idle_io0 = g_mem_io_reads, idle_epoch0 = g_wram_epoch, idle_edsr0 = g_mem_io_edsr;
   unsigned idle_blocks = 0;
   bool idle_cleared = false;

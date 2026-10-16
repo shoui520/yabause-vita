@@ -622,6 +622,7 @@ public:
   u32 spin_div_periods_ = 0;
   int SpinAffineDetect(unsigned spin_n);
   bool SpinDelayOverflows(unsigned spin_n) const;
+  bool IdleSkip(u32 targetcnt);
   bool SpinAffineIndependent(unsigned j, unsigned n) const;
   bool last_selfloop_ = false;
   bool last_resident_ = false;  // the slice ended in a resident loop at its deadline
