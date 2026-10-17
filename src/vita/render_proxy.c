@@ -305,6 +305,7 @@ static volatile uint64_t render_exec_us;
 static volatile u32 rp_calls[FN_QUIT + 1];
 static volatile uint64_t rp_exec_us[FN_QUIT + 1];
 static uint64_t rp_space_wait_us, rp_done_wait_us, rp_snapshot_us;
+volatile uint32_t vita_render_stall_us; /* emulation waits on the drawing side, taken per frame by the frontend */
 static u32 rp_waited, rp_fast_reads;
 static uint64_t rp_fast_us;   /* every 64th fast read timed, x64 */
 void VitaRenderProxyReport(void) {
@@ -414,6 +415,7 @@ static int Submit(int fn, int full, int wait, const u32 *args, int nargs, void *
   sceKernelWaitSema(sem_space, 1, NULL);
   uint64_t t1 = sceKernelGetProcessTimeWide();
   rp_space_wait_us += t1 - t0;
+  __atomic_add_fetch(&vita_render_stall_us, (uint32_t)(t1 - t0), __ATOMIC_RELAXED);
   LOCK();
   Cmd *c = &ring[ring_head % RING];
   c->fn = fn; c->full = full; c->ret = 0; c->done = wait ? (volatile int *)&result : NULL;
@@ -445,7 +447,9 @@ static int Submit(int fn, int full, int wait, const u32 *args, int nargs, void *
   if (wait) {
     t0 = sceKernelGetProcessTimeWide();
     sceKernelWaitSema(sem_done, 1, NULL);   /* result written before the signal */
-    rp_done_wait_us += sceKernelGetProcessTimeWide() - t0;
+    t1 = sceKernelGetProcessTimeWide();
+    rp_done_wait_us += t1 - t0;
+    __atomic_add_fetch(&vita_render_stall_us, (uint32_t)(t1 - t0), __ATOMIC_RELAXED);
     ++rp_waited;
   }
   return wait ? result : 0;

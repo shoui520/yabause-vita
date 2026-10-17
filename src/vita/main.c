@@ -175,6 +175,9 @@ static uint64_t present_us;
 volatile int vita_rotation_cpu;
 volatile unsigned vita_rotation_eligible;
 static volatile uint32_t route_wait_us; /* render thread adds, frontend takes */
+#ifdef VITA_RENDER_THREAD
+extern volatile uint32_t vita_render_stall_us; /* render_proxy adds, frontend takes */
+#endif
 static VitaRotationRoute rotation_route;
 #endif
 static uint64_t copy_us;
@@ -1064,6 +1067,11 @@ int main(int argc, char **argv) {
       const int was = rotation_route.cpu;
       vita_rotation_cpu = VitaRotationRouteFrame(&rotation_route, wall,
           __atomic_exchange_n(&route_wait_us, 0, __ATOMIC_RELAXED),
+#ifdef VITA_RENDER_THREAD
+          __atomic_exchange_n(&vita_render_stall_us, 0, __ATOMIC_RELAXED),
+#else
+          wall,  /* drawing is inline: the emulation always waits for it */
+#endif
           __atomic_exchange_n(&vita_rotation_eligible, 0, __ATOMIC_RELAXED));
       if (was != rotation_route.cpu)
         YuiMsg("rotation_route frame=%u cpu=%d probing=%d base_period_us=%u holdoff=%u switches=%u",
