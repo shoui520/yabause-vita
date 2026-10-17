@@ -76,7 +76,15 @@ typedef struct {
    * producer shadow of this generation, already resident in the GPU texture. */
   unsigned vram_generation, vram_copied;
 #endif
+#ifdef VITA_ROTATION_VRAM_PAGES
+  /* The render snapshot's VRAM page stamps when vram[] is that snapshot. */
+  uint32_t page_ver[128];
+  unsigned page_valid;
+#endif
 } VitaRotationJob;
+#ifdef VITA_ROTATION_VRAM_PAGES
+extern u32 vdp2_page_ver[128];
+#endif
 static VitaRotationJob *vita_rotation_jobs[VITA_ROTATION_JOBS];
 #ifdef VITA_ROTATION_VRAM_REUSE
 /* Producer: Vdp2RamGeneration of the last copied snapshot. The worker copies
@@ -396,6 +404,10 @@ int YglVitaRotationBegin(RBGDrawInfo *rbg, vdp2rotationparameter_struct *p,
     YuiMsg("rotation_snapshot_reuse jobs=%u hits=%u byte_checked=%d",
            snapshot_jobs,snapshot_hits,vita_rotation_identity_validate);
 #endif
+#endif
+#ifdef VITA_ROTATION_VRAM_PAGES
+  job->page_valid = vram == Vdp2Ram;
+  if (job->page_valid) memcpy(job->page_ver, vdp2_page_ver, sizeof(job->page_ver));
 #endif
 #ifdef VITA_ROTATION_TARGET
   job->target = 0;
@@ -792,6 +804,72 @@ static VitaRotationProgram *YglVitaRotationProgram(const VitaRotationJob *job, i
   return p;
 }
 
+#ifdef VITA_ROTATION_VRAM_PAGES
+/* Each slot's VRAM texture stays resident in a ring of textures the CPU
+ * writes in place, so a job re-sends only the VRAM pages written since the
+ * texture it lands in last received a snapshot (most frames change a page or
+ * two of 128) instead of a whole new 534 KB image. A texture is rewritten
+ * only once the frame that last sampled it is VITA_ROTATION_RING_LAG frames
+ * old (as the geometry arena: the display queue admits one pending swap). */
+extern uint32_t vgl_framecount;
+enum { VITA_ROTATION_RING = 4, VITA_ROTATION_RING_LAG = 3 };
+typedef struct {
+  GLuint tex;
+  SceGxmTexture desc;   /* as allocated (RGBA); byte programs reinterpret it */
+  uint32_t frame, synced;
+  int valid;
+} VitaRotationResident;
+static VitaRotationResident vita_rotation_ring[VITA_ROTATION_JOBS][VITA_ROTATION_RING];
+static unsigned vita_rotation_page_jobs, vita_rotation_page_copies, vita_rotation_page_full;
+
+/* Binds a texture holding the job's 261 upload rows; 0 if none is free. */
+static int YglVitaRotationUploadPages(const VitaRotationJob *job, unsigned slot) {
+  VitaRotationResident *e = NULL;
+  for (unsigned i = 0; i < VITA_ROTATION_RING; ++i) {
+    VitaRotationResident *c = &vita_rotation_ring[slot][i];
+    if (c->tex && vgl_framecount - c->frame < VITA_ROTATION_RING_LAG) continue;
+    if (!e || (c->valid && (!e->valid || c->synced > e->synced))) e = c;
+  }
+  if (!e) return 0;
+  if (!e->tex) {
+    glGenTextures(1, &e->tex);
+    glBindTexture(GL_TEXTURE_2D, e->tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 512, 261, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    e->desc = *vglGetGxmTexture(GL_TEXTURE_2D);
+    e->valid = 0;
+  } else {
+    glBindTexture(GL_TEXTURE_2D, e->tex);
+    *vglGetGxmTexture(GL_TEXTURE_2D) = e->desc;
+  }
+  unsigned char *dst = sceGxmTextureGetData(&e->desc);
+  const unsigned char *src = (const unsigned char *)job;
+  ++vita_rotation_page_jobs;
+  if (!e->valid || !job->page_valid) {
+    memcpy(dst, src, 512 * 261 * 4);
+    ++vita_rotation_page_full;
+  } else {
+    for (unsigned p = 0; p < 128; ++p)
+      if (job->page_ver[p] >= e->synced) { memcpy(dst + p * 4096, src + p * 4096, 4096); ++vita_rotation_page_copies; }
+    memcpy(dst + 0x80000, src + 0x80000, 512 * 5 * 4);   /* coefficient and plane rows */
+  }
+  e->valid = job->page_valid;
+  if (e->valid) {
+    uint32_t newest = 0;
+    for (unsigned p = 0; p < 128; ++p) if (job->page_ver[p] > newest) newest = job->page_ver[p];
+    e->synced = newest + 1;   /* later writes stamp past every page here */
+  }
+  e->frame = vgl_framecount;
+  if ((vita_rotation_page_jobs & 255) == 0)
+    YuiMsg("rotation_vram_pages jobs=%u full=%u pages=%u", vita_rotation_page_jobs,
+           vita_rotation_page_full, vita_rotation_page_copies);
+  return 1;
+}
+#endif
+
 static void YglVitaRotationInitialize(void) {
   if (vita_rotation_vram) return;
   glGenTextures(1, &vita_rotation_vram);
@@ -1127,6 +1205,9 @@ void YglVitaRotationFlush(YglTextureManager *tm) {
       } else {
         vita_rotation_byte_valid=0;
 #endif
+#ifdef VITA_ROTATION_VRAM_PAGES
+      if (!YglVitaRotationUploadPages(job, slot))
+#endif
       glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 512, upload_rows, 0,
                    GL_RGBA, GL_UNSIGNED_BYTE, job);
 #ifdef VITA_ROTATION_BYTE_VRAM
@@ -1382,6 +1463,12 @@ void YglVitaRotationShutdown(void) {
 #endif
   if (vita_rotation_fbo) glDeleteFramebuffers(1, &vita_rotation_fbo);
   if (vita_rotation_vram) glDeleteTextures(1, &vita_rotation_vram);
+#ifdef VITA_ROTATION_VRAM_PAGES
+  for (unsigned i = 0; i < VITA_ROTATION_JOBS; ++i)
+    for (unsigned k = 0; k < VITA_ROTATION_RING; ++k)
+      if (vita_rotation_ring[i][k].tex) glDeleteTextures(1, &vita_rotation_ring[i][k].tex);
+  memset(vita_rotation_ring, 0, sizeof(vita_rotation_ring));
+#endif
 #ifdef VITA_ROTATION_TARGET
   for (unsigned i = 0; i < VITA_ROTATION_JOBS; ++i) {
     if (vita_rotation_targets[i]) glDeleteTextures(1, &vita_rotation_targets[i]);
