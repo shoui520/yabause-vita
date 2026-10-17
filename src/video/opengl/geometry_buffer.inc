@@ -26,9 +26,10 @@ static uint32_t ga_head, ga_tail, ga_live;  /* live bytes incl. wrap waste */
 static struct { uint32_t end, bytes, frame; } ga_fence[GA_FENCES];
 static unsigned ga_first, ga_count;
 static uint32_t ga_pending;     /* bytes allocated since the last fence */
-static int ga_want;             /* set while reserving for the VDP1 level */
+static int ga_want;             /* reserving for a VDP2 level (1) or the VDP1 level (2) */
 static uint32_t ga_heap_fallbacks; /* VDP1 blocks that did not fit the arena */
 static GLuint ga_vbo;
+static unsigned ga_peak;        /* largest slot of the last VDP1 render, in floats */
 
 static int YglGeomOwned(const void *p) {
   return ga_base && (const uint8_t *)p >= ga_base && (const uint8_t *)p < ga_base + GA_BYTES;
@@ -75,6 +76,21 @@ static void *YglGeomAlloc(uint32_t bytes) {
   ga_live += bytes + waste; ga_pending += bytes + waste;
   return ga_base + at;
 }
+/* Hands the blocks allocated since the last fence to the GPU frame now
+ * being recorded. With every fence in use (frames not presented), the GPU is
+ * drained so all fenced blocks can be reclaimed; blocks of slots still being
+ * filled are unfenced and stay live. */
+static void YglGeomFence(void) {
+  if (!ga_pending) return;
+  if (ga_count == GA_FENCES) {
+    glFinish();
+    for (unsigned k = 0; k < ga_count; k++) ga_fence[(ga_first + k) % GA_FENCES].frame = vgl_framecount - GA_LAG;
+    YglGeomReclaim();
+  }
+  unsigned slot = (ga_first + ga_count) % GA_FENCES;
+  ga_fence[slot].end = ga_head; ga_fence[slot].bytes = ga_pending; ga_fence[slot].frame = vgl_framecount;
+  ++ga_count; ga_pending = 0;
+}
 /* After a VDP1 render: every VDP1-level block is now owned by the GPU.
  * Each slot's next block is sized from what it drew in this render, not
  * from the largest it ever grew to: slots are reassigned to whatever
@@ -85,6 +101,7 @@ static void *YglGeomAlloc(uint32_t bytes) {
 static void YglGeomRetireLevel(YglLevel *level) {
   int j;
   if (ga_state <= 0) return;
+  ga_peak = 0;
   for (j = 0; j < level->prgcount; j++) {
     YglProgram *p = &level->prg[j];
     if (p->currentQuad != 0 || !p->quads) continue;
@@ -95,21 +112,38 @@ static void YglGeomRetireLevel(YglLevel *level) {
     {
       unsigned hint = (unsigned)p->usedQuad + (unsigned)p->usedQuad / 4;
       p->maxQuad = (int)(hint < 1024u ? 1024u : (hint + 1023u) & ~1023u);
+      if (hint > ga_peak) ga_peak = hint;
     }
     p->usedQuad = 0;
   }
-  if (!ga_pending) return;
-  if (ga_count == GA_FENCES) {
-    glFinish();
-    ga_count = 0; ga_live = 0; ga_head = ga_tail = 0;
-    for (j = 0; j < level->prgcount; j++) if (YglGeomOwned(level->prg[j].quads)) ga_live = 1;
-    if (ga_live) abort();   /* live blocks never survive a retire */
-    ga_pending = 0;
-    return;
+  YglGeomFence();
+}
+/* At the start of a frame's VDP2 recording: the last frame's VDP2 blocks
+ * belong to the GPU, as YglGeomRetireLevel's do after a VDP1 render. Every
+ * arena block is dropped (the ring reclaims it after GA_LAG frames whether
+ * or not a slot still points at it), sized for the next frame from what this
+ * one drew. */
+static void YglGeomRetireVdp2(void) {
+  int i, j;
+  if (ga_state <= 0) return;
+  for (i = 0; i < _Ygl->depth; i++) {
+    YglLevel *level = &_Ygl->levels[i];
+    for (j = 0; j < level->prgcount; j++) {
+      YglProgram *p = &level->prg[j];
+      if (!p->quads) continue;
+      if (!YglGeomOwned(p->quads)) {
+        free(p->quads); free(p->textcoords); free(p->vertexAttribute);
+      }
+      p->quads = p->textcoords = p->vertexAttribute = NULL;
+      {
+        const unsigned used = (unsigned)(p->currentQuad > p->usedQuad ? p->currentQuad : p->usedQuad);
+        const unsigned hint = used + used / 4;
+        p->maxQuad = (int)(hint < 1024u ? 1024u : (hint + 1023u) & ~1023u);
+      }
+      p->usedQuad = 0;
+    }
   }
-  unsigned slot = (ga_first + ga_count) % GA_FENCES;
-  ga_fence[slot].end = ga_head; ga_fence[slot].bytes = ga_pending; ga_fence[slot].frame = vgl_framecount;
-  ++ga_count; ga_pending = 0;
+  YglGeomFence();
 }
 /* Bind the arena VBO and point the program's attributes at its block. */
 static void YglGeomBind(YglProgram *p, GLint *old_array) {
@@ -141,7 +175,11 @@ static int YglReserveGeometry(YglProgram *program, unsigned needed) {
   if (required <= (unsigned)program->maxQuad && program->quads &&
       program->textcoords && program->vertexAttribute) return 0;
 #ifdef VITA_TESS_WORKER
-  YglTessDrain();   /* queued grids write into the buffers being replaced */
+  {  /* Queued grids write into VDP1-level buffers being replaced; any other
+      * slot can grow while the worker keeps filling them. */
+    const YglLevel *vdp1 = &_Ygl->levels[_Ygl->depth];
+    if (program >= vdp1->prg && program < vdp1->prg + vdp1->prgcount) YglTessDrain();
+  }
 #endif
   unsigned capacity = (unsigned)program->maxQuad;
   if (capacity > limit) return -1;
@@ -149,6 +187,9 @@ static int YglReserveGeometry(YglProgram *program, unsigned needed) {
   if (capacity < required) capacity = required;
   float *positions = NULL, *texcoords = NULL, *attributes = NULL;
 #ifdef VITA_GEOM_ARENA
+  /* A slot outgrowing its hint is likely this render's large one: grow it
+   * once to the last render's largest instead of doubling and copying. */
+  if (ga_want == 2 && used && capacity < ga_peak) capacity = (ga_peak + 1023u) & ~1023u;
   if (ga_want && capacity <= (GA_BYTES / 4) / (5 * sizeof(float))) {
     /* A retired block leaves its capacity behind as the size hint. */
     if (!program->quads) capacity = (unsigned)program->maxQuad;

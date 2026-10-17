@@ -2120,7 +2120,11 @@ YglProgram * YglGetProgram( YglSprite * input, int prg, unsigned needed )
    program = &level->prg[level->prgcurrent];
 
 #ifdef VITA_GEOM_ARENA
-   ga_want = level == &_Ygl->levels[_Ygl->depth];
+#if defined(VITA_VDP2_OPAQUE_RUNS) || defined(VITA_VDP2_INDEXED_QUADS)
+   ga_want = level == &_Ygl->levels[_Ygl->depth] ? 2 : 0;   /* those draw VDP2 slots from client memory */
+#else
+   ga_want = level == &_Ygl->levels[_Ygl->depth] ? 2 : 1;
+#endif
 #endif
    if (YglReserveGeometry(program, needed) != 0) {
      /* Out of memory: this primitive is dropped (every caller skips a NULL
@@ -5046,7 +5050,17 @@ void YglRender(void) {
             YglDrawIndexedVdp2Quads(&level->prg[j]);
           else
 #endif
-          if (!ABL(4)) glDrawArrays(GL_TRIANGLES, 0, level->prg[j].currentQuad / 2);
+          {
+#ifdef VITA_GEOM_ARENA
+            GLint old_array = 0;
+            const int arena = YglGeomOwned(level->prg[j].quads);
+            if (arena) YglGeomBind(&level->prg[j], &old_array);
+#endif
+            if (!ABL(4)) glDrawArrays(GL_TRIANGLES, 0, level->prg[j].currentQuad / 2);
+#ifdef VITA_GEOM_ARENA
+            if (arena) glBindBuffer(GL_ARRAY_BUFFER, old_array);
+#endif
+          }
 #ifdef VITA_DIAG_ABLATE
           { static unsigned f_; extern unsigned vt_frame_seq; static unsigned last_;
             if (last_ != vt_frame_seq) { last_ = vt_frame_seq; ++f_; }
@@ -5061,6 +5075,7 @@ void YglRender(void) {
             YglCleanUpWindow(&level->prg[j]);
           }
 
+          level->prg[j].usedQuad = level->prg[j].currentQuad;
           level->prg[j].currentQuad = 0;
         }
 
@@ -5497,7 +5512,9 @@ void YglReset(void) {
    YglLevel * level;
    unsigned int i,j;
 
-
+#ifdef VITA_GEOM_ARENA
+   YglGeomRetireVdp2();
+#endif
    for(i = 0;i < (_Ygl->depth+1) ;i++) {
      level = _Ygl->levels + i;
      level->blendmode  = 0;
