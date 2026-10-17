@@ -398,6 +398,14 @@ int YglVitaRotationBegin(RBGDrawInfo *rbg, vdp2rotationparameter_struct *p,
     ++snapshot_hits;
   } else
 #endif
+#ifdef VITA_ROTATION_VRAM_PAGES
+  /* This job's last snapshot: pages whose stamp is unchanged since were not
+   * written in between and hold the same bytes. */
+  if (job->page_valid && vram == Vdp2Ram) {
+    for (unsigned pg = 0; pg < 128; ++pg)
+      if (job->page_ver[pg] != vdp2_page_ver[pg]) memcpy(job->vram + pg * 4096, vram + pg * 4096, 4096);
+  } else
+#endif
   memcpy(job->vram, vram, sizeof(job->vram));
 #ifdef VITA_ROTATION_SNAPSHOT_REUSE
   if (!(++snapshot_jobs & 127))
