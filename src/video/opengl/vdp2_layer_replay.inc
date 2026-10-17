@@ -22,6 +22,13 @@ typedef struct { s16 x, y; u16 ax, ay; u8 flip, priority; u16 pos; } Vdp2ReplayQ
  * Vdp2DrawPatternPos for it. */
 typedef struct { u32 pn; s16 x, y; u8 map, planex, pagex, planey, pagey; } Vdp2ReplayPos;
 typedef struct { u64 addr; YglCache c; } Vdp2ReplayCache;
+#ifdef VITA_VDP2_CELL_STORE
+/* A cell store entry the walk drew from (Vdp2StoreQuad), by its placement
+ * serial: a replay needs it still there and in the current storage. */
+typedef struct { void *e; unsigned serial; } Vdp2ReplayStoreRef;
+static int Vdp2StoreRefValid(const Vdp2ReplayStoreRef *ref);
+static void Vdp2StoreRefUse(const Vdp2ReplayStoreRef *ref);
+#endif
 enum { VDP2_REPLAY_SLOTS = 5, VDP2_REPLAY_KEY_INTS = 64 };
 typedef struct {
   int valid;
@@ -47,6 +54,10 @@ typedef struct {
   unsigned ncaches, capcaches;
   Vdp2ReplayPos *pos;
   unsigned npos, cappos;
+#ifdef VITA_VDP2_CELL_STORE
+  Vdp2ReplayStoreRef *stores;
+  unsigned nstores, capstores;
+#endif
   int broken;                     /* something the record cannot express */
   int patched;                    /* holds cells Vdp2ReplayNames redrew, past the walk's */
 } Vdp2LayerRecord;
@@ -139,6 +150,15 @@ static int Vdp2ReplayRegsSame(const Vdp2 *a, const Vdp2 *b) {
                  sizeof(Vdp2) - offsetof(Vdp2, SCXIN0));
 }
 
+static int Vdp2ReplayStoresValid(const Vdp2LayerRecord *r) {
+#ifdef VITA_VDP2_CELL_STORE
+  for (unsigned i = 0; i < r->nstores; ++i) if (!Vdp2StoreRefValid(&r->stores[i])) return 0;
+#else
+  (void)r;
+#endif
+  return 1;
+}
+
 /* Everything but VRAM matches. */
 static int Vdp2ReplayStateSame(const Vdp2LayerRecord *r, const int *key, const YglTextureManager *tm) {
   extern unsigned vita_atlas_gen, vita_atlas_prev_frame;
@@ -146,7 +166,7 @@ static int Vdp2ReplayStateSame(const Vdp2LayerRecord *r, const int *key, const Y
          r->start_x == tm->currentX && r->start_y == tm->currentY && r->start_ymax == tm->yMax &&
          r->start_cash == tm->CashLink_index && r->start_sig == tm->vita_cache_sig &&
          !memcmp(r->key, key, sizeof(r->key)) && Vdp2ReplayRegsSame(&r->regs, fixVdp2Regs) &&
-         (!r->has_cram || !memcmp(r->cram, Vdp2ColorRam, sizeof(r->cram)));
+         (!r->has_cram || !memcmp(r->cram, Vdp2ColorRam, sizeof(r->cram))) && Vdp2ReplayStoresValid(r);
 }
 
 static int Vdp2ReplayMatches(const Vdp2LayerRecord *r, const int *key, const YglTextureManager *tm) {
@@ -212,6 +232,9 @@ static void Vdp2ReplayBegin(Vdp2LayerRecord *r, const vdp2draw_struct *info, con
   r->start_x = tm->currentX; r->start_y = tm->currentY; r->start_ymax = tm->yMax;
   r->start_cash = tm->CashLink_index; r->start_sig = tm->vita_cache_sig;
   r->reuse_n = 0; r->nquads = 0; r->ncaches = 0;
+#ifdef VITA_VDP2_CELL_STORE
+  r->nstores = 0;
+#endif
   vdp2_layer_rec = r;
 }
 
@@ -298,6 +321,19 @@ static void Vdp2ReplayDropQuad(void) {
   else vdp2_layer_rec->broken = 1;
 }
 
+#ifdef VITA_VDP2_CELL_STORE
+static void Vdp2ReplayAddStore(void *e, unsigned serial) {
+  Vdp2LayerRecord *r = vdp2_layer_rec;
+  if (r->nstores == r->capstores) {
+    const unsigned cap = r->capstores ? r->capstores * 2 : 1024;
+    Vdp2ReplayStoreRef *p = realloc(r->stores, cap * sizeof(*p));
+    if (!p) { r->broken = 1; return; }
+    r->stores = p; r->capstores = cap;
+  }
+  r->stores[r->nstores++] = (Vdp2ReplayStoreRef){ e, serial };
+}
+#endif
+
 static void Vdp2ReplayAddCache(u64 addr, const YglCache *c) {
   Vdp2LayerRecord *r = vdp2_layer_rec;
   if (r->ncaches == r->capcaches) {
@@ -370,6 +406,9 @@ static void Vdp2ReplayEmit(Vdp2LayerRecord *r, const vdp2draw_struct *info, YglT
     }
     i = end;
   }
+#ifdef VITA_VDP2_CELL_STORE
+  for (unsigned i = 0; i < r->nstores; ++i) Vdp2StoreRefUse(&r->stores[i]);  /* drawn from in this frame */
+#endif
   Vdp2ReplayCacheDefer(tm, r);
   tm->currentX = r->end_x; tm->currentY = r->end_y; tm->yMax = r->end_ymax;
   tm->vita_cpu_extent = r->end_extent;

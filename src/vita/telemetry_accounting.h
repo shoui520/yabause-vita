@@ -27,6 +27,7 @@
  X(VDP2_CELL_QUAD, "vdp2_cell_quad", "work") \
  X(VDP2_CELL_DECODE, "vdp2_cell_decode", "work") \
  X(VDP2_CELL_ADDR, "vdp2_cell_addr", "work") \
+ X(VDP2_CELL_STORE, "vdp2_cell_store", "work") \
  X(M68K, "m68k", "work") \
  X(M68K_ORBIT, "m68k_orbit", "work") \
  X(SCSP_TIMER, "scsp_timer", "work") \

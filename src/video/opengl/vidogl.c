@@ -705,6 +705,13 @@ static unsigned vdp1_store_short;       /* an atlas frame found the store full *
 /* Owns rectangles freed after being drawn in the current atlas frame (an
  * earlier quad may sample them) until the next one. */
 static Vdp1SpriteCacheEntry vdp1_store_held;
+#ifdef VITA_VDP2_CELL_STORE
+/* VDP2 cell patterns kept the same way (Vdp2StoreQuad), in a band of rows
+ * right below the sprite store's; the band moving drops its rectangles. */
+enum { VDP2_STORE_STEP = 64, VDP2_STORE_MAX_ROWS = 512 };
+static AtlasStore vdp2_store;
+static unsigned vdp2_store_epoch = 1, vdp2_store_base, vdp2_store_short;
+#endif
 static int Vdp1StorePlaced(const Vdp1SpriteCacheEntry *e) { return e->store_epoch == vdp1_store_epoch; }
 static void Vdp1StoreRelease(Vdp1SpriteCacheEntry *e) {
   if (!Vdp1StorePlaced(e)) return;
@@ -745,10 +752,23 @@ void Vdp1AtlasStoreFrame(YglTextureManager *tm) {
     AtlasStoreReset(&vdp1_store, tm->width, limit);
   }
   vdp1_store.limit = limit;
-  if (!limit) return;
-  if (tm->height < limit + ATLAS_STORE_STEP) YglTMRealloc(tm, tm->width, limit + 2 * ATLAS_STORE_STEP);
-  tm->currentY = tm->yMax = limit;
-  YglAtlasExtentAdd(&tm->vita_cpu_extent, 0, 0, tm->width, limit);
+  unsigned rows = limit;
+#ifdef VITA_VDP2_CELL_STORE
+  unsigned limit2 = vdp2_store.limit;
+  if (vdp2_store_short && limit2 < VDP2_STORE_MAX_ROWS) limit2 += VDP2_STORE_STEP;
+  vdp2_store_short = 0;
+  if (vdp2_store.width != tm->width || vdp2_store_base != limit) {
+    ++vdp2_store_epoch;
+    AtlasStoreReset(&vdp2_store, tm->width, limit2);
+    vdp2_store_base = limit;
+  }
+  vdp2_store.limit = limit2;
+  rows += limit2;
+#endif
+  if (!rows) return;
+  if (tm->height < rows + ATLAS_STORE_STEP) YglTMRealloc(tm, tm->width, rows + 2 * ATLAS_STORE_STEP);
+  tm->currentY = tm->yMax = rows;
+  YglAtlasExtentAdd(&tm->vita_cpu_extent, 0, 0, tm->width, rows);
 }
 /* Draws a cached sprite from its store rectangle and records it in the atlas
  * frame's cache under key, as a decoded sprite would be; 0 when it is not
@@ -855,10 +875,6 @@ static void FASTCALL Vdp1ReadTexture(vdp1cmd_struct *cmd, YglSprite *sprite, Ygl
   const u32 cache_w = sprite->w, cache_h = sprite->h, cache_pitch = texture->w + sprite->w;
 #ifndef VITA_VDP1_SPRITE_REUSE_VERIFY
   if (cache_hit) {
-    { static unsigned hist[64][32], n_; unsigned wi = cache_w / 8 < 63 ? cache_w / 8 : 63, hi = cache_h / 8 < 31 ? cache_h / 8 : 31; ++hist[wi][hi];
-      if (++n_ % 8192 == 0) { char b_[1024]; int o = 0;
-        for (unsigned i = 0; i < 64; ++i) for (unsigned j = 0; j < 32; ++j) if (hist[i][j] > 40 && o < 960) o += snprintf(b_ + o, 1024 - o, " %ux%u:%u", i * 8, j * 8, hist[i][j]);
-        YuiMsg("sprite_hist%s", b_); memset(hist, 0, sizeof hist); } }
     for (u32 r = 0; r < cache_h; ++r)
       memcpy(texture->textdata + r * cache_pitch, cache_entry->texels + r * cache_w, cache_w * 4);
     Vdp1ReuseSideEffects(cmd);
@@ -3539,6 +3555,141 @@ static void Vdp2AuditCellAlpha(const vdp2draw_struct *tile,const YglCache *c) {
 #ifdef VITA_DIAG_ABLATE
 unsigned vt_pat[2]; /* diagnostic: NBG0 pattern cache misses, hits */
 #endif
+#ifdef VITA_VDP2_CELL_STORE
+/* A decoded 4/8bpp pattern drawn again is sampled from its rectangle in the
+ * VDP2 band of the atlas store instead of being decoded into a new one; each
+ * atlas storage receives it once. Entries are keyed by every decode input of
+ * the fast path (as vdp2_cell_reuse.h) and hold the stamps of the VRAM pages
+ * the pattern was read from. */
+typedef struct {
+  u64 key;
+  uint32_t charaddr, co, pal, abits, ver[2];
+  uint16_t banks[4];
+  uint8_t patternwh, colornumber, transparent, live;
+  unsigned used, epoch, gen[4], next;
+  unsigned serial;                /* moves whenever the entry is reassigned or placed */
+  int shelf;
+  uint16_t x, y;
+} Vdp2StoreEntry;
+enum { VDP2_STORE_WAYS = 4, VDP2_STORE_SETS = 2048 };
+static Vdp2StoreEntry *vdp2_store_entries;
+
+#ifdef VITA_VDP2_LAYER_REPLAY
+static int Vdp2StoreRefValid(const Vdp2ReplayStoreRef *ref) {
+  const Vdp2StoreEntry *e = ref->e;
+  if (e->serial != ref->serial || e->epoch != vdp2_store_epoch) return 0;
+  for (unsigned k = 0; k < 4; ++k) if (e->gen[k] == vita_atlas_gen) return 1;
+  return 0;
+}
+static void Vdp2StoreRefUse(const Vdp2ReplayStoreRef *ref) { ((Vdp2StoreEntry *)ref->e)->used = vita_atlas_frame; }
+#endif
+static void Vdp2StoreEvict(unsigned age) {
+  for (unsigned i = 0; i < vdp2_store.shelves; ++i) {
+    AtlasStoreShelf *sh = &vdp2_store.shelf[i];
+    for (unsigned j = sh->n; j-- > 0;) {
+      Vdp2StoreEntry *e = sh->s[j].owner;
+      if (vita_atlas_frame - e->used < age) continue;
+      e->epoch = 0;
+      memmove(&sh->s[j], &sh->s[j + 1], (sh->n - j - 1) * sizeof(sh->s[0]));
+      --sh->n;
+    }
+  }
+}
+
+/* 1 when drawn (quad queued and recorded in the atlas frame's cache under
+ * key, as YglQuadOffset would); 0 leaves the pattern to the caller. */
+static int Vdp2StoreQuad(vdp2draw_struct *info, vdp2draw_struct *tile, u64 key, int cx, int cy) {
+  YglTextureManager *tm = _Ygl->texture_manager;
+
+  uint32_t abits;
+  const unsigned bytes = Vdp2CellReuseBytes(info->patternwh, info->colornumber);
+  if (!tm->texture || (info->patternwh != 1 && info->patternwh != 2) ||
+      (info->colornumber != 0 && info->colornumber != 1) || info->specialprimode == 2 ||
+      info->cellw != 8 || info->cellh != 8 || (uint32_t)info->charaddr + bytes > 0x80000 ||
+      !Vdp2CellReuseAlphaKey(info, &abits)) return 0;
+  if (!vdp2_store_entries) vdp2_store_entries = calloc(VDP2_STORE_SETS * VDP2_STORE_WAYS, sizeof(*vdp2_store_entries));
+  if (!vdp2_store_entries) return 0;
+  const uint32_t charaddr = (uint32_t)info->charaddr, co = (uint32_t)info->coloroffset,
+                 pal = (uint32_t)(info->paladdr << 4);
+  const uint32_t ver0 = vdp2_page_ver[(charaddr >> 12) & 127], ver1 = vdp2_page_ver[((charaddr + bytes - 1) >> 12) & 127];
+  const uint8_t transparent = info->transparencyenable != 0;
+  const uint32_t h = (uint32_t)(key ^ (key >> 29)) ^ co * 0x9E3779B1u ^ abits * 0x85EBCA77u;
+  Vdp2StoreEntry *const set = vdp2_store_entries + ((h * 2654435761u) >> 21) * VDP2_STORE_WAYS;
+  Vdp2StoreEntry *e = NULL, *victim = NULL;
+  for (unsigned w = 0; w < VDP2_STORE_WAYS; ++w) {
+    Vdp2StoreEntry *c = &set[w];
+    if (c->live && c->key == key && c->charaddr == charaddr && c->co == co && c->pal == pal &&
+        c->abits == abits && c->patternwh == info->patternwh && c->colornumber == info->colornumber &&
+        c->transparent == transparent && !memcmp(c->banks, info->char_bank, sizeof(c->banks))) { e = c; break; }
+    if (c->live && c->used == vita_atlas_frame) continue;   /* may be sampled by this frame's quads */
+    if (!victim || !c->live || (victim->live && vita_atlas_frame - c->used > vita_atlas_frame - victim->used)) victim = c;
+  }
+  if (!e) {
+    uint32_t clear_alpha;
+    if (!victim) return 0;
+    /* Left to the caller, which drops the quad of an all-alpha-0 pattern. */
+    if (Vdp2CellClearAlpha(info, &clear_alpha) &&
+        Vdp2CellsTransparent(Vdp2Ram, charaddr, (unsigned)(info->patternwh * info->patternwh),
+                             info->colornumber == 0 ? 32u : 64u, info->char_bank, clear_alpha << 24, transparent) == 1)
+      return 0;
+    e = victim;
+    if (e->live && e->epoch == vdp2_store_epoch) AtlasStoreFree(&vdp2_store, e->shelf, e->x);
+    e->live = 1; e->key = key; e->charaddr = charaddr; e->co = co; e->pal = pal; e->abits = abits;
+    e->patternwh = (uint8_t)info->patternwh; e->colornumber = (uint8_t)info->colornumber;
+    e->transparent = transparent; memcpy(e->banks, info->char_bank, sizeof(e->banks));
+    e->ver[0] = ver0; e->ver[1] = ver1; e->epoch = 0; ++e->serial;
+  } else if (e->ver[0] != ver0 || e->ver[1] != ver1) {
+    e->ver[0] = ver0; e->ver[1] = ver1;
+    memset(e->gen, 0, sizeof(e->gen));                    /* rewritten: every storage is stale */
+  }
+  e->used = vita_atlas_frame;
+  const unsigned side = (unsigned)info->patternpixelwh;
+  if (e->epoch != vdp2_store_epoch) {
+    unsigned x, y;
+    int shelf = AtlasStoreAlloc(&vdp2_store, side, side, e, &x, &y);
+    if (shelf < 0) { Vdp2StoreEvict(8); shelf = AtlasStoreAlloc(&vdp2_store, side, side, e, &x, &y); }
+    if (shelf < 0) { Vdp2StoreEvict(1); shelf = AtlasStoreAlloc(&vdp2_store, side, side, e, &x, &y); }
+    if (shelf < 0) { vdp2_store_short = 1; return 0; }
+    e->shelf = shelf; e->x = (uint16_t)x; e->y = (uint16_t)y; e->epoch = vdp2_store_epoch;
+    memset(e->gen, 0, sizeof(e->gen));
+    ++e->serial;
+  }
+  const unsigned ay = vdp2_store_base + e->y;
+  unsigned k = 0;
+  while (k < 4 && e->gen[k] != vita_atlas_gen) ++k;
+  if (k == 4) {
+    VT_STACK_BEGIN(VT_VDP2_CELL_DECODE);
+    YglTexture t = { tm->texture + (size_t)ay * tm->width + e->x, tm->width - side };
+    if (info->patternwh == 1) Vdp2DrawCell(info, &t);
+    else {   /* as Vdp2DrawPatternPos */
+      t.w += 8;
+      Vdp2DrawCell(info, &t);
+      t.textdata -= (t.w + 8) * 8 - 8;
+      Vdp2DrawCell(info, &t);
+      t.textdata -= 8;
+      Vdp2DrawCell(info, &t);
+      t.textdata -= (t.w + 8) * 8 - 8;
+      Vdp2DrawCell(info, &t);
+    }
+    VT_STACK_END();
+    e->gen[e->next++ & 3] = vita_atlas_gen;
+  }
+  YglCache c;
+  c.x = e->x; c.y = ay;
+  VT_STACK_BEGIN(VT_VDP2_CELL_QUAD);
+  YglCachedQuadOffset(tile, &c, cx, cy, info->coordincx, info->coordincy);
+  VT_STACK_END();
+  YglCacheAdd(tm, key, &c);
+#ifdef VITA_VDP2_LAYER_REPLAY
+  if (vdp2_layer_rec) {   /* as the decode path records it */
+    Vdp2ReplayAddQuad(tile, &c); Vdp2ReplayAddCache(key, &c);
+    Vdp2ReplayRead(charaddr, bytes);
+    Vdp2ReplayAddStore(e, e->serial);
+  }
+#endif
+  return 1;
+}
+#endif
 static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x, int y, int cx, int cy, int lines )
 {
   u64 cacheaddr = (((u64)(info->priority&0xF))<<35) | ((u32)(info->alpha >> 3) << 27) |
@@ -3629,6 +3780,12 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
   }
 
   //printf("x=%d,y=%d %lx not cached\n",x,y,cacheaddr);
+#ifdef VITA_VDP2_CELL_STORE
+  VT_STACK_BEGIN(VT_VDP2_CELL_STORE);
+  const int stored = Vdp2StoreQuad(info, &tile, cacheaddr, cx, cy);
+  VT_STACK_END();
+  if (stored) return;
+#endif
   VT_STACK_BEGIN(VT_VDP2_CELL_QUAD);
   YglQuadOffset(&tile, texture, &c, cx, cy, info->coordincx, info->coordincy);
   YglCacheAdd(_Ygl->texture_manager, cacheaddr, &c);

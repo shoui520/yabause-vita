@@ -17,7 +17,7 @@ static inline int VitaTelemetryPhaseEnabled(int mode, VitaTelemetryPhase phase) 
     case VT_SH2_DMA: case VT_SH2_MEMORY: case VT_SH2_DISPATCH:
     case VT_SH2_INVALIDATE: case VT_SH2_NATIVE: case VT_SH2_FORWARD: case VT_SH2_SLICE_TAIL:
     case VT_VDP2_CELL_LOOKUP: case VT_VDP2_CELL_QUAD: case VT_VDP2_CELL_DECODE:
-    case VT_VDP2_CELL_ADDR: case VT_VDP2_BITMAP: case VT_VDP2_BITMAP_LS: case VT_VDP2_BITMAP_CI:
+    case VT_VDP2_CELL_ADDR: case VT_VDP2_CELL_STORE: case VT_VDP2_BITMAP: case VT_VDP2_BITMAP_LS: case VT_VDP2_BITMAP_CI:
     case VT_VDP2_MAP_LINE: case VT_VDP2_MAP: case VT_SCU: case VT_SCU_DMA: case VT_SCU_DSP:
     case VT_SMPC: case VT_CD_CONTROL: case VT_HBLANK:
     case VT_M68K: case VT_M68K_ORBIT: case VT_SCSP_TIMER: case VT_SCSP_MIX: case VT_SCSP_DSP:
