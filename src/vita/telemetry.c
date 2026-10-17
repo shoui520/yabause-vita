@@ -65,6 +65,7 @@ static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int observer_tid = -1;
 static void observe_threads(void) {
   static uint64_t previous_us[VT_MAX_THREADS], previous_run[VT_MAX_THREADS];
+  static uint32_t previous_switch[VT_MAX_THREADS][3];
   static int valid[VT_MAX_THREADS];
   RegisteredThread copy[VT_MAX_THREADS];
   /* Only the emulation observer calls this function. Avoid spending a
@@ -80,11 +81,15 @@ static void observe_threads(void) {
     uint64_t now = sceKernelGetProcessTimeWide(), run = 0;
     if (rc >= 0) memcpy(&run, &info.runClocks, sizeof(run));
     int usable = rc >= 0 && valid[i] && run >= previous_run[i];
-    append_report(report, sizeof(report), &used, "telemetry_thread thread=%d role=%s sample_us=%llu cpu_window_us=%llu cpu_run_us=%llu cpu_valid=%d status=%u wait_type=%u wait_id=%d priority=%d thread_info_rc=%d scope=registered_threads_only",
+    append_report(report, sizeof(report), &used, "telemetry_thread thread=%d role=%s sample_us=%llu cpu_window_us=%llu cpu_run_us=%llu cpu_valid=%d status=%u wait_type=%u wait_id=%d priority=%d affinity=%x intr_preempt=%u thread_preempt=%u release=%u name=%s thread_info_rc=%d scope=registered_threads_only",
       copy[i].tid, copy[i].role, now, usable ? now - previous_us[i] : 0,
       usable ? run - previous_run[i] : 0, usable, info.status,
-      info.waitType, info.waitId, info.currentPriority, rc);
+      info.waitType, info.waitId, info.currentPriority, (unsigned)info.currentCpuAffinityMask,
+      info.intrPreemptCount - previous_switch[i][0], info.threadPreemptCount - previous_switch[i][1],
+      info.threadReleaseCount - previous_switch[i][2], info.name, rc);
     previous_us[i] = now; previous_run[i] = run; valid[i] = rc >= 0;
+    previous_switch[i][0] = info.intrPreemptCount; previous_switch[i][1] = info.threadPreemptCount;
+    previous_switch[i][2] = info.threadReleaseCount;
   }
   if (used && used < sizeof(report)) YuiMsg("%s", report);
   else if (used) YuiMsg("telemetry_report_overflow");
