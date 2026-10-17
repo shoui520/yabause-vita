@@ -110,6 +110,7 @@ void VitaDiagTimersReport(void) {
 #include <pthread.h>
 #include "telemetry.h"
 #include "threads.h"
+#include "cpu_affinity.h"
 #include "telemetry_policy.h"
 #include "sound_budget_api.h"
 #include "audio_pcm.h"
@@ -407,9 +408,9 @@ static void audio_queue_event(void *ctx,int event) {
         previous,observed_priority,priority_rc);
       abort();
     }
-    int rc=sceKernelChangeThreadCpuAffinityMask(0,0x20000);
+    int rc=sceKernelChangeThreadCpuAffinityMask(0,VitaAffinityEncode(VITA_CORE_SOUND));
     YuiMsg("audio_output_priority previous=%d observed=%d",previous,observed_priority);
-    YuiMsg("audio_output_affinity cpu=1 result=%08x observed=%08x",rc,sceKernelGetThreadCpuAffinityMask(0));
+    YuiMsg("audio_output_affinity cpu=0 result=%08x observed=%08x",rc,sceKernelGetThreadCpuAffinityMask(0));
     VitaTelemetryThread("audio_output");
   } else if(event==VAQ_STOP) VitaTelemetryReport();
   else if(event==VAQ_WAIT_BEGIN) VitaTelemetryEnter(VT_QUEUE_WAIT);
@@ -697,7 +698,7 @@ int main(int argc, char **argv) {
 #else
   YuiMsg("shader_delivery=offline_gxp");
 #endif
-  YabThreadSetCurrentThreadAffinityMask(1);
+  YabThreadSetCurrentThreadAffinityMask(VITA_CORE_EMULATION);
   char run_id[80] = {0};
   FILE *receipt = fopen(DATA "run-id.txt", "r");
   if (receipt) { fgets(run_id, sizeof(run_id), receipt); fclose(receipt); }

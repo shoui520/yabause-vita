@@ -4,12 +4,16 @@
 #include "../core/threads.h"
 // Fixed placement for emulation workers. Other service threads keep their
 // requested policy; pinning does not introduce new asynchronous execution.
+// Core 0 takes most of the kernel's interrupts (a thread there loses about
+// 3% of its time to them), so the emulation thread, which bounds the frame
+// rate, runs on core 1 and the sound side on core 0. Logical masks.
+enum { VITA_CORE_EMULATION = 2, VITA_CORE_SOUND = 1 };
 static inline int VitaAffinityForRole(int role, int requested) {
-  if (role == YAB_THREAD_SCSP || role == YAB_THREAD_OPENAL) return 2;
+  if (role == YAB_THREAD_SCSP || role == YAB_THREAD_OPENAL) return VITA_CORE_SOUND;
 #ifdef VITA_ROTATION_SPLIT
   /* Rows are shared with the render thread (core 2) while it waits; the
-   * worker preempts the spinning sound thread on core 1 instead. */
-  if (role == YAB_THREAD_VIDSOFT_LAYER_RBG0) return 2;
+   * worker preempts the spinning sound thread on its core instead. */
+  if (role == YAB_THREAD_VIDSOFT_LAYER_RBG0) return VITA_CORE_SOUND;
 #endif
   if (role == YAB_THREAD_VDP ||
       (role >= YAB_THREAD_VIDSOFT_LAYER_NBG3 && role < YAB_NUM_THREADS)) return 4;

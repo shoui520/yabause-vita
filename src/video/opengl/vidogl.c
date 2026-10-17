@@ -665,6 +665,7 @@ static Vdp2CellReuseSeq vdp2_cell_reuse_seq;
 #include "vdp1_sprite_reuse.h"
 #endif
 #include "../../vita/telemetry.h"
+#include "../../vita/cpu_affinity.h"
 #include "../../vita/diag_timers.h"
 #ifdef VITA_VDP2_BITMAP_REUSE_VERIFY
 unsigned vita_bitmap_verify[2];
@@ -6500,7 +6501,7 @@ static INLINE void Vdp2RotationSplitLoad(RotationSplitJob *job, const RotationSp
  * and info what the first dot of the final run of that key fetched (nothing,
  * if the run starts the frame on the initial key). Walks back from the end of
  * the previous row; a dot's key does not depend on the dots before it. The
- * core 0 helper passes its frame's seq and gives up (with the result then
+ * emulation core helper passes its frame's seq and gives up (with the result then
  * rejected) when the rows are republished under it. */
 static void Vdp2RotationSplitSeed(RotationSplitJob *job, int first, unsigned seq,
                                   int *oldcellx, int *oldcelly) {
@@ -6662,14 +6663,14 @@ static void Vdp2RotationSplitFinish(unsigned seq, int c, int rows) {
 
 extern volatile int g_vita_sound_wait;
 #ifdef VITA_DIAG_ABLATE
-/* diagnostic: rows and time per participant (0 render, 1 worker, 2 core 0 helper) */
+/* diagnostic: rows and time per participant (0 render, 1 worker, 2 emulation core helper) */
 unsigned vt_rot_rows[3], vt_rot_us[3];
 int vt_bench_mode, vt_bench_misses;
 unsigned vt_span_us[4]; /* seed, span lookups, span render us; spans */
 unsigned vt_span_diag[4]; /* fast dots, slow dots, fast cell misses (racy) */
 #endif
 /* Rotation worker, render thread and publisher: claim free chunks, then
- * chunks the core 0 helper is computing, and write them in place. */
+ * chunks the emulation core helper is computing, and write them in place. */
 static void Vdp2RotationSplitWork(int worker) {
   const unsigned seq = atomic_load(&rotation_split_seq);
   if (seq & 1) return;
@@ -6700,7 +6701,7 @@ static void Vdp2RotationSplitWork(int worker) {
   }
 }
 
-/* Core 0 helper, below the emulation thread's priority: it can be preempted
+/* Emulation core helper, below the emulation thread's priority: it can be preempted
  * holding a chunk, so it computes off to the side and writes the chunk only
  * if nobody took it over meanwhile. A stale frame's inputs are rejected by
  * the sequence check before computing and by the claim before writing. */
@@ -6742,7 +6743,7 @@ static void Vdp2RotationSplitHelperWork(void) {
 static SceUID rotation_split_wake = -1;
 static void *Vdp2RotationSplitHelperMain(void *arg) {
   (void)arg;
-  sceKernelChangeThreadCpuAffinityMask(0, SCE_KERNEL_CPU_MASK_USER_0);
+  sceKernelChangeThreadCpuAffinityMask(0, VitaAffinityEncode(VITA_CORE_EMULATION));
   sceKernelChangeThreadPriority(0, 176);
   for (;;) {
     if (sceKernelWaitSema(rotation_split_wake, 1, NULL) < 0) return NULL;
