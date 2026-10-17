@@ -5,10 +5,9 @@
 /* Chooses who draws GPU-admissible rotation screens: the SGX shader (0) or
  * the CPU rows (1). Both produce the same pixels; only the cost moves.
  * The GPU path is kept unless frames are slow while presentation waits on
- * the GPU and the emulation stalls on the drawing side; the other path is
- * then tried for one window and kept only if the frame period did not get
- * worse. Failed tries back off. */
-enum { ROUTE_WINDOW = 30, ROUTE_SETTLE = 6, ROUTE_BACKOFF_MIN = 120, ROUTE_BACKOFF_MAX = 1800 };
+ * the GPU; the other path is then tried for one window and kept only if the
+ * frame period did not get worse. Failed tries back off. */
+enum { ROUTE_WINDOW = 30, ROUTE_PROBE_WINDOW = 12, ROUTE_SETTLE = 4, ROUTE_BACKOFF_MIN = 120, ROUTE_BACKOFF_MAX = 1800 };
 enum { ROUTE_SLOW_US = 17200 }; /* period above this: below ~58 fps */
 
 typedef struct {
@@ -16,7 +15,7 @@ typedef struct {
   int probing;        /* 1 while trying the other route */
   uint32_t settle;    /* frames to discard after a switch */
   uint32_t frames;    /* frames in the current window */
-  uint64_t wall_us, wait_us, stall_us;
+  uint64_t wall_us, wait_us;
   uint32_t eligible;  /* admissible rotation screens in the window */
   uint32_t base_period;
   uint32_t holdoff, backoff;
@@ -34,19 +33,17 @@ static inline void VitaRotationRouteSwitch(VitaRotationRoute *r) {
   ++r->switches;
 }
 
-/* One emulated frame: its wall time, the presentation wait inside it, the
- * time the emulation waited for the drawing side and the admissible rotation
- * screens it drew. Returns the route to use next. */
+/* One emulated frame: its wall time, the presentation wait inside it and
+ * the admissible rotation screens it drew. Returns the route to use next. */
 static inline int VitaRotationRouteFrame(VitaRotationRoute *r, uint32_t wall_us,
-                                         uint32_t wait_us, uint32_t stall_us,
-                                         uint32_t eligible) {
+                                         uint32_t wait_us, uint32_t eligible) {
   if (r->settle) { --r->settle; return r->cpu; }
-  r->wall_us += wall_us; r->wait_us += wait_us; r->stall_us += stall_us; r->eligible += eligible;
-  if (++r->frames < ROUTE_WINDOW) return r->cpu;
+  r->wall_us += wall_us; r->wait_us += wait_us; r->eligible += eligible;
+  if (++r->frames < (r->probing ? ROUTE_PROBE_WINDOW : ROUTE_WINDOW)) return r->cpu;
   const uint32_t period = (uint32_t)(r->wall_us / r->frames);
-  const uint64_t wall = r->wall_us, wait = r->wait_us, stall = r->stall_us;
+  const uint64_t wall = r->wall_us, wait = r->wait_us;
   const uint32_t n = r->frames, seen = r->eligible;
-  r->frames = 0; r->wall_us = r->wait_us = r->stall_us = 0; r->eligible = 0;
+  r->frames = 0; r->wall_us = r->wait_us = 0; r->eligible = 0;
   if (r->probing) {
     r->probing = 0;
     if ((uint64_t)period * 100 > (uint64_t)r->base_period * 105) {
@@ -60,11 +57,9 @@ static inline int VitaRotationRouteFrame(VitaRotationRoute *r, uint32_t wall_us,
   }
   if (r->holdoff) { r->holdoff = r->holdoff > n ? r->holdoff - n : 0; return r->cpu; }
   if (!seen || period <= ROUTE_SLOW_US) return r->cpu;
-  /* GPU route: presentation waiting says the SGX is behind, but only if the
-   * emulation is also held up by the drawing side; otherwise the wait is the
-   * idle vsync wait of a frame the emulation itself made slow. CPU route:
-   * little waiting says the ARM side is the limit, so the GPU may do better. */
-  const int try_other = r->cpu ? wait * 10 < wall : wait * 4 >= wall && stall * 10 >= wall;
+  /* GPU route: presentation waiting says the SGX is behind. CPU route: little
+   * waiting says the ARM side is the limit, so the GPU may do better. */
+  const int try_other = r->cpu ? wait * 10 < wall : wait * 10 >= wall * 3;
   if (try_other) {
     r->base_period = period;
     r->probing = 1;
