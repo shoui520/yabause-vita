@@ -76,6 +76,7 @@ enum { AREA_VDP1, AREA_VDP2, AREA_CRAM, AREA_LINES, AREAS };
 typedef struct { u8 *data; u32 synced; int refs; } Buf;
 static Buf pool[AREAS][POOL];
 static int newest[AREAS] = {-1, -1, -1, -1};
+static u32 vdp1_buf_ver[POOL][128];  /* vdp1_page_ver as of each VDP1 buffer's contents */
 static const u32 area_size[AREAS] = {0x80000, 0x80000, 0x1000, sizeof(Vdp2) * 270};
 
 /* Kernel semaphores only (pthread condition variables lost wakeups here:
@@ -128,8 +129,9 @@ static int AreaAcquire(int a) {
   if (n >= 0 && pool[a][n].synced && AreaTouched(a) < pool[a][n].synced) { ++pool[a][n].refs; return n; }
   for (;;) {
     int pick = -1;
-    if (n >= 0 && pool[a][n].refs == 0) pick = n;                 /* fewest pages to copy */
-    else for (int i = 0; i < POOL; ++i) if (pool[a][i].refs == 0) { pick = i; break; }
+    /* The most recently synced free buffer: fewest pages to copy. */
+    for (int i = 0; i < POOL; ++i)
+      if (pool[a][i].refs == 0 && (pick < 0 || pool[a][i].synced > pool[a][pick].synced)) pick = i;
     if (pick >= 0) {
       Buf *b = &pool[a][pick];
       b->refs = 1;
@@ -137,6 +139,7 @@ static int AreaAcquire(int a) {
       AreaUpdate(a, b);
       LOCK();
       newest[a] = pick;
+      if (a == AREA_VDP1) memcpy(vdp1_buf_ver[pick], vdp1_page_ver, sizeof(vdp1_buf_ver[pick]));
       return pick;
     }
     ++buf_waiters;
@@ -144,6 +147,17 @@ static int AreaAcquire(int a) {
     sceKernelWaitSema(sem_release, 1, NULL);
     LOCK();
   }
+}
+
+/* The renderer reads VDP1 RAM only walking and decoding VDP1 commands
+ * (Vdp1DrawStart). Commands that do not walk them keep the last snapshot's
+ * VDP1 buffer and page stamps instead of copying the pages the game wrote
+ * since: the next walk copies those once, not once per command. */
+static int AreaKeepVdp1(void) {
+  const int n = newest[AREA_VDP1];
+  if (n < 0) return -1;
+  ++pool[AREA_VDP1][n].refs;
+  return n;
 }
 
 /* ---- commands --------------------------------------------------------- */
@@ -406,8 +420,10 @@ static int Submit(int fn, int full, int wait, const u32 *args, int nargs, void *
   for (int i = 0; i < nargs; ++i) c->a[i] = args[i];
   c->p[0] = p0; c->p[1] = p1; c->p[2] = p2;
   if (full) {
-    for (int a = 0; a < AREAS; ++a) c->buf[a] = AreaAcquire(a);
-    memcpy(c->v1ver, vdp1_page_ver, sizeof(c->v1ver));
+    const int keep = fn == FN_V1END || fn == FN_ERASE || fn == FN_FCHANGE || fn == FN_V2START || fn == FN_V2END ||
+                     fn == FN_V2SCREENS || fn == FN_SYNC || fn == FN_DISPOFF ? AreaKeepVdp1() : -1;
+    for (int a = 0; a < AREAS; ++a) c->buf[a] = a == AREA_VDP1 && keep >= 0 ? keep : AreaAcquire(a);
+    memcpy(c->v1ver, keep >= 0 ? vdp1_buf_ver[keep] : vdp1_page_ver, sizeof(c->v1ver));
     memcpy(c->v2ver, vdp2_page_ver, sizeof(c->v2ver));
     ++vdp_snap_epoch;                              /* later writes: newer than these buffers */
     if (Vdp1Regs) c->v1 = *Vdp1Regs; else memset(&c->v1, 0, sizeof(c->v1));
