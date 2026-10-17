@@ -5300,6 +5300,20 @@ static INLINE void ReadVdp2ColorOffset(Vdp2 * regs, vdp2draw_struct *info, int m
 
 #define RBG_PROFILE 0
 
+#ifdef VITA_ROTATION_SPLIT
+#include <stdatomic.h>
+/* Who computes the posted rotation job: the worker shares its core with the
+ * sound thread, which can keep it from even starting the job for the whole
+ * frame. The drawing thread reaching the sync first computes it itself. */
+enum { ROTATION_JOB_POSTED, ROTATION_JOB_WORKER, ROTATION_JOB_INLINE };
+static atomic_int rotation_job_owner;
+static int rotation_job_inline;   /* the publisher is the drawing thread */
+/* Posts wake the worker. Unlike handing it g_rotate_mtx (only a started
+ * flag here), nothing the drawing thread does afterwards waits for the
+ * worker to be scheduled. */
+static SceUID rotation_job_wake = -1;
+#endif
+
 /*------------------------------------------------------------------------------
  Rotate Screen drawing
  ------------------------------------------------------------------------------*/
@@ -5321,8 +5335,18 @@ void Vdp2DrawRotationThread(void * p) {
     YuiMsg("rotation_worker_priority previous=%d observed=%d", previous, sceKernelGetThreadCurrentPriority());
   }
 #endif
+#ifdef VITA_ROTATION_SPLIT
   while (Vdp2DrawRotationThread_running) {
-    YabThreadSetCurrentThreadAffinityMask(0x02);
+    YabThreadSetCurrentThreadAffinityMask(VITA_CORE_SOUND);
+    if (sceKernelWaitSema(rotation_job_wake, 1, NULL) < 0 || !Vdp2DrawRotationThread_running) break;
+    int expected = ROTATION_JOB_POSTED;
+    if (!atomic_compare_exchange_strong(&rotation_job_owner, &expected, ROTATION_JOB_WORKER)) continue;
+    Vdp2DrawRotation_in(curret_rbg);
+    __atomic_store_n(&curret_rbg->vdp2_sync_flg, RBG_FINIESED, __ATOMIC_RELEASE);
+  }
+#else
+  while (Vdp2DrawRotationThread_running) {
+    YabThreadSetCurrentThreadAffinityMask(VITA_CORE_SOUND);
     YabThreadLock(g_rotate_mtx);
     if (Vdp2DrawRotationThread_running == 0) {
       break;
@@ -5352,6 +5376,7 @@ void Vdp2DrawRotationThread(void * p) {
     YGL_THREAD_DEBUG("Vdp2DrawRotationThread out %d\n", curret_rbg->vdp2_sync_flg);
 
   }
+#endif
 }
 
 static void FASTCALL Vdp2DrawRotation(RBGDrawInfo * rbg)
@@ -5511,13 +5536,25 @@ static void FASTCALL Vdp2DrawRotation(RBGDrawInfo * rbg)
     if (Vdp2DrawRotationThread_running == 0) {
       Vdp2DrawRotationThread_running = 1;
       g_rotate_mtx = YabThreadCreateMutex();
+#ifdef VITA_ROTATION_SPLIT
+      rotation_job_wake = sceKernelCreateSema("rotation_job", 0, 0, 1, NULL);
+      if (rotation_job_wake < 0) { YuiMsg("fatal: rotation job semaphore %08x", (unsigned)rotation_job_wake); abort(); }
+#else
       YabThreadLock(g_rotate_mtx);
+#endif
       YabThreadStart(YAB_THREAD_VIDSOFT_LAYER_RBG0, (void * (*)(void *))Vdp2DrawRotationThread, NULL);
     }
     Vdp2RgbTextureSync();
     YGL_THREAD_DEBUG("Vdp2DrawRotation in %d\n", curret_rbg->vdp2_sync_flg);
     curret_rbg->vdp2_sync_flg = RBG_REQ_RENDER;
+#ifdef VITA_ROTATION_SPLIT
+    /* After the request: a worker finishing the job overwrites it. A wake
+     * already pending (the last job was computed here) covers this one. */
+    atomic_store(&rotation_job_owner, ROTATION_JOB_POSTED);
+    sceKernelSignalSema(rotation_job_wake, 1);
+#else
     YabThreadUnLock(g_rotate_mtx);
+#endif
     YGL_THREAD_DEBUG("Vdp2DrawRotation out %d\n", curret_rbg->vdp2_sync_flg);
   }
   else {
@@ -5580,17 +5617,30 @@ void Vdp2RgbTextureSync() {
       // Render Reqested But not finied
       YGL_THREAD_DEBUG("Vdp2RgbTextureSync in %d\n", curret_rbg->vdp2_sync_flg);
 #ifdef VITA_ROTATION_SPLIT
-      while (curret_rbg->vdp2_sync_flg == RBG_REQ_RENDER) { Vdp2RotationSplitHelp(); YabThreadYield(); }
+      int expected = ROTATION_JOB_POSTED;
+      if (atomic_compare_exchange_strong(&rotation_job_owner, &expected, ROTATION_JOB_INLINE)) {
+        /* The worker, woken for this post, finds the job taken and waits
+         * for the next one. */
+        rotation_job_inline = 1;
+        Vdp2DrawRotation_in(curret_rbg);
+        rotation_job_inline = 0;
+      } else
+        while (curret_rbg->vdp2_sync_flg == RBG_REQ_RENDER) { Vdp2RotationSplitHelp(); YabThreadYield(); }
+      atomic_thread_fence(memory_order_acquire);
 #else
       while (curret_rbg->vdp2_sync_flg == RBG_REQ_RENDER) YabThreadYield();
-#endif
       YabThreadLock(g_rotate_mtx);
+#endif
       curret_rbg->vdp2_sync_flg = RBG_TEXTURE_SYNCED;
       YGL_THREAD_DEBUG("Vdp2RgbTextureSync out %d\n", curret_rbg->vdp2_sync_flg);
     }
     else if (curret_rbg->vdp2_sync_flg == RBG_FINIESED) {
       YGL_THREAD_DEBUG("Vdp2RgbTextureSync in %d\n", curret_rbg->vdp2_sync_flg);
+#ifdef VITA_ROTATION_SPLIT
+      atomic_thread_fence(memory_order_acquire);
+#else
       YabThreadLock(g_rotate_mtx);
+#endif
       curret_rbg->vdp2_sync_flg = RBG_TEXTURE_SYNCED;
       YGL_THREAD_DEBUG("Vdp2RgbTextureSync out %d\n", curret_rbg->vdp2_sync_flg);
     }
@@ -7021,7 +7071,7 @@ static int Vdp2RotationSplit(RBGDrawInfo *rbg, vdp2draw_struct *info, YglTexture
   atomic_store(&rotation_split_seq, seq);
   if (rotation_split_wake >= 0) sceKernelSignalSema(rotation_split_wake, 1);
   do {
-    Vdp2RotationSplitWork(1);
+    Vdp2RotationSplitWork(!rotation_job_inline);
     if (atomic_load(&rotation_split_done) >= rbg->vres) break;
     YabThreadYield();
   } while (atomic_load(&rotation_split_done) < rbg->vres);
@@ -7427,7 +7477,11 @@ void VIDOGLDeInit(void)
   Vdp2RgbTextureSync();
   if (Vdp2DrawRotationThread_running != 0) {
     Vdp2DrawRotationThread_running = 0;
+#ifdef VITA_ROTATION_SPLIT
+    sceKernelSignalSema(rotation_job_wake, 1);
+#else
     YabThreadUnLock(g_rotate_mtx);
+#endif
     YabThreadWait(YAB_THREAD_VIDSOFT_LAYER_RBG0);
   }
   YglDeInit();
