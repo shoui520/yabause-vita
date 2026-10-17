@@ -207,6 +207,7 @@ struct tagSH2
   // slice target while chaining is allowed and no interrupt is acceptable,
   // otherwise 0 (set by C before each native call and by AddInterrupt).
   u32 chain_limit = 0;
+  uintptr_t data_array = 0;     // #176 this CPU's cache data array (VITA_SH2_DATA_ARRAY_JIT)
 };
 
 #ifdef VITA
@@ -374,7 +375,16 @@ public:
   std::array<std::vector<Block*>, 256> low_code_pages;
   void InvalidateLow(u32 address, u32 length);
   // Each SH-2 has its own cache RAM. Keep both CPU identity and full guest PC.
-  std::unordered_map<u64, Block*> LookupTableC;
+  // live is nonzero while any block is compiled there: compiled data-array
+  // stores read it (memSet* clears the table on such a store).
+  struct CacheTable : std::unordered_map<u64, Block*> {
+    using Base = std::unordered_map<u64, Block*>;
+    u32 live = 0;
+    Block *&operator[](const u64 &key) { live = 1; return Base::operator[](key); }
+    void clear() { Base::clear(); live = 0; }
+    iterator erase(iterator it) { iterator next = Base::erase(it); live = !empty(); return next; }
+  };
+  CacheTable LookupTableC;
   Block * dCode = nullptr;
   
   std::unordered_map<u32, int> self_modify_block;
@@ -487,6 +497,7 @@ public:
 
 
   void ShowStatics();
+  void OnFrame();
   void SetDebugMode(bool debug) { debug_mode_ = debug;  }
 };
 
@@ -530,7 +541,7 @@ public:
   static DynarecSh2 * CurrentContext;
   void SetCurrentContext(){ CurrentContext = this; }
   void SetSlave(bool is_slave) { is_slave_ = is_slave; }
-  void SetContext(SH2_struct * ctx) { ctx_= ctx;}
+  void SetContext(SH2_struct * ctx);
   bool IsSlave() { return is_slave_;  }
 
   dlstIntct m_IntruptTbl;
@@ -680,9 +691,7 @@ public:
   u32 lazy_m_ = 0;   // affine proofs: periods of the entry state past lazy_q_
   void LazySync();
 #define VITA_LAZY_SYNC() (lazy_ ? LazySync() : (void)0)
-  void onFrame(){
-    m_pCompiler->self_modify_block.clear();
-  }
+  void onFrame(){ m_pCompiler->OnFrame(); }
 
   tagSH2 * getDynaSh(){ VITA_LAZY_SYNC(); return m_pDynaSh2; }; 
 

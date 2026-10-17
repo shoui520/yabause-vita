@@ -38,6 +38,9 @@ extern "C" {
 
 #include "DynarecSh2.h"
 #include "spin_step.h"
+#if defined(VITA_SH2_DATA_ARRAY_JIT) && defined(VITA_SH2_IDLE_SLICE_SKIP)
+extern "C" { extern u32 g_mem_io_reads, g_mem_io_last; }
+#endif
 #include "a9_register_region.h"
 u32 g_code_epoch;
 #include <algorithm>
@@ -50,7 +53,8 @@ static_assert(offsetof(tagSH2, exitcount) == 128 && offsetof(tagSH2, spec_bail) 
               offsetof(tagSH2, dispatch) == 144 && offsetof(tagSH2, chain_budget) == 148 &&
               offsetof(tagSH2, chain_table) == 152 && offsetof(tagSH2, chain_cur) == 156 &&
               offsetof(tagSH2, memcycle) == 160 && offsetof(tagSH2, macw_saturate) == 164 &&
-              offsetof(tagSH2, macl_saturate) == 168 && offsetof(tagSH2, chain_limit) == 172,
+              offsetof(tagSH2, macl_saturate) == 168 && offsetof(tagSH2, chain_limit) == 172 &&
+              offsetof(tagSH2, data_array) == 176,
               "offsets used by generated code and dynalib_arm.s");
 static_assert(offsetof(Block, code) == 0 && offsetof(Block, b_addr) == 4 && offsetof(Block, flags) == 16 &&
               offsetof(Block, link_pc) == 28 && BLOCK_LOOP == 1, "Block layout used by sh2_dispatch and link stubs");
@@ -1409,6 +1413,15 @@ void CompileBlocks::UnlinkSlot(int slot) {
   }
 }
 
+void CompileBlocks::OnFrame() {
+#ifndef VITA_SH2_SMC_VARIANTS
+  self_modify_block.clear();
+#endif
+  // With variants this map is how a block rewritten late in one frame and run
+  // in the next finds its earlier compiles; SmcReuse and SmcSlot only count a
+  // recorded slot while it still holds that PC.
+}
+
 void CompileBlocks::ShowStatics() {
   //LOG("Compile\t%d\t%d\t%d\n", compile_count_, exec_count_, remove_count_);
   compile_count_ = 0;
@@ -1548,7 +1561,9 @@ static bool Sh2MayWrite(u16 op) {
 }
 int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 {
-  VitaSh2CodeWrite code_write(page->code, code_room_);
+  // The whole slot: data-array slow edges may run past code_room_ (see
+  // data_array_left); only the bytes written are published.
+  VitaSh2CodeWrite code_write(page->code, kCodeRoom);
   int i, j, jmp = 0, count = 0;
   u16 op, temp;
   u32 addr = page->b_addr;
@@ -1788,6 +1803,11 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
   //MaxSize = MAXBLOCKSIZE - MAXINSTRSIZE- delay_seperator_size - SEPERATORSIZE_DELAY_AFTER - nomal_seperator_size - EPILOGSIZE;
   //while (ptr - startptr < MaxSize) {
 #if defined(VITA_SH2_A9_REGIONS) && !defined(AARCH64)
+  /* Data-array slow edges are extra words. Sizing ends this pass at
+   * code_room_; when the slot has more room (kCodeRoom), they come out of
+   * that difference, less a margin, and sizing never sees them. A pass whose
+   * room is the whole slot (the MAC pass, whose extent is fixed) counts them. */
+  int data_array_left = code_room_ < kCodeRoom ? int((kCodeRoom - code_room_) / sizeof(u32)) - 128 : 1 << 20;
   auto make_region = [&]() {
     sh2a9::RegisterRegion region(reinterpret_cast<uintptr_t>(LowWram),
                                 reinterpret_cast<uintptr_t>(HighWram)
@@ -1816,6 +1836,16 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
     region.onchip_write[0] = reinterpret_cast<uintptr_t>(&OnchipWriteByte);
     region.onchip_write[1] = reinterpret_cast<uintptr_t>(&OnchipWriteWord);
     region.onchip_write[2] = reinterpret_cast<uintptr_t>(&OnchipWriteLong);
+#endif
+#if defined(VITA_SH2_DATA_ARRAY_JIT) && !defined(A9_PMU_REGIONS)
+    region.data_array_jit = !debug_mode_;
+    region.hide_extra = code_room_ < kCodeRoom;
+    region.extra_budget = data_array_left;
+    region.cache_code = reinterpret_cast<uintptr_t>(&LookupTableC.live);
+#ifdef VITA_SH2_IDLE_SLICE_SKIP
+    region.io_last = reinterpret_cast<uintptr_t>(&g_mem_io_last);
+    region.io_reads = reinterpret_cast<uintptr_t>(&g_mem_io_reads);
+#endif
 #endif
 #if defined(VITA_SH2_MAC_REGIONS) && defined(VITA_SH2_MACL_WRAM)
     region.macl_helper = reinterpret_cast<uintptr_t>(&sh2_macl_region);
@@ -1986,6 +2016,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #endif
         const size_t bytes = region.code.size() * sizeof(u32);
         legacy_extra += size_t(region.legacy_words) * sizeof(u32);
+        data_array_left -= region.extra_used;
         memcpy(ptr, region.code.data(), bytes);
         ptr += bytes;
         scheduling_cursor = ptr;
@@ -2305,6 +2336,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
         slot_region.Finish();
 #endif
         legacy_extra += size_t(slot_region.legacy_words) * sizeof(u32);
+        data_array_left -= slot_region.extra_used;
         std::vector<u32> &w = slot_region.code;
         const u32 fall = branch_pc + 4;
         u32 taken_cc = 0xe0000000u, skip_cc = 0;
@@ -2659,6 +2691,11 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT )
 #endif
 
   return 0;
+}
+
+void DynarecSh2::SetContext(SH2_struct *ctx) {
+  ctx_ = ctx;
+  m_pDynaSh2->data_array = ctx ? reinterpret_cast<uintptr_t>(ctx->DataArray) : 0;
 }
 
 DynarecSh2::DynarecSh2() : m_pDynaSh2(new tagSH2()), memcycle_(m_pDynaSh2->memcycle) {

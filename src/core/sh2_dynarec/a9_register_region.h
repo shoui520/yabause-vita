@@ -343,6 +343,37 @@ public:
   // nonzero once any compiled block has claimed an instruction in that
   // KiB. Guarded stores are admitted only when set (see GuardStore).
   uint32_t code_pages = 0;
+  // Cached SH-2 data array (cache used as RAM, 0xC0000000-0xC0000FFF) on the
+  // slow edge of guarded loads and stores, before the helper and exactly as
+  // memGet*/memSet* treat it (VITA_SH2_DATA_ARRAY_JIT): a T2 access to the
+  // running CPU's array (tagSH2 #176) with no memory cycles; loads record the
+  // helper's I/O read (*io_last = address, ++*io_reads) and stores take it
+  // only while no code is compiled in the cache region (*cache_code == 0).
+  // io_last/io_reads are 0 when the helper records nothing. The words are
+  // extra to the helper edge: with hide_extra they are taken back out of
+  // legacy_words, so block sizing is unchanged, and they are emitted only
+  // while extra_budget (the compiler's spare code room) allows.
+  bool data_array_jit = false, hide_extra = false;
+  uint32_t io_last = 0, io_reads = 0, cache_code = 0;
+  int extra_budget = 0, extra_used = 0;
+  static constexpr int kDataArrayLoadWords = 24, kDataArrayStoreWords = 20;
+  bool DataArrayAdmits(int words) const { return data_array_jit && extra_budget - extra_used >= words; }
+  void DataArrayExtra(size_t from) {
+    const int words = int(code.size() - from);
+    extra_used += words;
+    if (hide_extra) legacy_words -= words;
+  }
+  // r10 = s ^ 0xC0000000; BHS (to be filled) unless an aligned array offset.
+  void DataArrayRange(unsigned s, unsigned width, std::vector<unsigned> &miss) {
+    code.push_back(0xe220a103u | (s << 16));              // EOR r10,s,#0xC0000000
+    if (width == 1) {
+      code.push_back(0xe35a0a01u);                        // CMP r10,#0x1000
+    } else {
+      code.push_back(width == 4 ? 0xe1a0c16au : 0xe1a0c0eau); // MOV ip,r10,ROR #2 / #1
+      code.push_back(width == 4 ? 0xe35c0b01u : 0xe35c0b02u); // CMP ip,#0x400 / #0x800
+    }
+    miss.push_back(code.size()); code.push_back(0x20000000u); // BHS
+  }
 
   static bool IsDivisionStep(uint16_t op) {
     return (op & 0xf00f) == 0x3004 || (op & 0xf0ff) == 0x4024;
@@ -1184,6 +1215,26 @@ private:
     load(12);
     ColdJumpHot(done);
     for (unsigned at : to_helper) jump(at, code.size(), code[at]);
+    if (DataArrayAdmits(kDataArrayLoadWords)) {
+      // memGet*'s data-array read: its I/O record, then the T2 read. d is
+      // free scratch until the result (no mapping depends on its value yet).
+      const size_t from = code.size();
+      std::vector<unsigned> miss;
+      DataArrayRange(s, width, miss);
+      if (io_last) {
+        Constant(12, io_last);
+        code.push_back(0xe58c0000u | (s << 12));           // STR s,[ip]
+        Constant(12, io_reads);
+        code.push_back(0xe59c0000u | (d << 12));           // LDR d,[ip]
+        code.push_back(0xe2800001u | (d << 16) | (d << 12)); // ADD d,d,#1
+        code.push_back(0xe58c0000u | (d << 12));           // STR d,[ip]
+      }
+      code.push_back(0xe597c0b0u);                         // LDR ip,[r7,#176] data array
+      load(12);
+      ColdJumpHot(done);
+      for (unsigned at : miss) jump(at, code.size(), code[at]);
+      DataArrayExtra(from);
+    }
     // Slow edge publishes dirty values before calling and reloads all resident
     // mappings afterwards. r10 holds the result while r0-r6 are reconstructed.
     for (unsigned h = 0; h < slots.size(); ++h) Store(h);
@@ -1599,6 +1650,32 @@ private:
     }
     const unsigned done = code.size();
     BeginCold(slow, conds);
+    if (DataArrayAdmits(kDataArrayStoreWords)) {
+      // memSet*'s data-array write (DATA_ARRAY_WRITE) while the cache region
+      // holds no compiled code; otherwise the helper (which clears it).
+      const size_t from = code.size();
+      std::vector<unsigned> miss;
+      DataArrayRange(s, width, miss);
+      Constant(12, cache_code);
+      code.push_back(0xe59cc000u);               // LDR ip,[ip]
+      code.push_back(0xe35c0000u);               // CMP ip,#0
+      miss.push_back(code.size()); code.push_back(0x10000000u); // BNE
+      code.push_back(0xe597c0b0u);               // LDR ip,[r7,#176] data array
+      if (width == 1) {
+        code.push_back(0xe22aa001u);             // EOR r10,r10,#1
+        code.push_back(0xe7cc000au | (v << 12)); // STRB v,[ip,r10]
+      } else if (width == 2) {
+        code.push_back(0xe18c00bau | (v << 12)); // STRH v,[ip,r10]
+      } else {
+        code.push_back(0xe08cc00au);             // ADD ip,ip,r10
+        code.push_back(0xe1a0a860u | v);         // MOV r10,v,ROR #16
+        code.push_back(0xe58ca000u);             // STR r10,[ip]
+      }
+      ColdJumpHot(done);
+      for (unsigned at : miss)
+        code[at] = (code[at] & 0xf0000000u) | 0x0a000000u | (uint32_t(int32_t(code.size()) - int32_t(at) - 2) & 0xffffffu);
+      DataArrayExtra(from);
+    }
     for (unsigned h = 0; h < slots.size(); ++h) Store(h);
     Pending(0xe2800000u);                        // ADD r8/r9
     if (s != 0) code.push_back(0xe1a00000u | s); // MOV r0,s

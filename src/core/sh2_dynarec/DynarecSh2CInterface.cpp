@@ -688,6 +688,15 @@ WRITE_LINKAGE void WRITE_NAME(Long)(u32 addr , u32 data )
 #else
 #define ONCHIP_WRITE(Name, addr, data)
 #endif
+#ifdef VITA_SH2_DATA_ARRAY_DIRECT
+// Data array (cache used as RAM) without compiled code in it: the slow
+// helper's own direct write, with no lock or memory cycles.
+#define DATA_ARRAY_WRITE(Name, addr, data) \
+    if (((addr) >> 29) == 6 && block && (block->LookupTableC.empty() || ((addr) & 0xFF000000u) != 0xC0000000u)) { \
+      PROF_MEM(1, addr); T2Write##Name(CurrentSH2->DataArray, (addr) & 0xFFF, data); return; }
+#else
+#define DATA_ARRAY_WRITE(Name, addr, data)
+#endif
 #define WRITE_LEAF(Name, Type, Width) \
   void memSet##Name(u32 addr, Type data) { \
     CompileBlocks *block=CompileBlocks::existingInstance(); \
@@ -699,6 +708,7 @@ WRITE_LINKAGE void WRITE_NAME(Long)(u32 addr , u32 data )
       return; \
     } \
     ONCHIP_WRITE(Name, addr, data) \
+    DATA_ARRAY_WRITE(Name, addr, data) \
     WriteSlow##Name(addr,data); \
   }
 WRITE_LEAF(Byte,u8,1)
@@ -706,6 +716,7 @@ WRITE_LEAF(Word,u16,2)
 WRITE_LEAF(Long,u32,4)
 #undef WRITE_LEAF
 #undef ONCHIP_WRITE
+#undef DATA_ARRAY_WRITE
 #pragma GCC pop_options
 #endif
 #undef WRITE_LINKAGE
